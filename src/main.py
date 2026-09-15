@@ -34,6 +34,7 @@ RESEARCH_DESCRIPTION / USER_KEYWORDS / TOPIC_QUERY），本文件无需改动。
     python -m src.main --to me@example.com        # 临时改收件人（调试用）
     python -m src.main --no-ai                    # 跳过 AI，仅检查检索与邮件
     python -m src.main --find-topic               # 查询语义主题 id（供 config 手填）
+    python -m src.main --show-config              # 只看「靠什么召回/靠什么打分」，不联网
 """
 
 from __future__ import annotations
@@ -47,15 +48,21 @@ from . import abstract_source, ai_matcher, dedup, mailer, openalex_client
 from .config import (
     AI_THRESHOLD,
     EMAIL_TITLE,
+    ISSN_FILTER,
     LOOKBACK_DAYS,
     LOOKBACK_DAYS_FIRST_RUN,
     MAX_EMAIL_ITEMS,
     MAX_WORKS_FETCH,
     OUTBOX_DIR,
+    RESEARCH_DESCRIPTION,
     RESEARCH_FIELD,
     RETRIEVAL_MODE,
+    TOPICS,
     TOPIC_QUERY,
+    USER_KEYWORDS,
+    config_warnings,
     mail_recipients,
+    relevance_plan,
     validate_env,
 )
 from .logger import setup_logging, today_str
@@ -151,6 +158,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--show-config",
+        action="store_true",
+        help=(
+            "不跑主流程，只打印「这一轮靠什么召回、靠什么打分」然后退出（纯离线，不联网）。"
+            "改完 config.py 拿不准改动生效在哪一层时先跑它"
+        ),
+    )
+    parser.add_argument(
         "--to",
         default=None,
         metavar="ADDR",
@@ -204,6 +219,48 @@ def find_topic(query: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# --show-config 辅助命令
+# ---------------------------------------------------------------------------
+def show_config(args: argparse.Namespace) -> int:
+    """离线打印「这一轮靠什么召回、靠什么打分」，不联网、不发邮件。
+
+    为什么需要它：默认 topic 模式下 USER_KEYWORDS 不参与召回，
+    改完它跑一遍会发现候选量毫无变化。这个命令把两层的分工直接摊开，
+    免得每次都要靠猜或者等一次完整的联网运行。
+    """
+    mode = args.retrieval_mode
+    print()
+    print(f"{EMAIL_TITLE} · 生效配置（离线查看，未联网）")
+    print("-" * 68)
+    print(f"  研究方向        {RESEARCH_FIELD}")
+    print(f"  补充说明        {RESEARCH_DESCRIPTION.strip() or '（未设置）'}")
+    print(f"  USER_KEYWORDS   {USER_KEYWORDS or '（空）'}")
+    print(f"  TOPIC_QUERY     {TOPIC_QUERY!r}")
+    print(f"  TOPICS          {TOPICS or '（空 → 按 TOPIC_QUERY 自动解析）'}")
+    print(f"  期刊            {len(ISSN_FILTER.split('|'))} 本")
+    print(
+        f"  时间窗          首次 {LOOKBACK_DAYS_FIRST_RUN} 天 / 之后 {LOOKBACK_DAYS} 天"
+        f"（最多拉取 {MAX_WORKS_FETCH} 篇）"
+    )
+    print(f"  AI 入选线       ≥ {AI_THRESHOLD} 分，单封最多展示 {MAX_EMAIL_ITEMS} 篇")
+    print(f"  本轮检索模式    {mode}")
+    print("-" * 68)
+    for label, detail in relevance_plan(mode):
+        print(f"  【{label}】{detail}")
+    problems = config_warnings(mode)
+    if problems:
+        print()
+        for problem in problems:
+            print(f"  ⚠️  {problem}")
+    print("-" * 68)
+    print("  想换「能搜到什么」        → 改 RETRIEVAL_MODE / TOPIC_QUERY")
+    print("  想换「搜到的里面留下什么」 → 改 RESEARCH_FIELD / RESEARCH_DESCRIPTION / USER_KEYWORDS")
+    print("  真正解析出的主题 id 要看联网日志：python -m src.main --dry-run -v")
+    print()
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 def run(args: argparse.Namespace) -> int:
@@ -212,10 +269,19 @@ def run(args: argparse.Namespace) -> int:
 
     log.info("=" * 68)
     log.info("%s · 运行开始（%s）", EMAIL_TITLE, run_date)
-    log.info("研究方向（供 AI 打分）：%s", "、".join(keywords) if keywords else f"{RESEARCH_FIELD}（来自 config）")
-    log.info("第 1 层检索：%s 模式", args.retrieval_mode)
-    log.info("模式：%s", "DRY-RUN（不发邮件）" if args.dry_run else "正式运行")
+    # 把「两把旋钮」的分工直接打出来：topic 模式下改 USER_KEYWORDS 不会改变候选量，
+    # 这是本项目最容易让人误判成 bug 的地方，所以每轮都明说一下。
+    for label, detail in relevance_plan(args.retrieval_mode):
+        log.info("【%s】%s", label, detail)
+    if keywords:
+        log.info(
+            "【覆盖】--keywords 生效：AI 打分改用 %s（本轮 config.USER_KEYWORDS 不参与打分）",
+            "、".join(keywords),
+        )
+    log.info("【模式】%s", "DRY-RUN（不发邮件）" if args.dry_run else "正式运行")
     log.info("=" * 68)
+    for problem in config_warnings(args.retrieval_mode):
+        log.warning("配置提醒：%s", problem)
 
     # ---- 1. 配置校验（快速失败）----
     validate_env(require_ai=not args.no_ai, require_mail=not args.dry_run)
@@ -340,6 +406,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     setup_logging(verbose=args.verbose)
+
+    if args.show_config:
+        return show_config(args)
 
     if args.find_topic:
         return find_topic(args.find_topic)

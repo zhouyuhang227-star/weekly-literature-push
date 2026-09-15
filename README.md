@@ -247,6 +247,7 @@ on:
 | 每周都跑但状态文件没更新 | 正常。`data/pushed_dois.json` 无变化时脚本会主动跳过 commit |
 | `push.cmd` 一直提示连不上，最后报 `Failed to connect to github.com:443` | **不是你的 git 配错了，是网络**。国内 `github.com` 常常时通时不通（典型表现：`api.github.com` 能访问、`github.com` 超时 21 秒）。挂上代理后让 git 也走代理：`git config --global http.proxy http://127.0.0.1:7890`（端口换成你代理软件的）。取消：`git config --global --unset http.proxy` |
 | 黄色警告 `Node.js 20 is deprecated` | **任务仍然会成功，但要修**。三个官方 action 的旧大版本内部声明的是 Node 20，而 Node 20 已于 **2026-09-23 从 runner 上彻底移除**。本项目已升级到 `checkout@v7` / `setup-python@v7` / `upload-artifact@v7`（内部为 `node24`）。以后凡是「绿色 ✔ + 黄条警告」，八成都是这类依赖过时，去对应 action 的 releases 页取最新大版本号即可 |
+| **改了 `USER_KEYWORDS`，候选量一点没变** | **不是 bug**，是默认 `topic` 模式的正常行为：此模式下关键词不参与召回，只当 AI 的打分尺（见 [两把旋钮](#two-knobs)）。想让它影响召回 → `RETRIEVAL_MODE = "both"` 或改 `TOPIC_QUERY`。拿不准就跑 `python -m src.main --show-config` |
 
 > **想让定时任务更准时**：GitHub 官方文档明确说明**整点（minute = 0）是负载高峰**，
 > 任务可能被延迟几分钟甚至几十分钟，所以本项目已经把 cron 设成了非整点的
@@ -270,6 +271,7 @@ python -m src.main [选项]
 | `--max-fetch N` | 最多拉取候选文献数（默认 300） |
 | `--threshold N` | AI 相关性阈值，低于此值不展示（默认 60） |
 | `--keywords "a;b"` | 临时覆盖研究方向（`topic` 模式下用作 **AI 打分标准**，不参与检索） |
+| `--show-config` | 只打印「靠什么召回 / 靠什么打分」然后退出，**纯离线、不联网、不跑主流程**。改完配置拿不准改动落在哪一层时先跑它 |
 | `--find-topic [QUERY]` | 只查询 OpenAlex 语义主题、打印候选 id/名称，**不跑主流程**（省略 QUERY 则用 `config.TOPIC_QUERY`） |
 | `--to addr` | 临时覆盖收件人（多个用逗号分隔） |
 | `--no-ai` | 跳过 AI 打分，全部展示（仅用于排查检索/邮件链路） |
@@ -278,6 +280,10 @@ python -m src.main [选项]
 常用组合：
 
 ```bash
+# 改完 config.py 先跑这个：离线看「靠什么召回/靠什么打分」，秒出
+python -m src.main --show-config
+python -m src.main --show-config --retrieval-mode both   # 预览切到 both 之后的样子
+
 # 完整链路预览（需要 AI_API_KEY，不需要 SMTP）
 python -m src.main --dry-run --verbose
 
@@ -448,26 +454,61 @@ AI 打分失败时卡片会打 `AI 打分失败` 标签，且该文献仍会展�
 
 ## 如何修改
 
+<a id="two-knobs" name="two-knobs"></a>
+
+### ★ 动手前先搞清一件事：配置里有「两把旋钮」
+
+这是最容易误解的地方。先看这张表，能省你半小时。
+
+| | 旋钮 A：**召回** | 旋钮 B：**打分** |
+|---|---|---|
+| 决定什么 | **哪些论文能进候选池** | 进了池子的论文，**AI 给谁高分** |
+| 对应变量 | `RETRIEVAL_MODE` + `TOPIC_QUERY` | `RESEARCH_FIELD` + `RESEARCH_DESCRIPTION` + `USER_KEYWORDS` |
+| 改了会怎样 | **候选量会变** | **候选量一点不变**，变的只是 AI 那把打分尺 |
+| 怎么确认改对了 | 日志里的「候选 N 篇」 | 邮件里的 AI 分数 / 理由有没有变准 |
+
+> ⚠️ **默认 `RETRIEVAL_MODE = "topic"`，此时 `USER_KEYWORDS` 不参与召回。**
+> 所以「我改了关键词，跑一遍候选量纹丝不动」是**正常现象，不是 bug**。
+> 想让关键词真正参与召回 → 把 `RETRIEVAL_MODE` 改成 `"both"`。
+>
+> 拿不准自己的改动落在哪一层，跑这一条 —— **纯离线、秒出、不联网、不发邮件**：
+>
+> ```bash
+> python -m src.main --show-config
+> ```
+>
+> ```
+> 【召回层】topic（语义主题）—— 由 TOPIC_QUERY='solid-state battery' 解析出的 topics.id 决定，USER_KEYWORDS 不参与
+> 【打分层】AI 0-100 分、入选线 ≥ 60 —— 尺子 = RESEARCH_FIELD='固态电池' + 关注关键词 5 个
+> 【提示】topic 模式下改 USER_KEYWORDS 不会改变候选量，它只当 AI 的打分尺子。想让关键词也参与召回 → RETRIEVAL_MODE = "both"；想换召回方向 → 改 TOPIC_QUERY。
+> ```
+>
+> 这三行在**每次正常运行时也会打进日志开头**，所以每周 Actions 的日志里都留着
+> 当时生效的配置与提示，事后回溯不用猜。
+
 ### 改完怎么生效：一键同步到 GitHub
 
 **改什么 = 改哪里**（全部在 `src/config.py` 里，改完不用动其它任何文件）：
 
-| 想改什么 | 改哪个变量 |
-|---|---|
-| 研究方向（换课题） | `RESEARCH_FIELD` + `RESEARCH_DESCRIPTION` + `USER_KEYWORDS` + `TOPIC_QUERY` |
-| **关键词** | **`USER_KEYWORDS`** |
-| **期刊** | **`JOURNALS`** |
-| 检索方式 | `RETRIEVAL_MODE` |
-| 评分阈值 / 并发 / 时间窗 | `AI_THRESHOLD` / `AI_MAX_WORKERS` / `LOOKBACK_DAYS` |
-| 密钥、AI 供应商、收件人 | **GitHub Secrets**，改完即生效，**不用改代码也不用 push** |
+| 想改什么 | 改哪个变量 | 属于 |
+|---|---|---|
+| **能搜到什么**（召回方向） | **`TOPIC_QUERY`** | 旋钮 A |
+| 召回策略（主题 / 关键词 / 并集） | `RETRIEVAL_MODE` | 旋钮 A |
+| **搜到的里面留下什么**（AI 的打分尺） | **`USER_KEYWORDS`** + `RESEARCH_DESCRIPTION` | 旋钮 B |
+| 方向名（邮件标题也用它） | `RESEARCH_FIELD` | 旋钮 B |
+| **期刊** | **`JOURNALS`** | — |
+| 评分阈值 / 并发 / 时间窗 | `AI_THRESHOLD` / `AI_MAX_WORKERS` / `LOOKBACK_DAYS` | — |
+| 密钥、AI 供应商、收件人 | **GitHub Secrets**，改完即生效，**不用改代码也不用 push** | — |
 
 **推荐流程**（三步）：
 
 ```bash
-# ① 本地改 src/config.py
-# ② 先看检索结果对不对，别白等一周
+# ① 本地改 src/config.py，先确认改动落在哪一层（离线，秒出）
+python -m src.main --show-config
+
+# ② 再看真实检索结果对不对，别白等一周
+python -m src.main --find-topic           # 确认 TOPIC_QUERY 解析到了正确方向
 python -m src.main --dry-run --no-ai --verbose
-python -m src.main --find-topic          # 确认主题解析到了正确方向
 
 # ③ 同步到 GitHub
 .\push.cmd                                # 或者在资源管理器里双击 push.cmd
@@ -476,7 +517,7 @@ python -m src.main --find-topic          # 确认主题解析到了正确方向
 `push.cmd`（实际逻辑在 `push.ps1`）会依次做 5 件事：
 
 1. 检查待提交文件，**拦住 `.env` 等敏感文件**（推上去就泄露了，而且删掉也仍留在 git 历史里）
-2. 跑 52 个单元测试，**不通过就中止**（配置改错了根本推不上去）
+2. 跑全部单元测试（当前 65 个），**不通过就中止**（配置改错了根本推不上去）
 3. `fetch` + `rebase` ← **关键，见下方说明**
 4. `push`，失败自动重试 4 次（`github.com` 在国内时通时不通）
 5. 校验远程 commit 和本地是否一致
@@ -514,6 +555,11 @@ python -m src.main --find-topic          # 确认主题解析到了正确方向
 
 **只需要改 `src/config.py` 里的一段配置**，其它文件一个字都不用动。
 AI 提示词、检索条件、邮件标题全部由这四个变量派生：
+
+> ⚠️ 前提是**四个变量一起改**。只改关键词而忘了 `TOPIC_QUERY`，
+> 程序会**静默地继续用旧方向检索**（不报错、日志也看不出来）。
+> 改完先跑 `python -m src.main --show-config` 复查一遍，再看配置块末尾的
+> `TOPIC_QUERY` 说明。
 
 ```python
 # ===== ★★★ 研究方向：换课题只需要改这一段 ★★★ =====
@@ -620,37 +666,53 @@ ISSN 可在 [OpenAlex Sources](https://openalex.org/sources) 或期刊官网查�
 > ⚠️ **跨学科换向必须同时换期刊**。当前这 11 本是材料 / 能源 / 化学类，
 > 如果你想换成计算机、医学等方向，光改研究方向会让候选集几乎为空（同样不报错）。
 
-### 改检索模式（第 1 层）
+### 改检索模式（第 1 层 = 旋钮 A）
 
 `RETRIEVAL_MODE` 三选一：
 
-| 值 | 含义 | 实测候选量（30 天） |
-|---|---|---|
-| `"topic"`（默认） | 只用语义主题分类 | 194 篇 |
-| `"keyword"` | 只用 `title_and_abstract.search` 字面匹配 | 36 篇（会漏） |
-| `"both"` | 两者并集 | 202 篇 |
+| 值 | 含义 | 实测候选量（30 天） | `USER_KEYWORDS` 参与召回？ |
+|---|---|---|---|
+| `"topic"`（默认） | 只用语义主题分类 | 194 篇 | ❌ 不参与（只当打分尺） |
+| `"keyword"` | 只用 `title_and_abstract.search` 字面匹配 | 36 篇（会漏） | ✅ 参与 |
+| `"both"` | 两者并集 | 202 篇 | ✅ 参与 |
 
 也可临时用 `--retrieval-mode` 覆盖。
 
-### 改关键词（第 2 层：AI 的打分标准）
+> **如果你已经不止一次困惑"改了关键词没反应"，直接把 `RETRIEVAL_MODE` 改成 `"both"`。**
+> 代价只是候选量从 194 → 202（+4%），换来的是**改 `TOPIC_QUERY` 和 `USER_KEYWORDS` 都能影响召回**，
+> 不用再记"哪个字段管哪一层"。
 
-就是上面「如何换研究方向」里的 `USER_KEYWORDS`。
+### 改关键词（`USER_KEYWORDS`）
 
-> **注意**：在默认的 `topic` 模式下，这些词**不参与检索**，而是作为
-> **AI 的打分标准**拼进 prompt —— 也就是说它们影响的是"AI 认为什么算相关"。
-> 只有 `--retrieval-mode keyword` / `both` 时它们才会用于 OpenAlex 检索
-> （此时多词短语自动加引号，OpenAlex 会做**词干化**匹配，`battery` 能匹配 `batteries`）。
->
-> 想临时试别的研究方向用 `--keywords "a;b"`（全角 `；，` 会自动归一化）。
-> 不传 `--keywords` 时，AI 收到的是 `RESEARCH_FIELD + RESEARCH_DESCRIPTION + USER_KEYWORDS`
-> 的完整描述，而不是只有关键词。
->
-> ⚠️ 想加**排除项**（例如"不要聚合物电解质"）请写进 `RESEARCH_DESCRIPTION`。
-> 写在 `USER_KEYWORDS` 里只会让召回/评分范围变大，起不到排除作用。
->
-> **一句话总结**：在默认的 `topic` 模式下改了 `USER_KEYWORDS`，会发现"候选量一点没变"——
-> 那是**正常的**，变的是 AI 评分的那把尺子。想让新关键词真正参与**检索**，
-> 要么改 `TOPIC_QUERY`，要么把 `RETRIEVAL_MODE` 改成 `keyword` / `both`。
+就是上面「如何换研究方向」里的 `USER_KEYWORDS`。**它属于旋钮 B**。
+
+**先记住一句话**：
+
+> 在默认的 `topic` 模式下，`USER_KEYWORDS` **不参与召回**，只当 AI 的打分尺子。
+> 所以改了它之后「候选量一点没变」是**正常的**，变的是 AI 认为什么算相关。
+> 想让它真正影响「能搜到什么」，就把 `RETRIEVAL_MODE` 改成 `"both"`。
+
+**按你的目的选做法**：
+
+| 你的目的 | 该改哪里 |
+|---|---|
+| AI 判得不够准，想让它更懂"我要什么" | `USER_KEYWORDS`（+ `RESEARCH_DESCRIPTION` 写"不要什么"） |
+| **能搜到的论文变多 / 变少** | `RETRIEVAL_MODE` → `"both"`，或改 `TOPIC_QUERY` |
+| **换一个研究方向** | `RESEARCH_FIELD` + `RESEARCH_DESCRIPTION` + `USER_KEYWORDS` + `TOPIC_QUERY` **四个一起改**，再跑 `--show-config` 复查 |
+| 只是几个词想临时试试，不改配置文件 | `--keywords "a;b"` |
+
+细节：
+
+- `USER_KEYWORDS` 只有在 `RETRIEVAL_MODE = "keyword"` / `"both"` 时才用于 OpenAlex 检索
+  （此时多词短语自动加引号，OpenAlex 会做**词干化**匹配，`battery` 能匹配 `batteries`）。
+- 想临时试别的研究方向用 `--keywords "a;b"`（全角 `；，` 会自动归一化）。
+  此时 AI 只拿到这几个词；不传 `--keywords` 时 AI 收到的是
+  `RESEARCH_FIELD + RESEARCH_DESCRIPTION + USER_KEYWORDS` 的完整描述，上下文更全。
+- ⚠️ 想加**排除项**（例如"不要聚合物电解质"）请写进 `RESEARCH_DESCRIPTION`。
+  写在 `USER_KEYWORDS` 里只会让召回/评分范围变大，起不到排除作用 ——
+  因为关键词是 **OR 并联**的。
+- ⚠️ `USER_KEYWORDS` 别留空。留空不会报错，但 AI 只剩 `RESEARCH_FIELD` 一句话可以依靠，
+  判准率会明显下降（程序会在日志里打 WARNING 提醒）。
 
 ### 换 AI 供应商
 

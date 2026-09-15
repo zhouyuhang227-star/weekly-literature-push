@@ -54,8 +54,29 @@ ISSN_TO_NAME: dict[str, str] = {issn: name for name, issn in JOURNALS.items()}
 # ===========================================================================
 # ★★★ 研究方向：换课题只需要改这一段 ★★★
 # ===========================================================================
-# 下面三个变量合起来描述"你要找什么"。它们是**唯一**决定研究方向的地方，
-# AI 提示词、检索条件、邮件标题全部由它们派生，改完不用动任何其它文件。
+# 先看这张图，再动手改 —— 本项目最容易踩的坑就在这里。
+#
+# 这段（连同下面的「第 1 层检索策略」）装的是【两把旋钮】，作用完全不同：
+#
+#   旋钮 A ── 决定「召回什么」：哪些论文能进候选池
+#              = RETRIEVAL_MODE + TOPIC_QUERY          （见下面「第 1 层检索策略」）
+#
+#   旋钮 B ── 决定「留下什么」：进了池子的论文，AI 给谁高分
+#              = RESEARCH_FIELD + RESEARCH_DESCRIPTION + USER_KEYWORDS
+#
+#   ★ 改 A → 候选量会变。
+#   ★ 改 B → 候选量【一点不变】，变的只是 AI 手里那把打分尺。
+#
+#   ⚠️ 默认 RETRIEVAL_MODE = "topic"，此时 USER_KEYWORDS【不参与召回】。
+#      所以"我改了关键词，跑一遍候选量纹丝不动"是【正常现象，不是 bug】。
+#      想让关键词真正参与召回，二选一：
+#        * RETRIEVAL_MODE 改成 "both"  ← 主题 ∪ 关键词，最省心（推荐）
+#        * 改 TOPIC_QUERY              ← 仍走纯语义，但换成新方向的主题短语
+#
+#   想确认"这一轮到底靠什么召回"，跑一条命令即可（不联网、秒出）：
+#        python -m src.main --show-config
+#
+#   一句话总结：想改「能搜到什么」→ 看 A；想改「搜到的里面留下什么」→ 看 B。
 
 # 1) 用一句短语说明你研究什么。会被用于：
 #    * 拼进 AI 的 system prompt（告诉它你是谁）
@@ -67,13 +88,15 @@ RESEARCH_FIELD = "固态电池"
 #    不算聚合物电解质"）。留空则只用下面的 USER_KEYWORDS。
 RESEARCH_DESCRIPTION = ""
 
-# 3) 判断相关性的关键词。作用取决于 RETRIEVAL_MODE：
-#    * "keyword" / "both" 模式：既是 OpenAlex 的检索条件，也是 AI 的打分标准
-#    * "topic"（默认）模式：**只**作为 AI 的打分标准（检索靠语义主题，见下）
+# 3) 判断相关性的关键词 —— 属于【旋钮 B】。作用取决于 RETRIEVAL_MODE：
+#    * "topic"（默认）：**只**作为 AI 的打分标准，**不参与召回**。
+#                       改这里不会让候选量变化，改的是"什么样的论文算相关"。
+#    * "keyword" / "both"：既参与 OpenAlex 召回，也作为 AI 的打分标准。
 #    多词短语会自动加引号，OpenAlex 会做词干化匹配（battery ↔ batteries）。
 #
 #    ⚠️ 想加"排除项"（例如"不要聚合物电解质"）请写进 RESEARCH_DESCRIPTION，
 #       因为关键词是 OR 并联的，写在这里只会让召回更多。
+#    ⚠️ 关键词为空时 AI 只剩 RESEARCH_FIELD 一句话可依靠，判准率会明显下降。
 USER_KEYWORDS: list[str] = [
     "solid-state battery",
     "solid-state electrolyte",
@@ -88,8 +111,11 @@ USER_KEYWORDS: list[str] = [
 # "topic"  —— 用 OpenAlex 的**语义主题分类**（topics.id）召回（默认，推荐）
 #              优点：不依赖字面关键词，garnet electrolyte / LLZO /
 #                    sulfide electrolyte 这类论文也能被召回
+#              ⚠️ 代价：此模式下 USER_KEYWORDS 完全不参与召回（只当打分尺）
 # "keyword" —— 用 title_and_abstract.search 做字面关键词召回（召回低）
 # "both"    —— 两者取并集（召回最高，候选量也最大）
+#
+# ★ 想让 USER_KEYWORDS 真正影响"能搜到什么"，必须选 "both" 或 "keyword"。
 #
 # 实测（11 本顶刊 / 近 30 天）：
 #   无过滤                        → 2069 篇
@@ -97,8 +123,12 @@ USER_KEYWORDS: list[str] = [
 #   topic   模式（T10281）        →  194 篇   ← 采用
 RETRIEVAL_MODE = "topic"
 
-# topic 模式下用哪条短语去查语义主题。
+# ★ 旋钮 A 的核心：topic / both 模式下，**这一行才决定"召回什么"**。
 # 一般就写你方向里最核心的那个英文词，不必和 USER_KEYWORDS 完全一致。
+#
+# ⚠️ 换了研究方向却只改 USER_KEYWORDS、忘了改这一行 → 会静默地继续召回旧方向的论文。
+#    改完记得跑一次 `python -m src.main --dry-run -v`，
+#    在日志里核对「主题自动解析：'...' → Txxxxx（主题名）」是不是你要的方向。
 TOPIC_QUERY = "solid-state battery"
 
 # 主题 id 通常**不需要手填**：留空即用 TOPIC_QUERY 自动查询，
@@ -205,6 +235,76 @@ def research_brief() -> str:
     if USER_KEYWORDS:
         lines.append("关注关键词：" + "、".join(USER_KEYWORDS))
     return "\n".join(lines)
+
+
+#: 标签常量：给 ``relevance_plan`` / ``main`` 共用，顺手也让测试不必拼字符串。
+LAYER_RECALL = "召回层"
+LAYER_SCORING = "打分层"
+LAYER_HINT = "提示"
+
+
+def relevance_plan(mode: str = RETRIEVAL_MODE) -> list[tuple[str, str]]:
+    """把「这一轮靠什么召回、靠什么打分」翻译成人话，用于启动日志与 ``--show-config``。
+
+    存在的唯一理由：默认 ``topic`` 模式下 ``USER_KEYWORDS`` 不参与召回，
+    只改它会出现「候选量一点没变」的现象，而且**不报任何错**。
+    与其让人对着日志自己猜，不如每轮把两层的分工直接打出来。
+
+    返回 ``[(标签, 说明), ...]``，标签取值见 ``LAYER_*`` 常量。
+    """
+    if mode == "topic":
+        recall = (
+            f"topic（语义主题）—— 由 TOPIC_QUERY={TOPIC_QUERY!r} 解析出的 topics.id 决定，"
+            f"USER_KEYWORDS 不参与"
+        )
+        hint = (
+            "topic 模式下改 USER_KEYWORDS 不会改变候选量，它只当 AI 的打分尺子。"
+            '想让关键词也参与召回 → RETRIEVAL_MODE = "both"；'
+            "想换召回方向 → 改 TOPIC_QUERY。详见 src/config.py 顶部「两把旋钮」说明。"
+        )
+    elif mode == "keyword":
+        recall = f"keyword（字面关键词）—— 由 USER_KEYWORDS 决定：{USER_KEYWORDS}"
+        hint = (
+            "keyword 模式召回偏低（实测 5 个词/30 天仅 36 篇）。"
+            '除非你明确只要字面命中的论文，否则建议改用 "both"。'
+        )
+    elif mode == "both":
+        recall = (
+            f"both（并集）—— topics.id（TOPIC_QUERY={TOPIC_QUERY!r}）"
+            f" ∪ 字面关键词 {USER_KEYWORDS}"
+        )
+        hint = "both 模式召回最高；改 TOPIC_QUERY 和 USER_KEYWORDS 都会影响候选量。"
+    else:
+        recall = f"未知模式 {mode!r}"
+        hint = "RETRIEVAL_MODE 只接受 'topic' / 'keyword' / 'both'。"
+
+    keywords_desc = f"关注关键词 {len(USER_KEYWORDS)} 个" if USER_KEYWORDS else "关注关键词（空）"
+    scoring = (
+        f"AI 0-100 分、入选线 ≥ {AI_THRESHOLD} —— 尺子 = RESEARCH_FIELD={RESEARCH_FIELD!r}"
+        f" + {keywords_desc}"
+        + (" + RESEARCH_DESCRIPTION" if RESEARCH_DESCRIPTION.strip() else "")
+    )
+    return [(LAYER_RECALL, recall), (LAYER_SCORING, scoring), (LAYER_HINT, hint)]
+
+
+def config_warnings(mode: str = RETRIEVAL_MODE) -> list[str]:
+    """挑出「明显配错了、但不会报错」的组合，交给调用方以 WARNING 打出。
+
+    只放真正有把握的判断，宁可少报也不要狼来了。
+    """
+    problems: list[str] = []
+    if mode not in ("topic", "keyword", "both"):
+        problems.append(f"RETRIEVAL_MODE={mode!r} 不是合法值（只能是 topic / keyword / both）")
+    if not USER_KEYWORDS:
+        problems.append(
+            "USER_KEYWORDS 为空：AI 只能靠 RESEARCH_FIELD 一句话打分，判准率会明显下降"
+        )
+    if mode in ("topic", "both") and not TOPICS and not TOPIC_QUERY.strip():
+        problems.append(
+            "topic 模式但 TOPIC_QUERY 为空且 TOPICS 未手工指定：解析不到主题 id，"
+            "本轮会退化成无主题过滤（召回到全刊所有论文）"
+        )
+    return problems
 
 
 # ---------------------------------------------------------------------------

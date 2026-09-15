@@ -10,6 +10,8 @@ DOI 规范化、倒排摘要还原、AI 返回解析、去重状态读写、HTML
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import sys
@@ -189,6 +191,161 @@ class TestResearchDirectionIsConfigurable(unittest.TestCase):
 
     def test_email_title_defaults_to_research_field(self):
         self.assertEqual(config.EMAIL_TITLE, f"{config.RESEARCH_FIELD}顶刊周报")
+
+
+class TestRelevanceLayersAreExplained(unittest.TestCase):
+    """「两把旋钮」必须每轮都说明白。
+
+    锁住的是**提示文字本身**：默认 topic 模式下 USER_KEYWORDS 不参与召回，
+    只改它会出现「候选量一点没变」的现象，而且不报任何错。
+    一旦有人把 relevance_plan 删掉或让它不再提这件事，这里就变红 ——
+    防止这个陷阱重新变得静默。
+    """
+
+    def setUp(self):
+        self._saved = {
+            name: getattr(config, name)
+            for name in ("RESEARCH_FIELD", "RESEARCH_DESCRIPTION", "USER_KEYWORDS", "AI_THRESHOLD")
+        }
+
+    def tearDown(self):
+        for name, value in self._saved.items():
+            setattr(config, name, value)
+
+    @staticmethod
+    def _detail(plan, label):
+        return dict(plan)[label]
+
+    def test_topic_mode_says_keywords_do_not_drive_recall(self):
+        plan = config.relevance_plan("topic")
+        self.assertEqual(
+            [label for label, _ in plan],
+            [config.LAYER_RECALL, config.LAYER_SCORING, config.LAYER_HINT],
+        )
+        recall = self._detail(plan, config.LAYER_RECALL)
+        self.assertIn("topic", recall)
+        self.assertIn(config.TOPIC_QUERY, recall)
+        self.assertIn("USER_KEYWORDS 不参与", recall)
+
+        # 光说"不生效"不够，必须直接给出"想让它生效该改哪里"
+        hint = self._detail(plan, config.LAYER_HINT)
+        self.assertIn('RETRIEVAL_MODE = "both"', hint)
+        self.assertIn("TOPIC_QUERY", hint)
+
+    def test_keyword_mode_says_keywords_do_drive_recall(self):
+        config.USER_KEYWORDS = ["perovskite solar cell"]
+        recall = self._detail(config.relevance_plan("keyword"), config.LAYER_RECALL)
+        self.assertIn("keyword", recall)
+        self.assertIn("perovskite solar cell", recall)
+        self.assertNotIn("不参与", recall)
+
+    def test_both_mode_mentions_both_recall_sources(self):
+        recall = self._detail(config.relevance_plan("both"), config.LAYER_RECALL)
+        self.assertIn("topics.id", recall)
+        self.assertIn("TOPIC_QUERY", recall)
+
+    def test_scoring_layer_follows_config(self):
+        config.RESEARCH_FIELD = "钙钛矿太阳能电池"
+        config.AI_THRESHOLD = 77
+        scoring = self._detail(config.relevance_plan("topic"), config.LAYER_SCORING)
+        self.assertIn("钙钛矿太阳能电池", scoring)
+        self.assertIn("77", scoring)
+
+    def test_unknown_mode_is_reported_not_crashed(self):
+        recall = self._detail(config.relevance_plan("nope"), config.LAYER_RECALL)
+        self.assertIn("nope", recall)
+
+    def test_plan_is_recomputed_from_current_config(self):
+        """必须是「当前」配置，不能在 import 时把值算死。"""
+        config.USER_KEYWORDS = ["aaa"]
+        first = self._detail(config.relevance_plan("keyword"), config.LAYER_RECALL)
+        config.USER_KEYWORDS = ["bbb"]
+        second = self._detail(config.relevance_plan("keyword"), config.LAYER_RECALL)
+        self.assertIn("aaa", first)
+        self.assertIn("bbb", second)
+        self.assertNotIn("bbb", first)
+
+
+class TestConfigWarnings(unittest.TestCase):
+    """只报真正配错的组合，不狼来了。"""
+
+    def setUp(self):
+        self._saved = {
+            name: getattr(config, name) for name in ("USER_KEYWORDS", "TOPIC_QUERY", "TOPICS")
+        }
+
+    def tearDown(self):
+        for name, value in self._saved.items():
+            setattr(config, name, value)
+
+    def test_healthy_config_is_silent(self):
+        # 默认配置（topic + 有主题 + 有关键词）不该在每周日志里刷警告
+        self.assertEqual(config.config_warnings("topic"), [])
+        self.assertEqual(config.config_warnings("both"), [])
+
+    def test_empty_keywords_warns_because_ai_loses_its_ruler(self):
+        config.USER_KEYWORDS = []
+        problems = config.config_warnings("topic")
+        self.assertTrue(any("USER_KEYWORDS 为空" in p for p in problems))
+
+    def test_topic_mode_without_any_topic_source_warns(self):
+        config.TOPICS = {}
+        config.TOPIC_QUERY = "   "
+        problems = config.config_warnings("topic")
+        self.assertTrue(any("退化成无主题过滤" in p for p in problems))
+
+        # 手工锁定了 TOPICS 后就不该再报
+        config.TOPICS = {"X": "T1"}
+        self.assertEqual(config.config_warnings("topic"), [])
+
+    def test_bad_mode_warns(self):
+        self.assertTrue(any("不是合法值" in p for p in config.config_warnings("typo")))
+
+
+class TestShowConfigCommand(unittest.TestCase):
+    """--show-config 必须离线、不跑主流程，并把两层分工讲清楚。"""
+
+    def test_show_config_prints_layers_and_returns_zero(self):
+        from src import main as main_module
+
+        args = main_module.build_parser().parse_args(["--show-config"])
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = main_module.show_config(args)
+
+        self.assertEqual(code, 0)
+        text = buffer.getvalue()
+        self.assertIn(config.LAYER_RECALL, text)
+        self.assertIn(config.LAYER_SCORING, text)
+        self.assertIn(config.LAYER_HINT, text)
+        # 必须回显真实的 TOPIC_QUERY，否则看了也不知道在搜什么
+        self.assertIn(config.TOPIC_QUERY, text)
+
+    def test_show_config_honours_retrieval_mode_flag(self):
+        from src import main as main_module
+
+        args = main_module.build_parser().parse_args(["--show-config", "--retrieval-mode", "both"])
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            main_module.show_config(args)
+
+        text = buffer.getvalue()
+        self.assertIn("both", text)
+        # both 模式不该再出现「USER_KEYWORDS 不参与召回」
+        self.assertNotIn("USER_KEYWORDS 不参与", text)
+
+    def test_main_routes_show_config_before_running_pipeline(self):
+        from src import main as main_module
+
+        buffer = io.StringIO()
+        with patch.object(main_module, "setup_logging"), patch.object(
+            main_module, "run", side_effect=AssertionError("不该进入主流程")
+        ):
+            with contextlib.redirect_stdout(buffer):
+                code = main_module.main(["--show-config"])
+
+        self.assertEqual(code, 0)
+        self.assertIn(config.LAYER_RECALL, buffer.getvalue())
 
 
 class TestTopicResolution(unittest.TestCase):
