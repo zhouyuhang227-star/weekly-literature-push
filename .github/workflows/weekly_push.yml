@@ -8,6 +8,10 @@ name: weekly-literature-push
 # 为什么是 07 分而不是整点 00 分：GitHub 官方文档明确说明 schedule 事件
 # 在 Actions 负载高峰时会被延迟，而"高峰期包括每个整点"，
 # 故避开整点能显著降低延迟概率。改回整点只需把 cron 写成 "0 23 * * 3"。
+#
+# 下面三个 action 都用 v7：旧版（checkout@v4 / setup-python@v5 /
+# upload-artifact@v4）内部声明的是 Node 20，而 Node 20 已于 2026-09-23
+# 从 GitHub runner 上彻底移除，届时会直接报错。v7 系列声明的是 node24。
 on:
   schedule:
     - cron: "7 23 * * 3"
@@ -48,10 +52,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
@@ -93,7 +97,7 @@ jobs:
       # 日志改走 artifact，避免每周 commit 导致仓库历史膨胀
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: run-logs-${{ github.run_number }}
           path: data/logs/
@@ -102,7 +106,7 @@ jobs:
 
       - name: Upload dry-run email preview
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: email-preview-${{ github.run_number }}
           path: data/outbox/
