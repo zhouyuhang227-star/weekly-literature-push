@@ -45,6 +45,8 @@
 │   ├── topics_cache.json               # 语义主题解析缓存（已 gitignore，自动重建）
 │   ├── logs/                           # 运行日志（已 gitignore，Actions 里传 artifact）
 │   └── outbox/                         # --dry-run 生成的 HTML 预览（已 gitignore）
+├── push.ps1                            # ★本地改动一键同步到 GitHub（见「如何修改」）
+├── push.cmd                            # 双击运行 push.ps1 的包装（免执行策略限制）
 ├── requirements.txt
 └── README.md
 ```
@@ -241,7 +243,7 @@ on:
 | 发信时间不对 | 检查仓库默认分支是不是 `main`、`timezone:` 那行还在不在。注意定时时间是 **23:07**（`cron: "7 23 * * 3"`），不是整点 |
 | Actions 显示绿色但没收到邮件 | 看日志末行的「运行摘要：候选 N → 去重后 M → 入选 K」。K=0 时也会发心跳邮件；若连心跳邮件都没有，检查 `MAIL_TO` 和垃圾邮件箱 |
 | `git push` 报 `src refspec main does not match any` | 本地还没 `git commit`，或者本地分支不叫 `main` |
-| push 被拒绝 `rejected (fetch first)` | 建仓库时勾了 "Add a README file" → 先 `git pull --rebase origin main` 再 push |
+| push 被拒绝 `rejected (fetch first)` | ① 建仓库时勾了 "Add a README file"；② **机器人自动提交了 `data/pushed_dois.json`**（最常见）。别手动折腾，直接双击 `push.cmd`，它会自动 fetch + rebase + 重试推送 |
 | 每周都跑但状态文件没更新 | 正常。`data/pushed_dois.json` 无变化时脚本会主动跳过 commit |
 | 黄色警告 `Node.js 20 is deprecated` | **任务仍然会成功，但要修**。三个官方 action 的旧大版本内部声明的是 Node 20，而 Node 20 已于 **2026-09-23 从 runner 上彻底移除**。本项目已升级到 `checkout@v7` / `setup-python@v7` / `upload-artifact@v7`（内部为 `node24`）。以后凡是「绿色 ✔ + 黄条警告」，八成都是这类依赖过时，去对应 action 的 releases 页取最新大版本号即可 |
 
@@ -445,6 +447,68 @@ AI 打分失败时卡片会打 `AI 打分失败` 标签，且该文献仍会展�
 
 ## 如何修改
 
+### 改完怎么生效：一键同步到 GitHub
+
+**改什么 = 改哪里**（全部在 `src/config.py` 里，改完不用动其它任何文件）：
+
+| 想改什么 | 改哪个变量 |
+|---|---|
+| 研究方向（换课题） | `RESEARCH_FIELD` + `RESEARCH_DESCRIPTION` + `USER_KEYWORDS` + `TOPIC_QUERY` |
+| **关键词** | **`USER_KEYWORDS`** |
+| **期刊** | **`JOURNALS`** |
+| 检索方式 | `RETRIEVAL_MODE` |
+| 评分阈值 / 并发 / 时间窗 | `AI_THRESHOLD` / `AI_MAX_WORKERS` / `LOOKBACK_DAYS` |
+| 密钥、AI 供应商、收件人 | **GitHub Secrets**，改完即生效，**不用改代码也不用 push** |
+
+**推荐流程**（三步）：
+
+```bash
+# ① 本地改 src/config.py
+# ② 先看检索结果对不对，别白等一周
+python -m src.main --dry-run --no-ai --verbose
+python -m src.main --find-topic          # 确认主题解析到了正确方向
+
+# ③ 同步到 GitHub
+.\push.cmd                                # 或者在资源管理器里双击 push.cmd
+```
+
+`push.cmd`（实际逻辑在 `push.ps1`）会依次做 5 件事：
+
+1. 检查待提交文件，**拦住 `.env` 等敏感文件**（推上去就泄露了，而且删掉也仍留在 git 历史里）
+2. 跑 52 个单元测试，**不通过就中止**（配置改错了根本推不上去）
+3. `fetch` + `rebase` ← **关键，见下方说明**
+4. `push`，失败自动重试 4 次（`github.com` 在国内时通时不通）
+5. 校验远程 commit 和本地是否一致
+
+> **★ 为什么第 3 步「rebase」不能省**
+>
+> 每次真实发信后，GitHub 上的机器人会**自动提交一次** `data/pushed_dois.json`
+> （记录已推送的 DOI，防止下周重复推送给你）。
+> 也就是说**远程永远会比你本地多一个提交**。
+> 如果你直接 `git push`，会被拒绝并报：
+>
+> ```
+> ! [rejected]        main -> main (fetch first)
+> error: failed to push some refs to 'https://github.com/...'
+> ```
+>
+> 这**不是你把什么东西弄坏了**，只是需要先同步。`push.cmd` 已经帮你处理好。
+> 手动操作的话就是先 `git pull --rebase origin main`，再 `git push origin main`。
+
+> **另一种改法：直接在 GitHub 网页上改**
+>
+> 在仓库里点开 `src/config.py` → 右上角铅笔图标 → 改 → 底部 **Commit changes**。
+> **不用装 Git、不用碰命令行、改完立刻生效**，适合只调一两行的情况。
+>
+> 代价是本地文件会变旧：下次从本地 push 之前，必须先
+> `git pull --rebase origin main` 把网页上的改动拉回来（`push.cmd` 会做）。
+>
+> 两种方式混着用容易忘了同步 —— **习惯用哪种就一直用哪种**。
+
+> ⚠️ **改完一定要确认检索量没变成 0**。期刊 ISSN 写错、或关键词与本方向完全不搭，
+> 都可能让候选集变成空集 —— 而程序不会报错，你只会收到一封「本周无新文献」的心跳邮件。
+> 用 `python -m src.main --dry-run --no-ai --verbose` 看一眼「候选 N 篇」就放心了。
+
 ### 如何换研究方向
 
 **只需要改 `src/config.py` 里的一段配置**，其它文件一个字都不用动。
@@ -549,6 +613,12 @@ JOURNALS: dict[str, str] = {
 
 ISSN 可在 [OpenAlex Sources](https://openalex.org/sources) 或期刊官网查询。
 
+> ⚠️ **ISSN 写错不会报错，只会返回 0 篇**，表现是收到一封「本周无新文献」的心跳邮件。
+> 改完务必跑一次 `python -m src.main --dry-run --no-ai` 确认「候选 N 篇」不是 0。
+>
+> ⚠️ **跨学科换向必须同时换期刊**。当前这 11 本是材料 / 能源 / 化学类，
+> 如果你想换成计算机、医学等方向，光改研究方向会让候选集几乎为空（同样不报错）。
+
 ### 改检索模式（第 1 层）
 
 `RETRIEVAL_MODE` 三选一：
@@ -576,6 +646,10 @@ ISSN 可在 [OpenAlex Sources](https://openalex.org/sources) 或期刊官网查�
 >
 > ⚠️ 想加**排除项**（例如"不要聚合物电解质"）请写进 `RESEARCH_DESCRIPTION`。
 > 写在 `USER_KEYWORDS` 里只会让召回/评分范围变大，起不到排除作用。
+>
+> **一句话总结**：在默认的 `topic` 模式下改了 `USER_KEYWORDS`，会发现"候选量一点没变"——
+> 那是**正常的**，变的是 AI 评分的那把尺子。想让新关键词真正参与**检索**，
+> 要么改 `TOPIC_QUERY`，要么把 `RETRIEVAL_MODE` 改成 `keyword` / `both`。
 
 ### 换 AI 供应商
 
