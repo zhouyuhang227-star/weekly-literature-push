@@ -64,7 +64,28 @@
 git --version
 ```
 
-如果报「无法将"git"项识别为 cmdlet…」，说明 Git 还没装。二选一：
+如果报「无法将"git"项识别为 cmdlet…」，有**两种**可能，先别急着重装：
+
+**① 装过 Git，但终端没读到 PATH**（更常见）
+
+安装到**非默认目录**（例如 `E:\Git`）时尤其容易这样。先查注册表确认：
+
+```powershell
+Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+  "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+  "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
+  Where-Object { $_.DisplayName -like "*Git*" } | Select-Object DisplayName, InstallLocation
+```
+
+有输出（例如 `InstallLocation : E:\Git\`）就说明已经装了。两种办法：
+**重开终端**（最干净），或在本会话里临时加进 PATH：
+
+```powershell
+$env:Path = "E:\Git\cmd;" + $env:Path   # 把路径换成上面查到的 InstallLocation
+git --version
+```
+
+**② 确实还没装** —— 二选一：
 
 | 方案 | 下载 | 说明 |
 |---|---|---|
@@ -72,6 +93,10 @@ git --version
 | **GitHub Desktop** | <https://desktop.github.com> | 图形界面，适合完全不想碰命令行的人 |
 
 装完**重开终端**（PATH 才会刷新），再验证一次 `git --version`。
+
+> **别忘了配邮箱**：`git config --global user.email "you@example.com"`。
+> 只配了 `user.name` 的话 `git commit` 会直接报错。
+> 不想暴露真实邮箱可用 GitHub 的 noreply 地址：`<用户名>@users.noreply.github.com`。
 
 ### 第 1 步：先本地跑通预览
 
