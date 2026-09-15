@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 本地私密配置（绝不入库）
+.env
+.env.*
+*.local
+
+# 运行时产物：日志与 dry-run 邮件 HTML
+# 这两个目录不入库，GitHub Actions 中改用 upload-artifact 保存，避免污染 git 历史
+data/logs/
+data/outbox/
+
+# 语义主题解析缓存：机器生成、可一键重建（一次 API 请求）
+# 不入库可避免每次换研究方向都产生无意义的 diff
+data/topics_cache.json
+
+# 注意：data/pushed_dois.json 必须入库！它是去重状态的唯一来源
+!data/pushed_dois.json
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

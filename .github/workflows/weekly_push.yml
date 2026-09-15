@@ -1,0 +1,127 @@
+name: weekly-literature-push
+
+# 每周三 23:07（北京时间）自动运行 + 支持手动触发
+#
+# timezone 字段是 GitHub Actions 官方支持的写法（IANA 时区名），
+# 因此无需再手工做 UTC 换算（若写成 UTC 则是 "7 15 * * 3"）。
+#
+# 为什么是 07 分而不是整点 00 分：GitHub 官方文档明确说明 schedule 事件
+# 在 Actions 负载高峰时会被延迟，而"高峰期包括每个整点"，
+# 故避开整点能显著降低延迟概率。改回整点只需把 cron 写成 "0 23 * * 3"。
+on:
+  schedule:
+    - cron: "7 23 * * 3"
+      timezone: "Asia/Shanghai"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只生成邮件 HTML（存为 artifact），不发邮件、不改去重状态"
+        type: boolean
+        default: false
+      lookback_days:
+        description: "覆盖时间窗天数，留空则使用默认（首次 30 天 / 常规 14 天）"
+        required: false
+        type: string
+      retrieval_mode:
+        description: "第 1 层检索方式：topic（语义主题，默认）/ keyword（字面关键词）/ both（并集）"
+        required: false
+        type: choice
+        default: topic
+        options:
+          - topic
+          - keyword
+          - both
+
+# 允许把更新后的 data/pushed_dois.json 提交回仓库
+permissions:
+  contents: write
+
+# 防止两次运行并发导致 push 冲突
+concurrency:
+  group: weekly-literature-push
+  cancel-in-progress: false
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run pipeline
+        env:
+          # OpenAlex 礼貌池（建议填你的邮箱）；不填也能跑，但速率更低
+          OPENALEX_MAILTO: ${{ secrets.OPENALEX_MAILTO }}
+          # AI（任何 OpenAI 兼容端点，默认 DeepSeek）
+          AI_BASE_URL: ${{ secrets.AI_BASE_URL }}
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_MODEL: ${{ secrets.AI_MODEL }}
+          # 邮件
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: |
+          set -euo pipefail
+          ARGS=()
+          if [ "${{ inputs.dry_run || 'false' }}" = "true" ]; then
+            ARGS+=("--dry-run")
+          fi
+          if [ -n "${{ inputs.lookback_days }}" ]; then
+            ARGS+=("--lookback-days" "${{ inputs.lookback_days }}")
+          fi
+          if [ -n "${{ inputs.retrieval_mode }}" ]; then
+            ARGS+=("--retrieval-mode" "${{ inputs.retrieval_mode }}")
+          fi
+          echo "运行参数：${ARGS[*]:-（无）}"
+          python -m src.main -v "${ARGS[@]}"
+
+      # 日志改走 artifact，避免每周 commit 导致仓库历史膨胀
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-logs-${{ github.run_number }}
+          path: data/logs/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Upload dry-run email preview
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: email-preview-${{ github.run_number }}
+          path: data/outbox/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      # 只在流水线成功（即邮件确实发出）后才回写状态
+      - name: Commit pushed DOIs
+        if: success() && inputs.dry_run != true
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add data/pushed_dois.json
+          if git diff --cached --quiet; then
+            echo "去重状态无变化，跳过提交"
+            exit 0
+          fi
+
+          git commit -m "chore: update pushed DOIs $(date +%F)"
+          git push

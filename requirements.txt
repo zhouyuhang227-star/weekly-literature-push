@@ -1,0 +1,8 @@
+# 刻意只依赖 requests，其余全部使用标准库
+# （smtplib / email / logging / json / zoneinfo / concurrent.futures / argparse）
+# 以降低 GitHub Actions 环境的踩坑概率。
+requests>=2.31
+
+# 本地 Windows 缺少 IANA 时区数据库，zoneinfo.ZoneInfo("Asia/Shanghai") 会抛
+# ZoneInfoNotFoundError。Linux/macOS 自带 /usr/share/zoneinfo，此包为无害空操作。
+tzdata>=2024.1
