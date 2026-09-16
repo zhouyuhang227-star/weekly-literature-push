@@ -53,6 +53,7 @@ from . import (
     mailer,
     openalex_client,
     ranking,
+    sources,
 )
 from .config import (
     AI_THRESHOLD,
@@ -181,6 +182,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--sources",
+        default=None,
+        metavar="LIST",
+        help=(
+            "本轮启用的数据源，逗号分隔（默认用 config.DATA_SOURCES："
+            "openalex,crossref,semantic_scholar 全开）。"
+            "例：--sources openalex 只跑主源；--sources crossref,s2 只用备用源"
+        ),
+    )
+    parser.add_argument(
         "--to",
         default=None,
         metavar="ADDR",
@@ -273,6 +284,12 @@ def show_config(args: argparse.Namespace) -> int:
         print(f"     主题剔除    {content_rules.describe_excludes(topic)}")
         print(f"     去重分区键  {topic.key}")
     print(f"  期刊            {len(ISSN_FILTER.split('|'))} 本")
+    try:
+        active = sources.enabled_sources(getattr(args, "sources", None))
+        source_text = " + ".join(sources.source_label(name) for name in active)
+    except Exception as exc:  # noqa: BLE001 - 配置写错也要能把其它信息打出来
+        source_text = f"⚠️ {exc}"
+    print(f"  数据源          {source_text}   ← 每轮全部查询后按 DOI 合并")
     print(
         f"  时间窗          首次 {LOOKBACK_DAYS_FIRST_RUN} 天 / 之后 {LOOKBACK_DAYS} 天"
         f"（最多拉取 {MAX_WORKS_FETCH} 篇）"
@@ -374,6 +391,14 @@ def run(args: argparse.Namespace) -> int:
             log.info("  【%s】%s", label, detail)
         log.info("  【内容】%s", content_rules.summary(topic))
     log.info("【排序】%s", ranking.describe())
+    try:
+        _active_sources = sources.enabled_sources(getattr(args, "sources", None))
+        log.info(
+            "【数据源】%s（每轮全部查询后按 DOI 合并；单源失败不影响其余源）",
+            " + ".join(sources.source_label(name) for name in _active_sources),
+        )
+    except Exception as exc:  # noqa: BLE001 - 下面 fetch_works 会给出更完整的报错
+        log.warning("【数据源】配置有问题：%s", exc)
     if keywords:
         if len(topics) > 1:
             log.warning("【覆盖】--keywords 在多主题模式下会被忽略（每个主题用自己的 keywords）")
@@ -457,17 +482,25 @@ def run_topic(
         "首次运行预热" if first_run else "常规滚动",
     )
 
-    # ---- 3. 检索（第 1 层筛选：主题分类 / 字面关键词）----
-    works = openalex_client.fetch_works(
+    # ---- 3. 检索（第 1 层筛选：多数据源并集 → 按 DOI 合并）----
+    # 见 src/sources/__init__.py：每轮把所有启用的源**都问一遍**再合并，
+    # 而不是「主源挂了才切备用」—— 后者会把源故障伪装成「本周没有新论文」，
+    # 而那正是这个项目吃过的最大的亏。
+    fetched = sources.fetch_works(
         keywords,
         lookback_days,
         max_works=args.max_fetch,
         mode=mode,
         topic=topic,
+        sources=getattr(args, "sources", None),
     )
+    works = fetched.works
     total_candidates = len(works)
+    log.info("%s检索汇总：%s", prefix, fetched.summary())
+    for notice in fetched.notices():
+        log.warning("%s%s", prefix, notice)
     if not total_candidates:
-        log.warning("%sOpenAlex 未返回任何候选文献（时间窗 %s 天）", prefix, lookback_days)
+        log.warning("%s所有数据源都没返回候选文献（时间窗 %s 天）", prefix, lookback_days)
 
     # ---- 4. 去重（按主题各自的记录）----
     fresh = dedup.filter_new(works, topic_key=topic.key)
@@ -511,6 +544,12 @@ def run_topic(
         )
 
     # ---- 7. 渲染 ----
+    # 数据源与主题都写进页头元信息：用户一眼能看出这轮的候选是几个源凑出来的。
+    meta_extras = []
+    if total > 1:
+        meta_extras.append(f"主题：{topic.name}")
+    meta_extras.append(f"数据源：{fetched.summary()}")
+
     html_body, plain_body = mailer.build_html(
         selected,
         run_date,
@@ -522,7 +561,8 @@ def run_topic(
         ai_failed=len(ai_failed),
         title=topic.email_title,
         max_items=args.max_items,
-        extra_meta=f"主题：{topic.name}" if total > 1 else "",
+        extra_meta=" ｜ ".join(meta_extras),
+        extra_notices=fetched.notices(),
     )
 
     stats = {
@@ -533,6 +573,7 @@ def run_topic(
         "selected": len(selected),
         "shown": min(len(selected), args.max_items),
         "mailed": 0,
+        "sources": fetched.summary(),
     }
 
     # ---- 8. 输出 ----

@@ -18,7 +18,7 @@
 
 | 层级 | 手段 | 作用 | 实测候选量 |
 |---|---|---|---|
-| 第 1 层 | OpenAlex 的**字面短词召回**（`title_and_abstract.search`） | 按研究方向捞出**可能相关**的全部论文 | ~18 / ~43 篇 / 30 天（两个主题） |
+| 第 1 层 | **多源字面短词召回**（OpenAlex + Crossref + Semantic Scholar，三源各自查完后按 DOI 合并） | 按研究方向捞出**可能相关**的全部论文 | 首次 90 天窗下两个主题各约 70～110 篇；常规 14 天窗约 20～60 篇 |
 | 第 2 层 | AI 逐篇打分（0–100），低于阈值丢弃 | 按**你的具体兴趣**做精读判断 | ~20 篇入选 |
 
 > 第 1 层也可以用 OpenAlex 的**语义主题** `topics.id`（`--retrieval-mode topic`），
@@ -36,7 +36,9 @@
 > 两种加成**只管排序，不管入选** —— 是否进邮件依旧只看 AI 分数是否过 `AI_THRESHOLD`。
 > 详见 [内容加权](#内容加权bonus_rules--exclude_rules)。
 
-- 检索：**OpenAlex**（免费；填 `OPENALEX_MAILTO` 进礼貌池更快，可选填 `OPENALEX_API_KEY` 换独立额度）
+- 检索：**三个免费数据源并集** —— OpenAlex（主）+ Crossref + Semantic Scholar（备用）。
+  三源各查一遍再按 DOI 合并；**任一源挂掉不影响其余源**，并在邮件页头显式提示。
+  详见 [数据源](#数据源)
 - 筛选：任意 **OpenAI 兼容** 的 AI 接口（默认 DeepSeek `deepseek-chat`）
 - 邮件：SMTP（QQ / Gmail / 163 / Outlook…）
 - 调度：**GitHub Actions**（仓库自带 workflow，无需服务器）
@@ -49,8 +51,14 @@
 .
 ├── .github/workflows/weekly_push.yml   # 定时任务（每周五 23:07 北京时间）
 ├── src/
-│   ├── config.py                       # ★所有"可能要改"的参数（研究方向、期刊、阈值）
+│   ├── config.py                       # ★所有"可能要改"的参数（研究方向、期刊、阈值、数据源）
 │   ├── logger.py                       # 日志初始化（时区正确、幂等）
+│   ├── sources/                        # ★多数据源层（三源并集）
+│   │   ├── __init__.py                 #   调度：全查 → 合并 → 去重 → 单源失败不影响其余
+│   │   ├── base.py                     #   work 统一结构、DOI 归一、本地字面复核、源名注册表
+│   │   ├── openalex.py                 #   主源适配器
+│   │   ├── crossref.py                 #   Crossref 适配器（按 ISSN 逐刊查 + 本地复核）
+│   │   └── semantic_scholar.py         #   Semantic Scholar 适配器（单次 bulk 查询 + 自带限流）
 │   ├── openalex_client.py              # 第 1 层召回：拼查询 + 分页 + 解析 + 主题解析
 │   ├── abstract_source.py              # 摘要三级回退：OpenAlex → Crossref → S2
 │   ├── ai_matcher.py                   # 第 2 层：AI 并发打分 + 稳健 JSON 解析
@@ -59,7 +67,7 @@
 │   ├── dedup.py                        # DOI 去重 + 运行状态持久化（按主题分区）
 │   ├── mailer.py                       # HTML 渲染 + SMTP 发送
 │   └── main.py                         # 主流程编排（多主题循环）+ 命令行
-├── tests/test_core.py                  # 150 个单元测试（锁定高风险修复）
+├── tests/test_core.py                  # 203 个单元测试（锁定高风险修复）
 ├── data/
 │   ├── pushed_dois.json                # 去重状态（唯一需要提交的文件）
 │   ├── topics_cache.json               # 语义主题解析缓存（已 gitignore，自动重建）
@@ -195,12 +203,13 @@ git push -u origin main
 ### 第 4 步：配置 Secrets
 
 打开仓库页 **Settings → Secrets and variables → Actions → New repository secret**，
-依次添加下面 9 个必填 / 建议填的（本地调试时可改成环境变量）：
+依次添加下面 10 个必填 / 建议填的（本地调试时可改成环境变量）：
 
 | Secret | 必填 | 说明 | 示例 |
 |---|---|---|---|
 | `OPENALEX_MAILTO` | 建议 | 你的邮箱，OpenAlex 会把你放进**礼貌池**（更快、更稳）。留空则复用 `SMTP_USER` | `you@example.com` |
 | `OPENALEX_API_KEY` | 可选 | 只有碰到「当日额度用完（429）」才需要。在 openalex.org 免费注册后可拿到；不填也完全能跑 | `xxxxxxxx` |
+| `CROSSREF_MAILTO` | 可选 | Crossref 礼貌池邮箱（填了请求更快更稳）。不填则用仓库默认邮箱 | `you@example.com` |
 | `AI_BASE_URL` | ✅ | OpenAI 兼容端点 | `https://api.deepseek.com/v1` |
 | `AI_API_KEY` | ✅ | AI 平台的 API Key | `sk-xxxxxxxx` |
 | `AI_MODEL` | ✅ | 模型名 | `deepseek-chat` |
@@ -270,7 +279,7 @@ on:
 | 黄色警告 `Node.js 20 is deprecated` | **任务仍然会成功，但要修**。三个官方 action 的旧大版本内部声明的是 Node 20，而 Node 20 已于 **2026-09-23 从 runner 上彻底移除**。本项目已升级到 `checkout@v7` / `setup-python@v7` / `upload-artifact@v7`（内部为 `node24`）。以后凡是「绿色 ✔ + 黄条警告」，八成都是这类依赖过时，去对应 action 的 releases 页取最新大版本号即可 |
 | **改了 `keywords`，候选量一点没变** | **不是 bug**：`keywords` 是给 AI 的打分尺，召回去看 `search_terms`（见 [两把旋钮](#two-knobs)）。拿不准就跑 `python -m src.main --show-config` |
 | **两个主题的候选数一模一样 / 都不像自己方向 / 少到发慌** | 这是曾经真实发生过的事故：主题短语解析为 0 时旧版本会**静默丢掉主题条件**，退化成「全部期刊近 30 天」全库检索，两个主题拿到同一批无关论文。现已改成**直接报错**（`RuntimeError` + 退出码非 0 + Actions 变红）。看到红色 ≠ 坏了，而是它在告诉你“召回条件没生效” |
-| 报 `OpenAlex 今日额度已用完（HTTP 429）` | 2026 年起 OpenAlex 按请求计费（匿名 1000 积分/天）。当天调试次数太多就会耗尽，**要等次日 UTC 零点**，重试无用。临时办法：触发 GitHub Actions（走另一套出口 IP）；彻底解决：配 `OPENALEX_API_KEY` |
+| 报 `OpenAlex 今日额度已用完（HTTP 429）` | 2026 年起 OpenAlex 按请求计费（匿名 1000 积分/天）。当天调试次数太多就会耗尽，**要等次日 UTC 零点**，重试无用。**但因为现在有三源并集，这已经不会让周报断更**：本轮先用备用源 `--sources crossref,s2` 应一下，或直接等定时任务自己跑（Actions 走另一套出口 IP）；彻底解决：配 `OPENALEX_API_KEY` |
 
 > **想让定时任务更准时**：GitHub 官方文档明确说明**整点（minute = 0）是负载高峰**，
 > 任务可能被延迟几分钟甚至几十分钟，所以本项目已经把 cron 设成了非整点的
@@ -288,6 +297,7 @@ python -m src.main [选项]
 |---|---|
 | `--dry-run` | 只把邮件 HTML 写到 `data/outbox/`，不发信、不写状态 |
 | `--retrieval-mode X` | 第 1 层召回方式：`keyword`（**默认**，主题 `search_terms` 字面短词，粒度准）/ `topic`（OpenAlex 语义主题，粒度粗）/ `both`（并集） |
+| `--sources LIST` | 本轮启用哪些数据源，逗号分隔（默认 `config.DATA_SOURCES` = 三个全开）。例：`--sources openalex` 只跑主源（请求最少）；`--sources crossref,s2` 只用备用源（排查主源时用）。简写 `oa` / `cr` / `s2` 均可 |
 | `--force-first-run` | 强制按首次运行处理（用 90 天预热窗） |
 | `--lookback-days N` | 临时覆盖时间窗天数，如 `--lookback-days 90` 回补三个月 |
 | `--max-items N` | 单封邮件最多展示篇数（默认 20） |
@@ -331,6 +341,12 @@ python -m src.main --find-topic "perovskite solar cell"
 
 # 多主题时只跑其中一个方向（名字或 key 都行，可重复）
 python -m src.main --dry-run --topic 富锂锰正极
+
+# OpenAlex 额度用光 / 疑似被限流时，先用备用源把这一轮跑出来
+python -m src.main --dry-run --sources crossref,s2
+
+# 只跑主源（请求最少、最快）
+python -m src.main --show-config --sources openalex
 ```
 
 ---
@@ -358,8 +374,12 @@ python -m src.main --dry-run --topic 富锂锰正极
 ```mermaid
 flowchart LR
     A[校验配置] --> B[判定时间窗]
-    B --> C["第 1 层：OpenAlex 召回<br/>14 期刊 × 主题 search_terms"]
-    C --> D[DOI 去重]
+    B --> C1["第 1 层：三源召回<br/>OpenAlex（主源）"]
+    B --> C2["Crossref<br/>逐刊 ISSN + 本地复核"]
+    B --> C3["Semantic Scholar<br/>单次 bulk 查询"]
+    C1 --> D[按 DOI 合并去重<br/>单源失败只用其余源]
+    C2 --> D
+    C3 --> D
     D --> E[摘要三级回退]
     E --> F["第 2 层：AI 并发相关性打分"]
     F --> G[阈值过滤]
@@ -379,6 +399,86 @@ flowchart LR
 
 **关键安全约定：只有邮件发送成功才回写状态。** 否则一旦 SMTP 挂了，
 文献会被标记成"已推送"而永久丢失。
+
+### 数据源（第 1 层到底“问谁要”）
+
+<a id="数据源" name="数据源"></a>
+
+**问题**：只有一个数据源时，“这个源今天状态不好”就等于“这周没有文献”。
+OpenAlex 2026 年起按额度计费（匿名 1000 积分/天），调试期间很容易打光；
+更坑的是它是**静默**变差 —— 返回 429 而不是空列表，旧版本会把它当成“没搜到”。
+
+**做法**：`config.DATA_SOURCES` 里配的源，**每轮全部查一遍，再按 DOI 合并**。
+
+```python
+DATA_SOURCES = ("openalex", "crossref", "semantic_scholar")   # 顺序即优先级
+```
+
+> 这里**故意不做自动降级**（主源失败才用备用源）。自动降级有个隐蔽毛病：
+> 主源“部分成功”（只返回 3 篇而不是 300 篇）时它不会触发，你以为跑得好好的，
+> 其实已经漏了一周。全查 + 合并没有这个盲区，代价只是多几次 HTTP 请求（都免费）。
+
+#### 三个源各自的特点（实测）
+
+| | OpenAlex（主） | Crossref | Semantic Scholar |
+|---|---|---|---|
+| 覆盖 | 最全 | 全，但 **RSC 的 EES 一条都没有** | 偏 CS/生物，材料类命中少 |
+| 期刊定位 | ISSN 精确过滤 | 按 ISSN 逐刊查 | **期刊名/ISSN 常年错**，只能按 DOI 前缀认 |
+| 摘要覆盖率 | 高 | Wiley ≈100%、ACS ≈88%、Nature 系 ≈0 | 中（约 80%） |
+| 查询语法 | `title_and_abstract.search` 短语级 | `query.title` 是**分词**的，不是短语 | OR 必须用竖线 `\|` 分隔，空格 = AND |
+| 限流 | 有日额度，会 429 | 走 polite pool（填 `mailto`） | ~1 请求/秒，需自己节流 |
+| 关键词模式 | keyword / topic / both | 只支持字面关键词 | 只支持字面关键词 |
+
+三条由此推出的硬性约定：
+
+1. **Crossref 的结果必须本地复核。** 实测 `query.title=lithium-rich` 返回的
+   前 71 篇全是锂金属/电解液论文（`li-rich` 被拆成了 `li` + `rich`）。
+   程序会用主题的 `search_terms` 在本地的“标题+摘要”里再匹配一遍**整词**，
+   不匹配的直接丢掉，并记进日志。
+2. **Semantic Scholar 的期刊名不可信，一律按 DOI 前缀判定。**
+   实测一篇货真价实的 *Advanced Materials* 论文（`10.1002/adma.74958`）
+   被它写成 `venue = "Advances in Materials"`、`issn = "2327-2503"`；
+   *Angewandte* 干脆没有期刊字段。所以 `config.JOURNAL_DOI_PATTERNS`
+   才是唯一可信依据（`10.1002/adma.` → Advanced Materials），
+   期刊名只作兜底（`config.S2_VENUE_ALIASES`）。
+   遇到认不出来的期刊名会**记 WARNING 并列出名字**，不会静默丢掉。
+3. **`Energy & Environmental Science` 目前只有 OpenAlex 能召回。**
+   RSC 的 DOI 形如 `10.1039/D6EE01234A`，既没有可判别的 DOI 前缀，
+   Crossref 里也**查不到任何一条它的记录**（实测 `issn:1754-5706` → `total = 0`）。
+   只跑备用源时，“EES 0 篇”是**正常现象**，日志里会专门写一句提醒。
+
+#### 出错时的行为（三种，都不会静默）
+
+| 情况 | 行为 |
+|---|---|
+| 某一个源失败（429 / 超时 / HTTP 500） | 其余源照常合并发信；邮件**页头**出现 `⚠️ 本轮有数据源不可用（OpenAlex），结果由其余数据源合并而来，可能比平时少。`；日志里记具体原因 |
+| 源只支持关键词、但本轮是 `topic` 模式 | 该源标为“未参与”并说明原因，不算失败 |
+| **所有**源都失败 | 直接 `RuntimeError` 中断该主题（Actions 变红），不发明知道不完整的邮件 |
+
+> 页头提示不是装饰。**日志在手机上没人看，页头才看得见** ——
+> “这周只有 4 篇”和“这周三个源都正常，就是没几篇”是两件完全不同的事，
+> 必须让你一眼分清。
+
+#### 怎么调整
+
+```bash
+python -m src.main --show-config                         # 看当前启用了哪些源
+python -m src.main --show-config --sources crossref,s2   # 预览“只用备用源”的样子
+python -m src.main --dry-run --sources crossref,s2       # 主源挂了时的应急跑法
+```
+
+要永久改：编辑 `config.py` 的 `DATA_SOURCES`（顺序即优先级，
+合并同一条论文的元数据时以先到的为准）。**留空会直接报错**，
+不允许出现“一个源都没有”的状态。
+
+相关参数（都在 `config.py`）：
+
+| 参数 | 默认 | 作用 |
+|---|---|---|
+| `DATA_SOURCES` | 三个全开 | 启用哪些源 |
+| `CROSSREF_ROWS` / `CROSSREF_CONCURRENCY` | 100 / 5 | 每刊拉多少条、并发几个刊 |
+| `CROSSREF_MAILTO` | 仓库邮箱 | Crossref polite pool，**建议改成你的邮箱** |
+| `S2_BULK_LIMIT` / `S2_MIN_INTERVAL` | 1000 / 1.1 | S2 单次上限、最小请求间隔（秒） |
 
 ### 第 1 层：为什么默认用「字面短词」而不是「语义主题」
 
@@ -417,7 +517,8 @@ Actions 变红。宁可贵主题失败，也不要「绿着跑错」。
 #### 短词 OR 并联 vs 长短语：实测差距 18 倍
 
 `search_terms` 是**逐字**在标题/摘要里匹配的，所以「越像论文里真会写的短词越好」。
-以「富锂锰正极」为例，30 天 / 14 本刊实测：
+以「富锂锰正极」为例，30 天 / 14 本刊实测（这是当时条件下的数据；配置后来变成了
+90 天 / 15 本刊 / 三源，但下面「短词 ≫ 长短语」的结论完全不变）：
 
 | 写法 | 召回 |
 |---|---|
@@ -632,7 +733,7 @@ python -m src.main --find-topic "solid-state battery"   # 只有 topic 模式下
 `push.cmd`（实际逻辑在 `push.ps1`）会依次做 5 件事：
 
 1. 检查待提交文件，**拦住 `.env` 等敏感文件**（推上去就泄露了，而且删掉也仍留在 git 历史里）
-2. 跑全部单元测试（当前 150 个），**不通过就中止**（配置改错了根本推不上去）
+2. 跑全部单元测试（当前 203 个），**不通过就中止**（配置改错了根本推不上去）
 3. `fetch` + `rebase` ← **关键，见下方说明**
 4. `push`，失败自动重试 4 次（`github.com` 在国内时通时不通）
 5. 校验远程 commit 和本地是否一致
@@ -788,6 +889,15 @@ JOURNALS: dict[str, str] = {
 ```
 
 ISSN 可在 [OpenAlex Sources](https://openalex.org/sources) 或期刊官网查询。
+
+**新增期刊后建议顺手做两件事**（因为期刊列表现在同时喂给三个数据源）：
+
+1. 在 `JOURNAL_DOI_PATTERNS` 里为该期刊加一条 DOI 前缀（如 `"10.1002/adfm."`）。
+   不加也能跑：备用源会退回到用期刊名匹配，识别不到时只记 WARNING 不丢文献；
+   但**加了之后才能把 Semantic Scholar 写错的期刊名掰回来**（见 [数据源](#数据源)）。
+2. 跑一次 `python -m src.main --dry-run --no-ai -v`，看日志里每个源各命中几篇。
+   若某个源对这本刊**稳定为 0**（如 RSC 的 EES 在 Crossref 里就是 0），
+   那就是那家的收录问题，不是配置错了。
 
 > ⚠️ **ISSN 写错不会报错，只会返回 0 篇**，表现是收到一封「本周无新文献」的心跳邮件。
 > 改完务必跑一次 `python -m src.main --dry-run --no-ai` 确认「OpenAlex 命中总数」不是 0。
@@ -1099,7 +1209,7 @@ on:
 ## 本地开发
 
 ```bash
-# 跑测试（150 个）
+# 跑测试（203 个）
 python -m unittest discover -s tests -v
 
 # 语法检查
@@ -1134,6 +1244,16 @@ python -m src.main --to your@email.com --lookback-days 7
 - **AI 打分结果必须分成"入选 / 调用失败 / 低于阈值"三堆**，
   且失败项不得混进"低于阈值"（否则会被错误标记已读而永不重试）
 - 无 DOI 文献必须丢弃、期刊名可从 ISSN 表兜底
+- **多源并集不得退化成“自动降级”**：每个启用的源都必须真的被调用（回归测试）
+- **单源失败不得拖垮整轮**：其余源照常合并发信，并把故障写进邮件页头的 `notices`（回归测试）
+- **全部源失败必须报错**，不得发出一封看似正常的“本周无新文献”心跳邮件（回归测试）
+- **Crossref 结果必须本地复核召回词**：`query.title=lithium-rich` 返回的
+  “Lithium Metal Batteries” 必须被丢掉（回归测试）
+- **Crossref 只支持字面关键词**：`topic` 模式下应标为“未参与”而不是抦空（回归测试）
+- **Semantic Scholar 的期刊识别必须按 DOI 前缀**：
+  `10.1002/adma.74958` 必须认成 Advanced Materials，认不出来的期刊名要记 WARNING（回归测试）
+- **同一个 DOI 从两个源回来只能算一篇**，且保留最长摘要、累加 `sources`（回归测试）
+- **召回词全部太短时降级为“不复核”而不是“清空候选集”**（回归测试）
 - AI 返回的字符串分数必须转成 `int`（回归测试）
 - HTML 转义（`<script>` 必须变成 `&lt;script&gt;`）
 - **期刊加成只能影响排序，不能影响入选**；同分时先看 AI 真实分（回归测试）
@@ -1175,13 +1295,12 @@ C:\Users\16047\AppData\Local\Programs\Python\Python312\python.exe -m src.main --
 
 OpenAlex 免费，但有**每日额度**：2026 年起按请求计费（匿名 1000 积分/天、约 10 积分/次 ≈ 100 次，
 用完要到次日 UTC 零点才恢复，返回 429 `Insufficient budget`）。
-本流程每次运行只需个位数请求（每主题 1–2 次翻页），**正常使用碰不到上限**；
-只有本地反复调试才会打光当天额度。
-需要更多额度可以在 openalex.org 免费注册后把 key 配成 `OPENALEX_API_KEY`。
-AI 是唯一真花钱的地方。
+**Crossref 与 Semantic Scholar 完全免费且无日额度**（S2 未认证时约 1 请求/秒，程序已自带节流）。
+所以真的把 OpenAlex 额度打光了也**不会断更** —— 备用源照常发信，
+邮件页头会提醒你“本轮 OpenAlex 不可用”，见 [数据源](#数据源)。
 
-实测 14 本期刊 / 30 天，两个主题各自的候选量约 **18 篇（富锂锰正极）** 与
-**~43 篇（钠离子正极）**，其中约 96% 带摘要。按每篇约 1.5k token 计，
+实测 15 本期刊、90 天窗口（召回词 14 个），三源合并去重后单主题候选量在 **~70～110 篇**；
+常规 14 天窗口则约 **20～60 篇**，其中约 96% 带摘要。按每篇约 1.5k token 计，
 每周一次折合约 5 万 token，用 DeepSeek 的成本约 **每月一两毛钱**。
 
 > 候选量随召回词数量与宽泛程度变化。第一次改召回词后建议先跑

@@ -26,7 +26,7 @@ on:
         type: boolean
         default: false
       lookback_days:
-        description: "覆盖时间窗天数，留空则使用默认（首次 30 天 / 常规 14 天）"
+        description: "覆盖时间窗天数，留空则使用默认（首次 90 天 / 常规 14 天）"
         required: false
         type: string
       retrieval_mode:
@@ -40,6 +40,10 @@ on:
           - both
       topic:
         description: "只跑指定主题（留空 = 跑全部；多个用英文逗号分隔，写 name 或 key 均可）"
+        required: false
+        type: string
+      sources:
+        description: "本轮启用的数据源，逗号分隔（留空 = 全部：openalex,crossref,semantic_scholar；简写 oa / cr / s2 也可用）"
         required: false
         type: string
 
@@ -81,6 +85,11 @@ jobs:
           # 用完会返回 HTTP 429 + "Insufficient budget" 并要等次日 UTC 0 点恢复。
           # 想在 Actions 里也吃到独立额度，就把这个 secret 配上（不配=空=原来的行为）。
           OPENALEX_API_KEY: ${{ secrets.OPENALEX_API_KEY }}
+          # Crossref 礼貌池邮箱（**可选**）。配上之后请求走 polite pool，响应更快更稳；
+          # 不配则用 config.py 里的默认仓库邮箱。
+          CROSSREF_MAILTO: ${{ secrets.CROSSREF_MAILTO }}
+          # 友好 UA（**可选**），不填则自动拼一个含上面邮箱的 UA。
+          LITERATURE_BOT_UA: ${{ secrets.LITERATURE_BOT_UA }}
           # AI（任何 OpenAI 兼容端点，默认 DeepSeek）
           AI_BASE_URL: ${{ secrets.AI_BASE_URL }}
           AI_API_KEY: ${{ secrets.AI_API_KEY }}
@@ -102,6 +111,9 @@ jobs:
           fi
           if [ -n "${{ inputs.retrieval_mode }}" ]; then
             ARGS+=("--retrieval-mode" "${{ inputs.retrieval_mode }}")
+          fi
+          if [ -n "${{ inputs.sources }}" ]; then
+            ARGS+=("--sources" "${{ inputs.sources }}")
           fi
           if [ -n "${{ inputs.topic }}" ]; then
             IFS=',' read -ra PICKED <<< "${{ inputs.topic }}"

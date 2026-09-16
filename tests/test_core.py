@@ -24,6 +24,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src import abstract_source, ai_matcher, config, content_rules, dedup, mailer  # noqa: E402
 from src import main as main_module  # noqa: E402
 from src import openalex_client, ranking  # noqa: E402
+from src import sources as source_layer  # noqa: E402
+from src.sources import base as source_base  # noqa: E402
+from src.sources import crossref as crossref_source  # noqa: E402
+from src.sources import semantic_scholar as semantic_scholar_source  # noqa: E402
 from src.openalex_client import (  # noqa: E402
     build_filter,
     build_keyword_query,
@@ -1233,6 +1237,16 @@ class TestMultiTopicOrchestration(unittest.TestCase):
         ]
         self.sent: list[tuple[str, str]] = []
         self.fetched: list[str] = []
+        # 多源是 main 的默认行为 —— 不把备用源 stub 掉，单测就会真的去
+        # 请求 Crossref / Semantic Scholar（慢、依赖网络、还会被限流）。
+        self._saved_adapters = dict(source_layer.ADAPTERS)
+        self.addCleanup(self._restore_adapters)
+        source_layer.ADAPTERS["crossref"] = self._no_backup
+        source_layer.ADAPTERS["semantic_scholar"] = self._no_backup
+
+    def _restore_adapters(self):
+        source_layer.ADAPTERS.clear()
+        source_layer.ADAPTERS.update(self._saved_adapters)
 
     def tearDown(self):
         config.PUSHED_FILE = self._orig_file
@@ -1240,6 +1254,11 @@ class TestMultiTopicOrchestration(unittest.TestCase):
         self.tmp.cleanup()
 
     # -- 桩 -------------------------------------------------------------
+    @staticmethod
+    def _no_backup(terms, lookback_days, max_works=None, **_kw):
+        """备用源在单测里绝不联网：返回空 = 参与了但没命中。"""
+        return []
+
     def _fake_fetch(self, keywords, lookback_days, max_works=None, mode=None, topic=None, **_kw):
         self.fetched.append(topic.name)
         return [dict(work) for work in self.WORKS]
@@ -1332,9 +1351,16 @@ class TestMultiTopicOrchestration(unittest.TestCase):
                 raise RuntimeError("检索挂了")
             return [dict(work) for work in self.WORKS]
 
+        def boom_backup(*_a, **_k):
+            raise RuntimeError("备用源也挂了")
+
         args = main_module.build_parser().parse_args([])
         with patch.object(main_module, "validate_env", lambda **_kw: None), patch.object(
             main_module.openalex_client, "fetch_works", side_effect=flaky_fetch
+        ), patch.dict(
+            # 三源全挂才会让主题失败；只挂主源时备用源会把它救回来（这正是多源的意义）
+            source_layer.ADAPTERS,
+            {"crossref": boom_backup, "semantic_scholar": boom_backup},
         ), patch.object(
             main_module.abstract_source, "enrich_abstracts", side_effect=lambda works: works
         ), patch.object(
@@ -1699,6 +1725,610 @@ class TestLiveResearchConfig(unittest.TestCase):
         self.assertTrue(config.GLOBAL_EXCLUDE_NOTE.strip())
         for topic in config.active_research_topics():
             self.assertIn(config.GLOBAL_EXCLUDE_NOTE.split("；")[0], topic.brief())
+
+
+class TestSourceRegistry(unittest.TestCase):
+    """数据源名册：别名归一化、打错字必须报错、启用列表去重且保序。"""
+
+    def test_aliases_normalise(self):
+        cases = {
+            "openalex": "openalex",
+            "OA": "openalex",
+            "open_alex": "openalex",
+            "cr": "crossref",
+            "cross-ref": "crossref",
+            "crossref": "crossref",
+            "s2": "semantic_scholar",
+            "semantic-scholar": "semantic_scholar",
+            "SemanticScholar": "semantic_scholar",
+        }
+        for raw, expected in cases.items():
+            self.assertEqual(source_base.canonical_source(raw), expected, raw)
+
+    def test_unknown_source_raises_instead_of_being_silently_ignored(self):
+        """--sources 打错字若被忽略，用户会以为换了源其实没换成 —— 必须炸。"""
+        with self.assertRaises(ValueError) as ctx:
+            source_base.canonical_source("openalx")
+        self.assertIn("openalex", str(ctx.exception))  # 报错里要顺带给出可用值
+
+    def test_enabled_sources_dedupes_and_keeps_order(self):
+        self.assertEqual(
+            source_layer.enabled_sources("crossref, s2, crossref"),
+            ["crossref", "semantic_scholar"],
+        )
+
+    def test_empty_selection_raises(self):
+        with self.assertRaises(RuntimeError):
+            source_layer.enabled_sources("")
+
+    def test_default_selection_follows_config(self):
+        self.assertEqual(list(source_layer.enabled_sources()), list(config.DATA_SOURCES))
+
+    def test_labels_are_human_readable(self):
+        self.assertEqual(source_base.source_label("s2"), "Semantic Scholar")
+        self.assertEqual(source_base.source_label("crossref"), "Crossref")
+
+
+class TestUnifiedWorkShape(unittest.TestCase):
+    """所有源必须产出同一份结构，否则去重、排序、期刊加成都会错。"""
+
+    def test_missing_doi_is_dropped_not_faked(self):
+        """没有 DOI 就不能去重、也点不开，宁可丢掉也不能拿标题当键。"""
+        with self.assertLogs("src.sources.base", level="WARNING"):
+            self.assertIsNone(
+                source_base.make_work(doi="", title="No DOI paper", source="openalex")
+            )
+
+    def test_shape_supplies_everything_downstream_needs(self):
+        work = source_base.make_work(
+            doi="https://doi.org/10.1002/ADMA.74958",
+            title="T",
+            source="semantic_scholar",
+            journal="Advanced Materials",
+            issn="0935-9648",
+            pub_date="2026-03-01",
+            cited_by=5,
+            abstract="a",
+            abstract_from="semantic_scholar",
+        )
+        self.assertEqual(work["doi"], "10.1002/adma.74958")  # 归一化并小写
+        self.assertEqual(work["uid"], "doi:10.1002/adma.74958")
+        self.assertEqual(work["doi_url"], "https://doi.org/10.1002/adma.74958")
+        self.assertEqual(work["sources"], ["semantic_scholar"])
+        for key in ("title", "journal", "issn", "pub_date", "cited_by", "type", "abstract"):
+            self.assertIn(key, work)
+
+
+class TestLocalRecallRecheck(unittest.TestCase):
+    """Crossref 的 query.title 是**分词**匹配，必须本地整词复核，否则假阳性大量涌入。
+
+    实测：query.title=lithium-rich 返回的 Advanced Materials 论文里，
+    排名靠前的全是锂金属/电解液方向，与富锂锰正极无关。
+    """
+
+    def test_phrase_is_matched_whole_and_not_tokenised(self):
+        work = {"title": "Lithium Metal Batteries with a Sulfide Electrolyte"}
+        self.assertEqual(source_base.matches_recall_terms(work, ["lithium-rich", "li-rich"]), [])
+
+    def test_hits_are_reported_per_term(self):
+        work = {"title": "Li-rich layered oxides", "abstract": "anion redox chemistry"}
+        self.assertEqual(
+            sorted(source_base.matches_recall_terms(work, ["li-rich", "anion redox", "sodium"])),
+            ["anion redox", "li-rich"],
+        )
+
+    def test_abstract_alone_is_enough(self):
+        work = {"title": "A cathode design", "abstract": "anion redox stabilises the lattice"}
+        self.assertEqual(source_base.matches_recall_terms(work, ["anion redox"]), ["anion redox"])
+
+    def test_very_short_terms_are_not_usable_for_recheck(self):
+        """短词会命中 nanowire 这类无关词，所以本地复核要主动放过它们。"""
+        self.assertEqual(source_base.usable_terms(["na", "li", "anion redox"]), ["anion redox"])
+
+    def test_no_usable_term_still_lets_long_terms_through(self):
+        self.assertEqual(source_base.usable_terms(["sodium ion", "anion redox"]),
+                         ["sodium ion", "anion redox"])
+
+
+class TestJournalIdentity(unittest.TestCase):
+    """S2 的刊名/ISSN 会系统性地错，只能靠 DOI 前缀认刊。"""
+
+    def test_s2_mislabelled_adma_paper_is_rescued_by_the_doi_prefix(self):
+        """实测：10.1002/adma.74958 被 S2 标成 'Advances in Materials'（另一本真实期刊）。"""
+        self.assertEqual(
+            source_base.identify_journal(
+                doi="10.1002/adma.74958",
+                venue="Advances in Materials",
+                aliases=config.S2_VENUE_ALIASES,
+            ),
+            "Advanced Materials",
+        )
+
+    def test_venue_fallback_handles_html_escaped_ampersand(self):
+        """S2 返回的刊名是 HTML 转义的（ENERGY &amp; ENVIRONMENTAL ...）。"""
+        self.assertEqual(
+            source_base.identify_journal(
+                doi="", venue="Energy &amp; Environmental Science", aliases={}
+            ),
+            "Energy & Environmental Science",
+        )
+
+    def test_alias_table_handles_angewandte_variants(self):
+        for venue in ("Angewandte Chemie", "Angewandte Chemie International Edition"):
+            self.assertEqual(
+                source_base.identify_journal(
+                    doi="", venue=venue, aliases=config.S2_VENUE_ALIASES
+                ),
+                "Angewandte Chemie Int. Ed.",
+                venue,
+            )
+
+    def test_unrecognised_venue_returns_empty_so_the_caller_can_warn(self):
+        self.assertEqual(
+            source_base.identify_journal(doi="10.9999/x", venue="Some Journal", aliases={}), ""
+        )
+
+    def test_every_configured_journal_has_a_doi_pattern_entry(self):
+        for name in config.JOURNALS:
+            self.assertIn(name, config.JOURNAL_DOI_PATTERNS)
+
+    def test_ees_is_the_only_journal_without_a_doi_prefix(self):
+        """RSC 的 DOI 里没有刊名（10.1039/D6EE01234A），所以 EES 只能靠名字兜底。"""
+        empty = [n for n, patterns in config.JOURNAL_DOI_PATTERNS.items() if not patterns]
+        self.assertEqual(empty, ["Energy & Environmental Science"])
+
+
+class TestUnionMerge(unittest.TestCase):
+    """并集合并：按 DOI 去重、取最长摘要、来源累加、按日期倒序。"""
+
+    def _work(self, **overrides):
+        work = {
+            "uid": "doi:10.1/a", "doi": "10.1/a", "title": "T", "journal": "J",
+            "issn": "", "pub_date": "2026-03-01", "cited_by": 0, "abstract": "",
+            "abstract_from": "", "sources": ["openalex"],
+        }
+        work.update(overrides)
+        return work
+
+    def test_same_doi_from_two_sources_becomes_one_entry(self):
+        merged, added = source_base.merge_works([
+            ("openalex", [self._work()]),
+            ("crossref", [self._work(sources=["crossref"])]),
+        ])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["sources"], ["openalex", "crossref"])
+        self.assertEqual(added, {"openalex": 1, "crossref": 0})
+
+    def test_longest_abstract_wins(self):
+        """并集最实在的收益：同一篇论文常常 OpenAlex 缺摘要而其它源有。"""
+        merged, _ = source_base.merge_works([
+            ("openalex", [self._work(abstract="short", abstract_from="openalex")]),
+            ("crossref", [self._work(
+                abstract="a much longer abstract", abstract_from="crossref",
+                sources=["crossref"],
+            )]),
+        ])
+        self.assertEqual(merged[0]["abstract"], "a much longer abstract")
+        self.assertEqual(merged[0]["abstract_from"], "crossref")
+
+    def test_shorter_abstract_never_overwrites_a_longer_one(self):
+        merged, _ = source_base.merge_works([
+            ("openalex", [self._work(abstract="a much longer abstract")]),
+            ("crossref", [self._work(abstract="short", sources=["crossref"])]),
+        ])
+        self.assertEqual(merged[0]["abstract"], "a much longer abstract")
+
+    def test_missing_fields_are_backfilled_but_existing_ones_win(self):
+        merged, _ = source_base.merge_works([
+            ("openalex", [self._work(journal="Advanced Materials", issn="", cited_by=3)]),
+            ("crossref", [self._work(
+                journal="别的刊", issn="0935-9648", cited_by=99, sources=["crossref"],
+            )]),
+        ])
+        self.assertEqual(merged[0]["journal"], "Advanced Materials")  # 先到的不被覆盖
+        self.assertEqual(merged[0]["cited_by"], 3)
+        self.assertEqual(merged[0]["issn"], "0935-9648")  # 缺失的补齐
+
+    def test_sorted_newest_first(self):
+        merged, _ = source_base.merge_works([("openalex", [
+            self._work(uid="doi:1", doi="1", pub_date="2026-01-01"),
+            self._work(uid="doi:3", doi="3", pub_date="2026-03-01"),
+            self._work(uid="doi:2", doi="2", pub_date="2026-02-01"),
+        ])])
+        self.assertEqual(
+            [w["pub_date"] for w in merged], ["2026-03-01", "2026-02-01", "2026-01-01"]
+        )
+
+    def test_entries_without_uid_still_dedupe_by_doi(self):
+        merged, _ = source_base.merge_works([
+            ("openalex", [{"doi": "10.1/a", "title": "T"}]),
+            ("crossref", [{"doi": "10.1/a", "title": "T"}]),
+        ])
+        self.assertEqual(len(merged), 1)
+
+
+class TestUnionFetchAggregator(unittest.TestCase):
+    """多源并集：单源失败必须活下来，全失败必须报错。"""
+
+    def setUp(self):
+        self._saved = dict(source_layer.ADAPTERS)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        source_layer.ADAPTERS.clear()
+        source_layer.ADAPTERS.update(self._saved)
+
+    @staticmethod
+    def _ok(works):
+        return lambda *_a, **_k: [dict(w) for w in works]
+
+    @staticmethod
+    def _boom(message="HTTP 500"):
+        def _fail(*_a, **_k):
+            raise RuntimeError(message)
+        return _fail
+
+    @staticmethod
+    def _work(doi, **overrides):
+        work = source_base.make_work(doi=doi, title="T", source="openalex")
+        work.update(overrides)
+        return work
+
+    def test_one_failing_source_does_not_kill_the_round(self):
+        source_layer.ADAPTERS["openalex"] = self._boom()
+        source_layer.ADAPTERS["crossref"] = self._ok([self._work("10.1/a")])
+        result = source_layer.fetch_works(["anion redox"], 90, sources="openalex,crossref")
+        self.assertEqual(len(result.works), 1)
+        self.assertEqual([r.status for r in result.reports], ["failed", "ok"])
+        self.assertTrue(result.notices(), "单源故障必须在邮件里提示")
+
+    def test_all_sources_failing_raises(self):
+        """绝不能返回空列表假装成功 —— 那正是这个项目吃过的最贵的亏。"""
+        for name in ("openalex", "crossref", "semantic_scholar"):
+            source_layer.ADAPTERS[name] = self._boom()
+        with self.assertRaises(RuntimeError) as ctx:
+            source_layer.fetch_works(["anion redox"], 90)
+        self.assertIn("所有数据源都失败了", str(ctx.exception))
+
+    def test_running_a_single_source_is_allowed(self):
+        source_layer.ADAPTERS["openalex"] = self._boom()
+        source_layer.ADAPTERS["crossref"] = self._ok([self._work("10.1/a")])
+        result = source_layer.fetch_works(["anion redox"], 90, sources="crossref")
+        self.assertEqual(len(result.works), 1)
+
+    def test_keyword_only_sources_are_skipped_not_failed_without_terms(self):
+        """topic 模式没有字面词：Crossref/S2 不参与是模式差异，不是故障。"""
+        source_layer.ADAPTERS["openalex"] = self._ok([self._work("10.1/a")])
+        result = source_layer.fetch_works(
+            [], 90, mode="topic", sources="openalex,crossref,semantic_scholar"
+        )
+        statuses = {r.name: r.status for r in result.reports}
+        self.assertEqual(statuses["crossref"], "skipped")
+        self.assertEqual(statuses["semantic_scholar"], "skipped")
+        self.assertEqual(statuses["openalex"], "ok")
+        self.assertFalse(result.notices(), "「跳过」不该被当成故障来吓用户")
+
+    def test_recall_terms_come_from_search_terms_not_only_cli_keywords(self):
+        """★ 回归锁：命令行不传 ``--keywords`` 是常态，备用源不能因此被静默跳过。
+
+        曾经这里直接拿 ``keywords`` 参数当召回词 ⇒ 词表恒为空 ⇒
+        Crossref/S2 被标成「跳过」⇒ **多源原地失效，而日志看起来一切正常**。
+        """
+        seen: dict[str, list[str]] = {}
+
+        def _spy(terms, *_a, **_k):
+            seen["terms"] = list(terms)
+            return []
+
+        source_layer.ADAPTERS["openalex"] = self._ok([])
+        source_layer.ADAPTERS["crossref"] = _spy
+        topic = config.active_research_topics()[0]
+
+        source_layer.fetch_works(None, 90, topic=topic, sources="crossref")
+
+        self.assertTrue(seen["terms"], "备用源拿到了空词表 ⇒ 多源静默失效")
+        self.assertEqual(seen["terms"], list(topic.search_terms))
+
+    def test_duplicates_across_sources_are_merged(self):
+        source_layer.ADAPTERS["openalex"] = self._ok([self._work("10.1/a", abstract="short")])
+        source_layer.ADAPTERS["crossref"] = self._ok([
+            self._work("10.1/a", abstract="a longer abstract", sources=["crossref"])
+        ])
+        result = source_layer.fetch_works(["anion redox"], 90, sources="openalex,crossref")
+        self.assertEqual(len(result.works), 1)
+        self.assertEqual(result.works[0]["abstract"], "a longer abstract")
+
+    def test_merged_result_respects_the_global_cap(self):
+        source_layer.ADAPTERS["openalex"] = self._ok(
+            [self._work(f"10.1/{i}") for i in range(10)]
+        )
+        source_layer.ADAPTERS["crossref"] = self._ok([])
+        result = source_layer.fetch_works(
+            ["anion redox"], 90, max_works=4, sources="openalex,crossref"
+        )
+        self.assertEqual(len(result.works), 4)
+
+    def test_summary_names_every_enabled_source(self):
+        source_layer.ADAPTERS["openalex"] = self._ok([self._work("10.1/a")])
+        source_layer.ADAPTERS["crossref"] = self._ok([])
+        result = source_layer.fetch_works(["anion redox"], 90, sources="openalex,crossref")
+        self.assertEqual(result.summary(), "OpenAlex 1 篇 ｜ Crossref 0 篇")
+
+    def test_failure_reason_is_flattened_so_the_header_stays_readable(self):
+        """邮件页头是一行设计：OpenAlex 那 5 行额度提示绝不能把正文挤没。"""
+        report = source_base.SourceReport(
+            name="openalex",
+            status="failed",
+            error="OpenAlex 今日额度已用完（HTTP 429）。\n  匿名配额 1000 积分/天。\n  彻底解决：注册账号。" * 3,
+        )
+        line = report.describe()
+        self.assertEqual(len(line.splitlines()), 1)
+        self.assertLess(len(line), 100)
+        self.assertTrue(line.startswith("OpenAlex 失败（"), line)
+
+        skipped = source_base.SourceReport(
+            name="crossref", status="skipped", error="该源只支持字面关键词检索，当前模式没有可用召回词"
+        )
+        self.assertEqual(skipped.describe(), "Crossref 未参与")
+
+
+class TestCrossrefAdapter(unittest.TestCase):
+    """Crossref 的 query.title 是分词匹配，本地复核不是可选项。"""
+
+    class _Resp:
+        def __init__(self, payload, status_code=200):
+            self.status_code = status_code
+            self._payload = payload
+            self.text = json.dumps(payload, ensure_ascii=False)
+
+        def json(self):
+            return self._payload
+
+    @staticmethod
+    def _item(*, doi, title, abstract=None):
+        item = {
+            "DOI": doi,
+            "title": [title],
+            "container-title": ["Whatever Crossref Says"],
+            "published": {"date-parts": [[2026, 3, 1]]},
+            "type": "journal-article",
+            "is-referenced-by-count": 2,
+        }
+        if abstract:
+            item["abstract"] = abstract
+        return item
+
+    @staticmethod
+    def _payload(items):
+        return {"message": {"items": items}}
+
+    def _run(self, items, terms, status_code=200):
+        seen: dict = {}
+
+        def fake_get(url, params=None, headers=None, timeout=None):
+            seen["url"] = url
+            seen["params"] = params
+            return self._Resp(self._payload(items), status_code)
+
+        with patch.object(crossref_source.requests, "get", side_effect=fake_get):
+            works = crossref_source.fetch(terms, 90)
+        return works, seen
+
+    def test_uses_the_per_journal_endpoint_with_an_ors_query(self):
+        _, seen = self._run([], ["li-rich", "anion redox"])
+        self.assertIn("api.crossref.org/journals/", seen["url"])
+        self.assertTrue(seen["url"].endswith("/works"))
+        self.assertIn(" OR ", seen["params"]["query.title"])
+        self.assertIn('"li-rich"', seen["params"]["query.title"])
+
+    def test_date_and_type_filters_are_sent(self):
+        _, seen = self._run([], ["li-rich"])
+        self.assertIn("from-pub-date:", seen["params"]["filter"])
+        self.assertIn("type:journal-article", seen["params"]["filter"])
+        self.assertIn("abstract", seen["params"]["select"])  # 摘要必须要回来
+
+    def test_empty_recall_terms_raise_instead_of_pulling_everything(self):
+        """不传 query.title 会把这 15 本刊 90 天的全部论文拉回来。"""
+        with self.assertRaises(RuntimeError) as ctx:
+            crossref_source.fetch([], 90)
+        self.assertIn("召回词", str(ctx.exception))
+
+    def test_tokenised_false_positives_are_dropped_locally(self):
+        items = [
+            self._item(doi="10.1002/adma.1", title="Lithium Metal Batteries"),
+            self._item(doi="10.1002/adma.2", title="Li-rich layered oxide with anion redox"),
+        ]
+        works, _ = self._run(items, ["li-rich", "anion redox"])
+        self.assertEqual({w["doi"] for w in works}, {"10.1002/adma.2"})
+        self.assertEqual(len(works), len(config.JOURNALS))  # 每本刊各命中一次
+
+    def test_journal_name_comes_from_config_so_tier_bonus_still_resolves(self):
+        # mock 让 15 本刊都返回同一批条目（真实场景里每本刊只会返回自己的论文），
+        # 这里锁的是「刊名取自 config，而不是 Crossref 返回的 container-title」
+        items = [self._item(doi="10.1002/adma.1", title="Li-rich layered oxide")]
+        works, _ = self._run(items, ["li-rich"])
+        self.assertTrue(all(w["journal"] in config.JOURNALS for w in works))
+        self.assertIn("Advanced Materials", {w["journal"] for w in works})
+        self.assertNotIn("Whatever Crossref Says", {w["journal"] for w in works})
+        adma = [w for w in works if w["journal"] == "Advanced Materials"]
+        self.assertEqual(adma[0]["issn"], config.JOURNALS["Advanced Materials"])
+
+    def test_jats_xml_abstract_is_cleaned(self):
+        items = [self._item(
+            doi="10.1002/adma.1",
+            title="A cathode design",
+            abstract="<jats:p>An <jats:italic>anion redox</jats:italic> study</jats:p>",
+        )]
+        works, _ = self._run(items, ["anion redox"])
+        self.assertTrue(works)
+        self.assertNotIn("<", works[0]["abstract"])
+        self.assertIn("anion redox", works[0]["abstract"])
+
+    def test_every_journal_failing_raises(self):
+        with self.assertRaises(RuntimeError):
+            self._run([], ["li-rich"], status_code=500)
+
+
+class TestSemanticScholarAdapter(unittest.TestCase):
+    """S2 的 OR 必须用竖线；期刊只能靠 DOI 前缀认。"""
+
+    class _Resp:
+        def __init__(self, payload, status_code=200):
+            self.status_code = status_code
+            self._payload = payload
+            self.text = json.dumps(payload, ensure_ascii=False)
+
+        def json(self):
+            return self._payload
+
+    @staticmethod
+    def _item(*, doi=None, title, venue="", abstract=None):
+        item = {
+            "title": title,
+            "externalIds": {"DOI": doi} if doi else {},
+            "venue": venue,
+            "publicationDate": "2026-03-01",
+            "publicationTypes": ["JournalArticle"],
+        }
+        if abstract:
+            item["abstract"] = abstract
+        return item
+
+    def _run(self, items, terms):
+        seen: dict = {}
+
+        def fake_get(url, params=None, headers=None, timeout=None):
+            seen["url"] = url
+            seen["params"] = params
+            return self._Resp({"total": len(items), "data": items})
+
+        with patch.object(
+            semantic_scholar_source.requests, "get", side_effect=fake_get
+        ), patch.object(semantic_scholar_source.time, "sleep", lambda _s: None):
+            works = semantic_scholar_source.fetch(terms, 90)
+        return works, seen
+
+    def test_or_uses_pipes_because_spaces_mean_and(self):
+        """实测：同一组词用空格分隔返回 total=0 —— 不报错，只是安静地什么都没有。"""
+        _, seen = self._run([], ["li-rich", "anion redox"])
+        self.assertIn('"li-rich" | "anion redox"', seen["params"]["query"])
+        self.assertNotIn(" AND ", seen["params"]["query"])
+
+    def test_venue_filter_is_never_sent(self):
+        """venue= 是模糊匹配，实测查到 47 条，而拉全量本地筛能得 108 条。"""
+        _, seen = self._run([], ["li-rich"])
+        self.assertNotIn("venue", seen["params"])
+
+    def test_bulk_endpoint_and_open_ended_date_window(self):
+        _, seen = self._run([], ["li-rich"])
+        self.assertIn("/paper/search/bulk", seen["url"])
+        self.assertTrue(str(seen["params"]["publicationDateOrYear"]).endswith(":"))
+        self.assertIn("externalIds", seen["params"]["fields"])  # DOI 是唯一去重键
+
+    def test_empty_recall_terms_raise(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            semantic_scholar_source.fetch([], 90)
+        self.assertIn("召回词", str(ctx.exception))
+
+    def test_mislabelled_venue_is_corrected_by_the_doi_prefix(self):
+        items = [self._item(
+            doi="10.1002/adma.74958",
+            title="Li-rich cathode with anion redox",
+            venue="Advances in Materials",
+        )]
+        works, _ = self._run(items, ["li-rich", "anion redox"])
+        self.assertEqual(works[0]["journal"], "Advanced Materials")
+        self.assertEqual(works[0]["issn"], config.JOURNALS["Advanced Materials"])
+
+    def test_unrecognised_journal_is_dropped_and_named_in_a_warning(self):
+        """静默丢论文是不可接受的：被丢的是哪些刊必须写进日志。"""
+        items = [self._item(
+            doi="10.9999/unknown.1",
+            title="Li-rich cathode with anion redox",
+            venue="Some Other Journal",
+        )]
+        with self.assertLogs("src.sources.semantic_scholar", level="WARNING") as captured:
+            works, _ = self._run(items, ["li-rich", "anion redox"])
+        self.assertEqual(works, [])
+        self.assertIn("Some Other Journal", "\n".join(captured.output))
+
+    def test_records_without_doi_are_dropped(self):
+        items = [self._item(
+            doi=None, title="Li-rich cathode with anion redox", venue="Nature Energy"
+        )]
+        works, _ = self._run(items, ["li-rich", "anion redox"])
+        self.assertEqual(works, [])
+
+    def test_html_escaped_venue_is_unescaped(self):
+        items = [self._item(
+            doi="10.1039/d6ee01234a",
+            title="Li-rich oxide with anion redox",
+            venue="Energy &amp; Environmental Science",
+        )]
+        works, _ = self._run(items, ["li-rich", "anion redox"])
+        self.assertEqual(works[0]["journal"], "Energy & Environmental Science")
+
+
+class TestMailerSourceVisibility(unittest.TestCase):
+    """数据源故障必须出现在**邮件**里 —— 只写日志等于没说。"""
+
+    def test_source_line_and_failure_notice_reach_the_email(self):
+        work = {
+            "doi": "10.1/a", "title": "T", "journal": "Joule", "issn": "2542-4351",
+            "pub_date": "2026-03-01", "ai_score": 70, "ai_takeaway": "x", "ai_reason": "y",
+        }
+        html_body, plain = mailer.build_html(
+            [work], "2026-03-06", lookback_days=90, first_run=True,
+            extra_meta="数据源：OpenAlex 8 篇 ｜ Crossref 失败（HTTP 500）",
+            extra_notices=["⚠️ 本轮有数据源不可用（Crossref），结果由其余数据源合并而来"],
+        )
+        self.assertIn("数据源：OpenAlex 8 篇", html_body)
+        self.assertIn("数据源不可用", html_body)
+        self.assertIn("数据源不可用", plain)
+
+    def test_heartbeat_email_also_carries_the_notice(self):
+        """空结果邮件最容易被误读成「一切正常」，故障提示更要带上。"""
+        html_body, plain = mailer.build_html(
+            [], "2026-03-06", lookback_days=90, first_run=False,
+            extra_notices=["⚠️ 本轮有数据源不可用（Crossref）"],
+        )
+        self.assertIn("数据源不可用", html_body)
+        self.assertIn("数据源不可用", plain)
+
+    def test_no_notice_means_no_warning_block(self):
+        html_body, _ = mailer.build_html(
+            [], "2026-03-06", lookback_days=14, first_run=False
+        )
+        self.assertNotIn("数据源不可用", html_body)
+
+
+class TestSourceCliWiring(unittest.TestCase):
+    """命令行与 --show-config 都要能看见数据源配置。"""
+
+    def test_sources_flag_is_parsed_and_validated(self):
+        args = main_module.build_parser().parse_args(["--sources", "crossref,s2"])
+        self.assertEqual(
+            source_layer.enabled_sources(args.sources), ["crossref", "semantic_scholar"]
+        )
+
+    def test_bad_sources_flag_fails_loudly(self):
+        args = main_module.build_parser().parse_args(["--sources", "openaelx"])
+        with self.assertRaises(ValueError):
+            source_layer.enabled_sources(args.sources)
+
+    def test_show_config_lists_data_sources(self):
+        args = main_module.build_parser().parse_args(["--show-config"])
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = main_module.show_config(args)
+
+        self.assertEqual(code, 0)
+        text = buffer.getvalue()
+        # 换数据源是"能搜到什么"的第一层，必须离线可见
+        self.assertIn("数据源", text)
+        self.assertIn("OpenAlex", text)
+        self.assertIn("Crossref", text)
+        self.assertIn("Semantic Scholar", text)
 
 
 if __name__ == "__main__":

@@ -62,6 +62,52 @@ ISSN_FILTER = "|".join(JOURNALS.values())
 ISSN_TO_NAME: dict[str, str] = {issn: name for name, issn in JOURNALS.items()}
 
 # ---------------------------------------------------------------------------
+# ★ 期刊的 DOI 前缀（多数据源识别期刊时用）
+# ---------------------------------------------------------------------------
+# 为什么需要它：不同数据源对「刊名」的记录质量差别很大。实测 Semantic Scholar 把
+# Advanced Materials 的论文（DOI 10.1002/adma.74958）标成刊名 "Advances in
+# Materials"、publicationVenue.issn 也给成 2327-2503（另一本真实存在的期刊），
+# 而 Angewandte Chemie Int. Ed. 的 publicationVenue 干脆是 null。只按刊名/ISSN
+# 匹配会**静默丢掉 Advanced Materials 的全部结果**。
+#
+# DOI 前缀由出版社分配、多年不变，是识别期刊最可靠的办法：
+#   adma = Advanced Materials / adfm = Advanced Functional Materials / anie = Angew ...
+# 识别顺序是 **DOI 前缀优先、刊名兜底**（见 src/sources/base.py）。
+# 用 str.startswith 前缀匹配，不是正则，所以模式里的 "." 就是普通点号。
+JOURNAL_DOI_PATTERNS: dict[str, tuple[str, ...]] = {
+    # —— 正刊 ——
+    "Nature": ("10.1038/nature", "10.1038/s41586-"),
+    "Science": ("10.1126/science.",),
+    # —— 子刊 / 专业顶刊 ——
+    "Nature Energy": ("10.1038/s41560-",),
+    "Nature Materials": ("10.1038/s41563-",),
+    "Nature Chemistry": ("10.1038/s41557-",),
+    "Nature Sustainability": ("10.1038/s41893-",),
+    "Nature Communications": ("10.1038/s41467-",),
+    "Science Advances": ("10.1126/sciadv.",),
+    "Joule": ("10.1016/j.joule.",),
+    "Journal of the American Chemical Society": ("10.1021/jacs.",),
+    "Angewandte Chemie Int. Ed.": ("10.1002/anie.",),
+    "Advanced Materials": ("10.1002/adma.",),
+    # RSC 的 DOI 形如 10.1039/D6EE01234A，没有能区分 EES 与同社其它刊的固定前缀，
+    # 所以留空 —— 该刊只能靠刊名兜底识别（OpenAlex / Crossref 各有自己的路子）。
+    "Energy & Environmental Science": (),
+    "Advanced Functional Materials": ("10.1002/adfm.",),
+    "Small": ("10.1002/smll.",),
+}
+
+#: Semantic Scholar 的刊名写法 → 本项目 ``JOURNALS`` 里的刊名。
+#: 两边都会先归一化（小写、只留字母数字）再比较，所以大小写随便写。
+#: 默认刊名能精确对上的不需要列在这里。
+S2_VENUE_ALIASES: dict[str, str] = {
+    "Angewandte Chemie": "Angewandte Chemie Int. Ed.",
+    "Angewandte Chemie International Edition": "Angewandte Chemie Int. Ed.",
+    "Angewandte Chemie (International Ed. in English)": "Angewandte Chemie Int. Ed.",
+    "Energy and Environmental Science": "Energy & Environmental Science",
+    "Journal of the American Chemical Society (JACS)": "Journal of the American Chemical Society",
+}
+
+# ---------------------------------------------------------------------------
 # ★ 期刊档次权重：排序时给顶刊加分
 # ---------------------------------------------------------------------------
 # 字典的**书写顺序就是高低顺序**（第一个最高），值 = (加成分数, 该档次的期刊名)。
@@ -695,6 +741,50 @@ MAX_PAGES = 10
 
 # HTML 请求通用超时（秒）
 HTTP_TIMEOUT = 30
+
+# ---------------------------------------------------------------------------
+# ★ 数据源（并集检索）
+# ---------------------------------------------------------------------------
+# OpenAlex 2026 年起按请求计费（匿名 1000 积分/天，耗尽后一律 429 且当天不恢复）。
+# 额度用光就整轮断供 —— 而「断供」和「本周真的没有新论文」在邮件里长得一模一样。
+# 所以改成**多源并集**：每轮把所有启用的源都查一遍，按 DOI 合并去重。
+# 某个源失败时其余源照常工作，邮件页头会注明本轮有哪些源。
+#
+# 三个源的差异（都实测过，见 README「数据源」一节）：
+#   openalex        —— 主力。唯一支持「标题+摘要」短语检索的源，召回质量最好。
+#   crossref        —— 备用。逐刊查询（按 ISSN），期刊归属 100% 准确；
+#                      无配额、无需密钥；Wiley 系刊摘要覆盖接近 100%。
+#                      但它的 query.title 是分词匹配，必须本地复核（见 base.py）；
+#                      且 RSC 系的 EES 在 Crossref 里查不到任何记录。
+#   semantic_scholar —— 备用。一次请求即可拉回全量候选，摘要覆盖约 80-94%；
+#                      但刊名字段不可靠，只能靠 DOI 前缀识别期刊（见 base.py）。
+#
+# 顺序 = 优先级（合并同一条论文时以先到的字段为准）。删掉某一项就等于停用该源；
+# 只留 "openalex" 就是改造前的行为。用 --sources 可以在命令行临时覆盖。
+DATA_SOURCES: tuple[str, ...] = ("openalex", "crossref", "semantic_scholar")
+
+# Crossref：逐刊查询，每刊最多取回多少条（上限 1000）。
+# 它的默认排序是「相关度」，所以前 N 条已包住关键词命中，不必翻页。
+CROSSREF_ROWS = 100
+
+# Crossref：并发请求数。它对「礼貌池」（带 mailto）相当宽容，5 并发实测稳定。
+CROSSREF_CONCURRENCY = 5
+
+# Crossref：联系邮箱（进入礼貌池，请求更快更稳）。留空也能用，只是没有优先级。
+# 想换邮箱就改这里，或在 GitHub 仓库 Secrets 里设 CROSSREF_MAILTO。
+CROSSREF_MAILTO = os.environ.get("CROSSREF_MAILTO", "") or "literature-push-bot@users.noreply.github.com"
+
+# Semantic Scholar bulk search 单轮最多取回条数（接口硬上限 1000）。
+# 实测富锂锰正极 14 个召回词 + 90 天 = 685 条，所以 1000 足够一页拉完。
+S2_BULK_LIMIT = 1000
+
+# Semantic Scholar 未鉴权时限流约 1 请求/秒（且不返回限流响应头），所以主动节流。
+S2_MIN_INTERVAL = 1.1
+
+#: 三个源各自的 ``requests`` 请求头（都带 UA，避免被当成爬虫）。
+USER_AGENT = os.environ.get("LITERATURE_BOT_UA", "") or (
+    "weekly-literature-push/1.0 (mailto:%s)" % CROSSREF_MAILTO
+)
 
 # ---------------------------------------------------------------------------
 # AI 相关性匹配（任何 OpenAI 兼容端点）

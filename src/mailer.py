@@ -150,6 +150,7 @@ def build_html(
     ai_failed: int = 0,
     title: str | None = None,
     extra_meta: str = "",
+    extra_notices: list[str] | None = None,
     max_items: int | None = None,
 ) -> tuple[str, str]:
     """渲染邮件正文。
@@ -158,12 +159,15 @@ def build_html(
                   （多主题调研时每个主题传自己的标题）。
     :param excluded: 被内容规则（不看电解液工程 / 隔膜改性）剔除的篇数。
     :param extra_meta: 追加到头部元信息行末尾的说明（已转义前的纯文本）。
+    :param extra_notices: 额外提示条目（纯文本，会被转义）。**数据源故障就是靠它
+                          出现在邮件里的** —— 日志在手机上没人看，页头才看得见。
     :param max_items: 单封最多展示篇数；默认 ``config.MAX_EMAIL_ITEMS``。
     :return: ``(html, 纯文本备选)``
     """
     email_title = title or EMAIL_TITLE
     limit = MAX_EMAIL_ITEMS if max_items is None else max(1, int(max_items))
     scope = "首次预热" if first_run else "常规滚动"
+    header_notices = [_esc(item) for item in (extra_notices or []) if str(item).strip()]
     meta_line = (
         f"检索窗口：近 {lookback_days} 天（{scope}） &nbsp;·&nbsp; "
         f"候选 {total_candidates} 篇 &nbsp;·&nbsp; 去重后 {after_dedup} 篇"
@@ -174,7 +178,11 @@ def build_html(
         meta_line = f"{meta_line} &nbsp;·&nbsp; {_esc(extra_meta)}"
 
     if not works:
+        warn_html = "".join(
+            f'<div style="{_STYLE["notice"]}">{item}</div>' for item in header_notices
+        )
         body = f"""\
+{warn_html}
 <div style="{_STYLE['empty']}">
   <div style="font-size:32px;margin-bottom:12px;">📭</div>
   <div style="font-size:16px;font-weight:600;color:#374151;margin-bottom:8px;">本周没有新的相关文献</div>
@@ -183,7 +191,8 @@ def build_html(
 </div>"""
         plain = (
             f"{email_title} · {run_date}\n"
-            f"本周没有新的相关文献。\n"
+            + "".join(f"⚠️ {item}\n" for item in header_notices)
+            + "本周没有新的相关文献。\n"
             f"检索窗口：近 {lookback_days} 天（{scope}）\n"
             f"候选 {total_candidates} 篇，去重后 {after_dedup} 篇。\n"
         )
@@ -194,7 +203,7 @@ def build_html(
 
     cards = "\n".join(_render_card(work) for work in shown)
 
-    notices: list[str] = []
+    notices: list[str] = list(header_notices)
     if overflow > 0:
         notices.append(
             f"另有 <b>{overflow}</b> 篇相关文献因单封邮件上限（{limit} 篇）未在此展示，"
@@ -212,6 +221,7 @@ def build_html(
     body = f'{notice_html}\n{cards}'
 
     plain_lines = [f"{email_title} · {run_date}（{len(shown)} 篇）", ""]
+    plain_lines += [f"⚠️ {item}" for item in header_notices]
     for index, work in enumerate(shown, start=1):
         plain_lines += [
             f"{index}. {work.get('title')}",
