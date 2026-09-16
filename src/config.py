@@ -767,6 +767,11 @@ DATA_SOURCES: tuple[str, ...] = ("openalex", "crossref", "semantic_scholar")
 # 它的默认排序是「相关度」，所以前 N 条已包住关键词命中，不必翻页。
 CROSSREF_ROWS = 100
 
+# 网络请求的重试策略（Crossref 的两个端点共用）。
+# 只对 429（限流）与 5xx（服务端抖动）重试 —— 404（DOI/ISSN 不存在）
+# 重试多少次还是 404，白等只会拖慢整轮，所以要区分对待。
+HTTP_RETRY_STATUS: frozenset[int] = frozenset({429, 500, 502, 503, 504})
+
 # Crossref：并发请求数。**这个值不能调高。**
 #
 # 实测教训：5 并发时 Crossref 会回 429，而且是**整本刊静默丢失** ——
@@ -852,6 +857,13 @@ S2_URL = "https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}"
 S2_MIN_INTERVAL = 1.1  # Semantic Scholar 无鉴权约 1 req/s，串行节流
 S2_MAX_RETRIES = 3  # 公共池经常 429，需退避重试
 S2_CIRCUIT_BREAK_AFTER = 4  # 连续 N 篇都因 429 彻底失败就熔断，本轮不再请求 S2
+
+# Crossref 逐篇查摘要这一路的熔断阈值。
+# 它比 S2 宽得多（8 vs 4），因为这里的限流往往是**自己上一波请求打出来的**：
+# 逐刊检索刚发完 15 本刊×100 条的请求，紧接着 4 个线程逐篇查摘要，
+# 很容易短暂吃到 429 —— 这种 429 退避一两秒就好了，熔断反而是自损。
+# 这个阈值只用来封顶最坏情况耗时（每篇失败要白等 CROSSREF_RETRY_WAIT×1+×2）。
+CROSSREF_CIRCUIT_BREAK_AFTER = 8
 
 # ---------------------------------------------------------------------------
 # 邮件

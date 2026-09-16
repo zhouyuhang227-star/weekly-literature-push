@@ -830,7 +830,7 @@ class TestS2CircuitBreaker(unittest.TestCase):
 
         calls: list[str] = []
 
-        def fake_get(url, params=None, timeout=None):
+        def fake_get(url, params=None, headers=None, timeout=None):
             calls.append(url)
             return FakeResp()
 
@@ -860,6 +860,105 @@ class TestS2CircuitBreaker(unittest.TestCase):
             self.assertEqual(abstract_source.from_semantic_scholar("10.1/ok"), "An abstract.")
             self.assertEqual(abstract_source._s2_state["streak"], 0)
             self.assertFalse(abstract_source._s2_state["disabled"])
+
+
+class TestCrossrefAbstractRetry(unittest.TestCase):
+    """摘要回退这一路也必须重试。
+
+    实测日志：``Crossref 无摘要 10.1038/s41467-026-75101-w (HTTP 429)`` ——
+    逐刊检索刚打完 15 本刊，紧接着逐篇查摘要就被限流了。
+    摘要是 AI 打分的主要依据，一次 429 不该让这篇文献退化成"仅看标题"。
+    """
+
+    class _Resp:
+        def __init__(self, status_code=200, payload=None, headers=None):
+            self.status_code = status_code
+            self._payload = payload or {}
+            self.headers = headers or {}
+
+        def json(self):
+            return self._payload
+
+    def setUp(self):
+        self._reset()
+
+    def tearDown(self):
+        self._reset()
+
+    @staticmethod
+    def _reset() -> None:
+        abstract_source._crossref_state["disabled"] = False
+        abstract_source._crossref_state["streak"] = 0
+
+    def _run(self, codes, payload=None):
+        """``codes`` 是依次返回的状态码，用完后一直返回 200。"""
+        seen: list[dict] = []
+        queue = list(codes)
+
+        def fake_get(url, params=None, headers=None, timeout=None):
+            seen.append({"url": url, "params": params or {}, "headers": headers or {}})
+            code = queue.pop(0) if queue else 200
+            return self._Resp(code, payload or {"message": {"abstract": "<jats:p>An abstract.</jats:p>"}})
+
+        with patch.object(abstract_source.requests, "get", side_effect=fake_get), \
+                patch.object(abstract_source.time, "sleep", lambda _s: None):
+            text = abstract_source.from_crossref("10.1/paper")
+        return text, seen
+
+    def test_429_is_retried_instead_of_losing_the_abstract(self):
+        text, seen = self._run([429, 429])
+        self.assertEqual(text, "An abstract.")
+        self.assertEqual(len(seen), 3)
+        self.assertEqual(abstract_source._crossref_state["streak"], 0)
+
+    def test_client_errors_are_not_retried(self):
+        """404 = 该 DOI 在 Crossref 无记录，重试多少次都一样。"""
+        text, seen = self._run([404])
+        self.assertEqual(text, "")
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(abstract_source._crossref_state["streak"], 0)
+
+    def test_the_polite_pool_mailto_comes_from_crossref_mailto(self):
+        """原来用的是 OPENALEX_MAILTO（只来自 SMTP_USER，本地为空）⇒ 不在礼貌池。"""
+        with patch.object(abstract_source, "CROSSREF_MAILTO", "me@example.com"):
+            _, seen = self._run([])
+        self.assertEqual(seen[0]["params"]["mailto"], "me@example.com")
+        self.assertIn("User-Agent", seen[0]["headers"])
+
+    def test_persistent_failure_trips_the_breaker_and_stops_calling(self):
+        limit = abstract_source.CROSSREF_CIRCUIT_BREAK_AFTER
+        calls = 0
+
+        def fake_get(url, params=None, headers=None, timeout=None):
+            nonlocal calls
+            calls += 1
+            return self._Resp(429)
+
+        with patch.object(abstract_source.requests, "get", side_effect=fake_get), \
+                patch.object(abstract_source.time, "sleep", lambda _s: None):
+            for i in range(limit + 3):
+                self.assertEqual(abstract_source.from_crossref(f"10.1/paper{i}"), "")
+
+        self.assertEqual(calls, limit * abstract_source.CROSSREF_RETRIES)
+        self.assertTrue(abstract_source._crossref_state["disabled"])
+
+    def test_each_level_has_its_own_breaker(self):
+        """Crossref 熔断不该连累 S2 —— 它只是降级链路的上游，不是同一个池子。"""
+        abstract_source._crossref_state["disabled"] = True
+        urls: list[str] = []
+        ok = self._Resp(200, {"abstract": "An abstract."})
+
+        def fake_get(url, params=None, headers=None, timeout=None):
+            urls.append(url)
+            return ok
+
+        with patch.object(abstract_source.requests, "get", side_effect=fake_get), \
+                patch.object(abstract_source.time, "sleep", lambda _s: None):
+            self.assertEqual(abstract_source.from_crossref("10.1/paper"), "")
+            self.assertEqual(abstract_source.from_semantic_scholar("10.1/paper"), "An abstract.")
+
+        self.assertEqual(len(urls), 1)  # 熔断后一篇 Crossref 都不发
+        self.assertIn("semanticscholar", urls[0])
 
 
 class TestMailerEscaping(unittest.TestCase):

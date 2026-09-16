@@ -48,10 +48,6 @@ log = logging.getLogger(__name__)
 #: 逐刊端点。用 ISSN（不是刊名）定位，所以刊名归属不需要猜。
 _JOURNAL_URL = "https://api.crossref.org/journals/{issn}/works"
 
-#: 会重试的状态码：429 是限流（等一会儿就好），5xx 是服务端抖动。
-#: 其它 4xx 一律不重试 —— 404 重试多少次还是 404，只会拖慢整轮。
-_RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
-
 #: 只取需要的字段，响应体能小一大截。
 _SELECT = (
     "DOI,title,container-title,published,published-print,published-online,"
@@ -134,7 +130,7 @@ def _request_works(journal: str, issn: str, params: dict[str, object]) -> list[d
             if resp.status_code == 200:
                 return (resp.json().get("message") or {}).get("items") or []
             last_error = f"HTTP {resp.status_code}"
-            if resp.status_code not in _RETRY_STATUS:
+            if resp.status_code not in config.HTTP_RETRY_STATUS:
                 break
 
         if attempt < attempts:

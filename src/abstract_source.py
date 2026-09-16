@@ -13,6 +13,10 @@
 2. Crossref  ``message.abstract``（Elsevier/Cell 系通常有，是 JATS 富文本，需剥标签）
 3. Semantic Scholar ``fields=abstract``（无鉴权约 1 req/s，需串行节流）
 
+2 与 3 都带 429/5xx 退避重试：摘要是 AI 打分的**主要依据**，碰上一次限流
+这篇文献就退化成“仅看标题”，代价远高于多等几秒。重试仍不行才熔断本轮
+（阈值见 ``config.CROSSREF_CIRCUIT_BREAK_AFTER`` / ``S2_CIRCUIT_BREAK_AFTER``）。
+
 三级都拿不到时返回 ``("", "missing")``，由 AI 侧降级为"仅依据标题判断"。
 
 实测结论（2026-09 校验）
@@ -39,13 +43,18 @@ import requests
 
 from .config import (
     ABSTRACT_SOURCE_WORKERS,
+    CROSSREF_CIRCUIT_BREAK_AFTER,
+    CROSSREF_MAILTO,
+    CROSSREF_RETRIES,
+    CROSSREF_RETRY_WAIT,
     CROSSREF_URL,
+    HTTP_RETRY_STATUS,
     HTTP_TIMEOUT,
-    OPENALEX_MAILTO,
     S2_CIRCUIT_BREAK_AFTER,
     S2_MAX_RETRIES,
     S2_MIN_INTERVAL,
     S2_URL,
+    USER_AGENT,
 )
 
 log = logging.getLogger(__name__)
@@ -58,26 +67,36 @@ _BLANK_LINE_RE = re.compile(r"\n{2,}")
 _s2_lock = threading.Lock()
 _s2_last_call = 0.0
 
-#: S2 熔断状态。公共池一旦开始限流，基本会一直限流到本轮结束，
-#: 继续逐篇重试只是在烧时间（实测 8 篇要耗掉约 50 秒且一篇都拿不到）。
+#: S2 / Crossref 的熔断状态。公共池一旦开始限流，基本会一直限流到本轮结束，
+#: 继续逐篇重试只是在烧时间（实测 S2 8 篇要耗掉约 50 秒且一篇都拿不到）。
+#: 熔断只作用于当前进程，下次运行会自动重试。
 _s2_state = {"disabled": False, "streak": 0}
+_crossref_state = {"disabled": False, "streak": 0}
+_breaker_lock = threading.Lock()
 
 
-def _s2_mark_failure() -> None:
-    """记录一次"重试耗尽仍 429"，连续失败到阈值就熔断本轮。"""
-    with _s2_lock:
-        _s2_state["streak"] += 1
-        if _s2_state["streak"] >= S2_CIRCUIT_BREAK_AFTER and not _s2_state["disabled"]:
-            _s2_state["disabled"] = True
+def _breaker_failure(
+    state: dict, label: str, limit: int, cause: str = "重试耗尽", hint: str = ""
+) -> None:
+    """记一次「彻底失败」；连续到阈值就熔断本轮，不再请求该源。"""
+    with _breaker_lock:
+        state["streak"] += 1
+        if state["streak"] >= limit and not state["disabled"]:
+            state["disabled"] = True
             log.warning(
-                "Semantic Scholar 连续 %s 篇限流，本轮熔断：其余缺失摘要将直接标记为缺失",
-                _s2_state["streak"],
+                "%s 连续 %s 篇%s，本轮熔断：其余缺失摘要将直接标记为缺失%s",
+                label, state["streak"], cause, f"（{hint}）" if hint else "",
             )
 
 
-def _s2_mark_success() -> None:
-    with _s2_lock:
-        _s2_state["streak"] = 0
+def _breaker_success(state: dict) -> None:
+    with _breaker_lock:
+        state["streak"] = 0
+
+
+def _headers() -> dict[str, str]:
+    """带 UA 的请求头。与数据源层的 ``_headers()`` 保持一致。"""
+    return {"User-Agent": USER_AGENT, "Accept": "application/json"}
 
 
 
@@ -108,20 +127,59 @@ def _s2_throttle() -> None:
 # 各级来源
 # ---------------------------------------------------------------------------
 def from_crossref(doi: str) -> str:
-    params = {"mailto": OPENALEX_MAILTO} if OPENALEX_MAILTO else {}
-    try:
-        resp = requests.get(
-            CROSSREF_URL.format(doi=quote(doi, safe="")),
-            params=params,
-            timeout=HTTP_TIMEOUT,
-        )
-        if resp.status_code != 200:
-            log.debug("Crossref 无摘要 %s (HTTP %s)", doi, resp.status_code)
-            return ""
-        return clean_text((resp.json().get("message") or {}).get("abstract"))
-    except (requests.RequestException, ValueError) as exc:
-        log.debug("Crossref 请求异常 %s: %s", doi, exc)
+    """Crossref ``message.abstract``（Elsevier/Cell 系通常有，是 JATS 富文本）。
+
+    带 429 / 5xx 退避重试，原因很具体：这一路与**同一轮前面的逐刊检索**
+    共用同一个礼貌池 —— 15 本刊×100 条的检索刚发完，紧接着 4 个线程再逐篇查
+    摘要，很容易吃到 429（实测日志里的 ``Crossref 无摘要 … (HTTP 429)`` 就是这么来的）。
+    而摘要是 AI 打分的**主要依据**，碰上一次限流这篇文献就退化成“仅看标题”，
+    代价远高于多等几秒。
+
+    ⚠️ ``mailto`` 用的是 ``CROSSREF_MAILTO``（它有内置默认值），**不是**
+    ``OPENALEX_MAILTO``：后者只来自 ``SMTP_USER`` 环境变量，本地为空 ⇒
+    请求不进礼貌池 ⇒ 被严格限流。这个不一致本身就是 429 的诱因之一。
+    """
+    if _crossref_state["disabled"]:
         return ""
+
+    params = {"mailto": CROSSREF_MAILTO} if CROSSREF_MAILTO else {}
+    url = CROSSREF_URL.format(doi=quote(doi, safe=""))
+    last = ""
+
+    for attempt in range(1, CROSSREF_RETRIES + 1):
+        try:
+            resp = requests.get(
+                url, params=params, headers=_headers(), timeout=HTTP_TIMEOUT
+            )
+        except (requests.RequestException, ValueError) as exc:
+            last = f"{type(exc).__name__}"
+            log.debug("Crossref 请求异常 %s: %s", doi, exc)
+        else:
+            if resp.status_code == 200:
+                _breaker_success(_crossref_state)
+                return clean_text((resp.json().get("message") or {}).get("abstract"))
+            last = f"HTTP {resp.status_code}"
+            if resp.status_code not in HTTP_RETRY_STATUS:
+                # 4xx（404 = 该 DOI 在 Crossref 无记录）重试多少次都一样
+                log.debug("Crossref 无摘要 %s (%s)", doi, last)
+                return ""
+
+        if attempt < CROSSREF_RETRIES:
+            wait = max(0.0, float(CROSSREF_RETRY_WAIT)) * attempt
+            log.debug(
+                "Crossref 取摘要失败（%s），%s 秒后重试 %s/%s：%s",
+                last, wait, attempt, CROSSREF_RETRIES, doi,
+            )
+            if wait:
+                time.sleep(wait)
+
+    log.debug("Crossref 取摘要重试耗尽 %s（%s）", doi, last)
+    _breaker_failure(
+        _crossref_state, "Crossref", CROSSREF_CIRCUIT_BREAK_AFTER,
+        cause="取摘要失败",
+        hint="通常是上一波逐刊检索刚把礼貌池打满了",
+    )
+    return ""
 
 
 def from_semantic_scholar(doi: str) -> str:
@@ -150,7 +208,7 @@ def from_semantic_scholar(doi: str) -> str:
             return ""
 
         if resp.status_code == 200:
-            _s2_mark_success()
+            _breaker_success(_s2_state)
             return clean_text((resp.json() or {}).get("abstract"))
 
         if resp.status_code == 429:
@@ -160,11 +218,13 @@ def from_semantic_scholar(doi: str) -> str:
                 time.sleep(wait)
                 continue
             log.debug("Semantic Scholar 重试耗尽仍限流，放弃：%s", doi)
-            _s2_mark_failure()
+            _breaker_failure(
+                _s2_state, "Semantic Scholar", S2_CIRCUIT_BREAK_AFTER, cause="限流"
+            )
             return ""
 
         if resp.status_code == 404:
-            _s2_mark_success()  # 论文确实不存在，不是限流
+            _breaker_success(_s2_state)  # 论文确实不存在，不是限流
             log.debug("Semantic Scholar 无此论文：%s", doi)
             return ""
 

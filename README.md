@@ -67,7 +67,7 @@
 │   ├── dedup.py                        # DOI 去重 + 运行状态持久化（按主题分区）
 │   ├── mailer.py                       # HTML 渲染 + SMTP 发送
 │   └── main.py                         # 主流程编排（多主题循环）+ 命令行
-├── tests/test_core.py                  # 219 个单元测试（锁定高风险修复）
+├── tests/test_core.py                  # 224 个单元测试（锁定高风险修复）
 ├── data/
 │   ├── pushed_dois.json                # 去重状态（唯一需要提交的文件）
 │   ├── topics_cache.json               # 语义主题解析缓存（已 gitignore，自动重建）
@@ -614,6 +614,13 @@ AI 对每篇候选返回一个 **0–100 相关性分数** + 一句话中文结�
 | 2 | Crossref `message.abstract`（JATS，会去标签） | 少量补充 |
 | 3 | Semantic Scholar `abstract`（无鉴权约 1 req/s，已加节流 + 429 退避 + **熔断**） | 少量补充 |
 
+第 2、3 级都带 **429 / 5xx 退避重试**（4xx 不重试）。为什么要重试：摘要是 AI 打分的
+主要依据，碰上一次限流这篇文献就退化成「仅看标题」，代价远高于多等几秒。
+实测 `Crossref 无摘要 … (HTTP 429)` 的诱因有两个，都已修：
+① 逐刊检索刚发完 15 本刊×100 条，紧接着 4 个线程逐篇查摘要，把礼貌池短暂打满；
+② 这一路原来用的是 `OPENALEX_MAILTO`（只来自 `SMTP_USER`，**本地为空** ⇒
+不在礼貌池），现在统一用有内置默认值的 `CROSSREF_MAILTO`。
+
 **已知局限**：最新的 Nature / Nature Energy / Joule 等论文，OpenAlex 的
 `abstract_inverted_index` 常常是 `null`，而**此时 Crossref 和 Semantic Scholar 同样也没有摘要**
 （实测：`10.1038/s41560-026-02133-3`、`10.1016/j.joule.2026.102680`、
@@ -630,6 +637,11 @@ AI 打分失败时卡片会打 `AI 打分失败` 标签，且该文献仍会展�
 > 实测 8 篇文献逐篇重试要白等约 50 秒且一篇摘要都拿不到，因此加了进程级熔断
 > （`S2_CIRCUIT_BREAK_AFTER`，默认连续 4 篇彻底失败后本轮不再请求 S2，
 > 实测耗时 49s → 28s）。熔断只作用于当前进程，下次运行自动重试。
+>
+> Crossref 那一路也有自己的熔断（`CROSSREF_CIRCUIT_BREAK_AFTER`，默认 **8**）——
+> 阈值故意比 S2 宽得多：这里的 429 往往是**自己上一波请求打出来的**，
+> 退避一两秒就好，熔断反而是自损。它只用来封顶最坏情况耗时。两级各自独立，
+> Crossref 熔断不会连累 S2（它只是降级链路的上游）。
 
 ---
 
@@ -750,7 +762,7 @@ python -m src.main --find-topic "solid-state battery"   # 只有 topic 模式下
 `push.cmd`（实际逻辑在 `push.ps1`）会依次做 5 件事：
 
 1. 检查待提交文件，**拦住 `.env` 等敏感文件**（推上去就泄露了，而且删掉也仍留在 git 历史里）
-2. 跑全部单元测试（当前 219 个），**不通过就中止**（配置改错了根本推不上去）
+2. 跑全部单元测试（当前 224 个），**不通过就中止**（配置改错了根本推不上去）
 3. `fetch` + `rebase` ← **关键，见下方说明**
 4. `push`，失败自动重试 4 次（`github.com` 在国内时通时不通）
 5. 校验远程 commit 和本地是否一致
@@ -1226,7 +1238,7 @@ on:
 ## 本地开发
 
 ```bash
-# 跑测试（219 个）
+# 跑测试（224 个）
 python -m unittest discover -s tests -v
 
 # 语法检查
@@ -1265,6 +1277,8 @@ python -m src.main --to your@email.com --lookback-days 7
 - **单源失败不得拖垮整轮**：其余源照常合并发信，并把故障写进邮件页头的 `notices`（回归测试）
 - **源部分失败也要进页头**：Crossref 单刊 429 不得表现为“本轮少了一本顶刊”——
   优先重试；重试仍失败就把“N/15 本刊查询失败”写进页头；4xx 不重试（回归测试）
+- **摘要回退的两个源都要重试**：Crossref 碰 429 必须退避重试而不是直接放弃；
+  404 不重试；`mailto` 必须来自有内置默认值的 `CROSSREF_MAILTO`（回归测试）
 - **全部源失败必须报错**，不得发出一封看似正常的“本周无新文献”心跳邮件（回归测试）
 - **Crossref 结果必须本地复核召回词**：`query.title=lithium-rich` 返回的
   “Lithium Metal Batteries” 必须被丢掉（回归测试）
