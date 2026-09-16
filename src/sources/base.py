@@ -222,6 +222,8 @@ def make_work(
     openalex_id: str = "",
     abstract: str = "",
     abstract_from: str = "",
+    first_author: str = "",
+    corresponding_author: str = "",
 ) -> dict | None:
     """构造统一结构的 work 字典；**无 DOI 时返回 ``None``**。
 
@@ -231,8 +233,13 @@ def make_work(
     字段清单（下游 ``dedup`` / ``ranking`` / ``ai_matcher`` / ``mailer`` 都依赖它）::
 
         doi / doi_url / uid / title / journal / issn / pub_date / cited_by /
-        type / openalex_id / abstract / abstract_from / sources
+        type / openalex_id / abstract / abstract_from / sources /
+        first_author / corresponding_author
+
+    作者两个字段见 :mod:`src.authors`：**通讯作者只有 OpenAlex 能提供**，
+    Crossref / S2 只能给一作，所以这里允许为空串（显示时会自动省略）。
     """
+    from .. import authors
     from ..openalex_client import normalize_doi
 
     clean_doi = normalize_doi(doi)
@@ -256,8 +263,11 @@ def make_work(
         "openalex_id": openalex_id or "",
         "abstract": abstract or "",
         "abstract_from": abstract_from or "",
+        "first_author": authors.clean_name(first_author),
+        "corresponding_author": authors.clean_name(corresponding_author),
         "sources": [source],
     }
+
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +369,10 @@ def merge_works(groups: list[tuple[str, list[dict]]]) -> tuple[list[dict], dict[
     * 同一 DOI 只保留一条；``sources`` 记录所有命中它的源；
     * **摘要取最长的那一条** —— 这是并集检索最实在的收益：同一篇论文常常
       OpenAlex 没有摘要而 Crossref/S2 有，取最长能直接提高 AI 打分的准确性；
-    * 期刊名 / ISSN / 发表日期等缺失字段由后面的源补齐（先到的不被覆盖）。
+    * 期刊名 / ISSN / 发表日期等缺失字段由后面的源补齐（先到的不被覆盖）；
+    * 作者同理补齐（先到的不被覆盖）—— 于是"OpenAlex 有通讯作者、Crossref
+      只有一作"时，合并结果里两个字段都全（两个源给的一作写法不同是正常的，
+      显示时会取先到的那个，即 OpenAlex 的写法，与期刊名/摘要的处理一致）。
     """
     merged: dict[str, dict] = {}
     added: dict[str, int] = {}
@@ -389,7 +402,15 @@ def merge_works(groups: list[tuple[str, list[dict]]]) -> tuple[list[dict], dict[
                 existing["abstract"] = new_abstract
                 existing["abstract_from"] = work.get("abstract_from") or name
 
-            for field_name in ("journal", "issn", "pub_date", "cited_by", "openalex_id"):
+            for field_name in (
+                "journal",
+                "issn",
+                "pub_date",
+                "cited_by",
+                "openalex_id",
+                "first_author",
+                "corresponding_author",
+            ):
                 if not existing.get(field_name) and work.get(field_name):
                     existing[field_name] = work[field_name]
 

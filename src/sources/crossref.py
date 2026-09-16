@@ -49,9 +49,11 @@ log = logging.getLogger(__name__)
 _JOURNAL_URL = "https://api.crossref.org/journals/{issn}/works"
 
 #: 只取需要的字段，响应体能小一大截。
+#: ``author`` 里只用到 given/family/sequence，但 select 只能按字段整体开 ——
+#: 实测一整刊的 author 数组加不了多少字节，比多打一次请求划算。
 _SELECT = (
     "DOI,title,container-title,published,published-print,published-online,"
-    "abstract,type,is-referenced-by-count"
+    "abstract,type,is-referenced-by-count,author"
 )
 
 #: 取发表日期时按这个顺序找第一个有值的字段（Crossref 的字段经常缺）
@@ -85,6 +87,35 @@ def _pub_date(item: dict) -> str:
     return ""
 
 
+def _first_author(item: dict) -> str:
+    """Crossref 作者数组里的第一作者；拿不到返回 ``""``。
+
+    Crossref 给 ``given`` / ``family``，也有的记录只有机构作者（``name``）。
+    ``sequence`` 字段有标记时优先信它（值就是 ``"first"``），没标就按数组顺序 ——
+    比直接取 ``[0]`` 稳。
+
+    **Crossref 没有通讯作者字段**（那是 OpenAlex 独有的），所以这里只返回一作；
+    绝不拿末位作者冒充通讯。
+    """
+    from .. import authors
+
+    entries = [entry for entry in (item.get("author") or []) if isinstance(entry, dict)]
+
+    def name_of(entry: dict) -> str:
+        return authors.join_name(entry.get("given"), entry.get("family"), entry.get("name"))
+
+    for entry in entries:
+        if str(entry.get("sequence") or "").strip().lower() == "first":
+            name = name_of(entry)
+            if name:
+                return name
+    for entry in entries:
+        name = name_of(entry)
+        if name:
+            return name
+    return ""
+
+
 def _to_work(item: dict, journal: str, issn: str) -> dict | None:
     """把一条 Crossref item 转成统一结构；无 DOI 返回 ``None``。
 
@@ -104,6 +135,7 @@ def _to_work(item: dict, journal: str, issn: str) -> dict | None:
         type_=item.get("type") or "",
         abstract=clean_text(item.get("abstract")),
         abstract_from=CROSSREF,
+        first_author=_first_author(item),
     )
 
 

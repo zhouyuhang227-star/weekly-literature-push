@@ -48,7 +48,28 @@ log = logging.getLogger(__name__)
 
 _BULK_URL = "https://api.semanticscholar.org/graph/v1/paper/search/bulk"
 
-_FIELDS = "title,externalIds,venue,publicationDate,abstract,publicationTypes"
+_FIELDS = (
+    "title,externalIds,venue,publicationDate,abstract,publicationTypes,authors"
+)
+
+
+def _first_author(item: dict) -> str:
+    """S2 作者数组里的第一作者；拿不到返回 ``""``。
+
+    S2 只给 ``{"name": "J. Smith"}`` 这种压过的写法（没有 given/family），
+    也没有作者顺序字段，所以就是数组第一条。
+    **S2 没有通讯作者字段**，这里不猜。
+    """
+    from .. import authors
+
+    for entry in item.get("authors") or []:
+        if isinstance(entry, dict):
+            name = authors.clean_name(entry.get("name"))
+        else:
+            name = authors.clean_name(entry)
+        if name:
+            return name
+    return ""
 
 #: 主动节流的全局状态（S2 不给我们限流头，只能自己数）
 _throttle_lock = threading.Lock()
@@ -124,6 +145,7 @@ def _to_work(item: dict) -> tuple[dict | None, str]:
         type_=",".join(str(t) for t in raw_types) if raw_types else "",
         abstract=item.get("abstract") or "",
         abstract_from=SEMANTIC_SCHOLAR if item.get("abstract") else "",
+        first_author=_first_author(item),
     )
     return work, ""
 

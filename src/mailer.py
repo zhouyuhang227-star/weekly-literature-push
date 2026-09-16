@@ -22,14 +22,18 @@ from __future__ import annotations
 
 import html
 import logging
+import re
 import smtplib
 import ssl
+from email import encoders
 from email.header import Header
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formatdate, make_msgid
+from urllib.parse import quote
 
-from . import ranking
+from . import authors, ranking
 from .config import (
     EMAIL_TITLE,
     MAX_EMAIL_ITEMS,
@@ -57,6 +61,7 @@ _STYLE = {
     "score": "display:inline-block;padding:1px 8px;border-radius:999px;"
     "background:#ecfdf5;color:#047857;font-weight:600;margin-left:6px;",
     "title": "font-size:16px;font-weight:600;line-height:1.5;color:#111827;margin:0 0 10px;",
+    "authors": "font-size:12px;color:#6b7280;margin:-6px 0 10px;",
     "takeaway": "background:#f0f9ff;border-left:3px solid #0ea5e9;padding:10px 12px;"
     "border-radius:0 6px 6px 0;color:#0c4a6e;font-size:14px;line-height:1.7;margin:0 0 10px;",
     "reason": "font-size:13px;color:#4b5563;line-height:1.7;margin:0 0 10px;",
@@ -117,6 +122,13 @@ def _render_card(work: dict) -> str:
         f'<div style="{_STYLE["takeaway"]}">{_esc(takeaway)}</div>' if takeaway else ""
     )
 
+    # 一作 + 一通讯（最多 2 个名字）。两个人同一位、或数据源给不出通讯时，
+    # author_line() 会自己省略 —— 见 src/authors.py 里的数据源能力表。
+    author_text = authors.author_line(work)
+    author_html = (
+        f'<div style="{_STYLE["authors"]}">作者：{_esc(author_text)}</div>' if author_text else ""
+    )
+
     doi_html = (
         f'DOI：<a style="{_STYLE["link"]}" href="{_esc(doi_url)}">{_esc(doi)}</a>'
         if doi
@@ -132,6 +144,7 @@ def _render_card(work: dict) -> str:
     &nbsp;{tag_html}
   </div>
   <div style="{_STYLE['title']}">{_esc(work.get('title'))}</div>
+  {author_html}
   {takeaway_html}
   <div style="{_STYLE['reason']}">判断理由：{_esc(work.get('ai_reason') or '无')}</div>
   <div style="{_STYLE['doi']}">{doi_html}</div>
@@ -152,6 +165,9 @@ def build_html(
     extra_meta: str = "",
     extra_notices: list[str] | None = None,
     max_items: int | None = None,
+    attachment_name: str | None = None,
+    attachment_count: int = 0,
+    attachment_skipped: int = 0,
 ) -> tuple[str, str]:
     """渲染邮件正文。
 
@@ -162,6 +178,11 @@ def build_html(
     :param extra_notices: 额外提示条目（纯文本，会被转义）。**数据源故障就是靠它
                           出现在邮件里的** —— 日志在手机上没人看，页头才看得见。
     :param max_items: 单封最多展示篇数；默认 ``config.MAX_EMAIL_ITEMS``。
+    :param attachment_name: 超出正文上限的文献被排进了哪个附件（含文件名）。
+                            有值时提示语改成"看附件"，不再说"已截断"。
+    :param attachment_count: 附件里实际收录了几篇。
+    :param attachment_skipped: 连附件都没装下的篇数（超出 ``ATTACH_PDF_MAX_ITEMS``）
+                              —— 这些**不会**被标记为已推送，必须明说。
     :return: ``(html, 纯文本备选)``
     """
     email_title = title or EMAIL_TITLE
@@ -205,9 +226,21 @@ def build_html(
 
     notices: list[str] = list(header_notices)
     if overflow > 0:
+        if attachment_name:
+            notices.append(
+                f"另有 <b>{overflow}</b> 篇相关文献超出正文上限（{limit} 篇），"
+                f"已按<b>最终分降序</b>排进附件 <b>{_esc(attachment_name)}</b>"
+                f"（共 {int(attachment_count)} 篇），可下载查看。"
+            )
+        else:
+            notices.append(
+                f"另有 <b>{overflow}</b> 篇相关文献因单封邮件上限（{limit} 篇）未在此展示，"
+                "已按<b>最终分（AI 相关性分 + 期刊档次加成 + 内容加分）</b>降序截断。"
+            )
+    if attachment_skipped > 0:
         notices.append(
-            f"另有 <b>{overflow}</b> 篇相关文献因单封邮件上限（{limit} 篇）未在此展示，"
-            "已按<b>最终分（AI 相关性分 + 期刊档次加成 + 内容加分）</b>降序截断。"
+            f"附件已收满，另有 <b>{int(attachment_skipped)}</b> 篇未装入附件；"
+            "它们<b>没有</b>被标记为已推送，下一轮会重新评估。"
         )
     if ai_failed:
         notices.append(f"有 <b>{ai_failed}</b> 篇文献 AI 打分失败，本次未纳入统计（详见运行日志）。")
@@ -222,11 +255,22 @@ def build_html(
 
     plain_lines = [f"{email_title} · {run_date}（{len(shown)} 篇）", ""]
     plain_lines += [f"⚠️ {item}" for item in header_notices]
+    if attachment_name and overflow > 0:
+        plain_lines.append(
+            f"📎 另 {overflow} 篇超出正文上限，已排进附件 {attachment_name}"
+            f"（{int(attachment_count)} 篇）。"
+        )
+    if attachment_skipped:
+        plain_lines.append(f"📎 附件已收满，另有 {int(attachment_skipped)} 篇未装入。")
+    plain_lines.append("")
     for index, work in enumerate(shown, start=1):
         plain_lines += [
             f"{index}. {work.get('title')}",
             f"   [{work.get('journal')}] {work.get('pub_date')} · {ranking.breakdown(work)} 分",
         ]
+        author_text = authors.author_line(work)
+        if author_text:
+            plain_lines.append(f"   作者：{author_text}")
         if work.get("ai_takeaway"):
             plain_lines.append(f"   解读：{work['ai_takeaway']}")
         if work.get("ai_reason"):
@@ -291,22 +335,80 @@ def _connect() -> smtplib.SMTP:
     return server
 
 
-def send_mail(subject: str, html_body: str, plain_body: str, recipients: list[str] | None = None) -> None:
-    """发送 multipart/alternative 邮件。失败时抛出异常，由调用方决定是否回写状态。"""
+def _ascii_filename(name: str, fallback: str = "literature-overflow.pdf") -> str:
+    """附件名的纯 ASCII 兜底。
+
+    中文文件名必须走 RFC 2231（``filename*=utf-8''...``）才能正确显示，
+    但极老的客户端只认传统的 ``filename="..."``。两个都写（RFC 6266 也是这么
+    建议的）：新客户端读 ``filename*``，老客户端至少能拿到一个能存下来的名字。
+
+    ``富锂锰正极-2026-10-02-附件12篇.pdf`` 这种中文名剥掉非 ASCII 后会剩下一堆
+    分隔符，所以这里再折叠一次连续分隔符；剥空了就退回 ``fallback``。
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", str(name or ""))
+    cleaned = re.sub(r"[-_]{2,}", "-", cleaned).strip("._-")
+    return cleaned or fallback
+
+
+def send_mail(
+    subject: str,
+    html_body: str,
+    plain_body: str,
+    recipients: list[str] | None = None,
+    *,
+    attachment: tuple[str, bytes] | None = None,
+) -> None:
+    """发送邮件。失败时抛出异常，由调用方决定是否回写状态。
+
+    :param attachment: ``(文件名, 字节)``。有附件时最外层必须是
+        ``multipart/mixed``（正文的 ``multipart/alternative`` 嵌在里面），
+        否则客户端会把附件当成"另一种正文"而不是附件。
+        无附件时仍然直接发 ``alternative``，与以前完全一致。
+    """
     recipients = recipients or mail_recipients()
     if not recipients:
         raise RuntimeError("收件人列表为空（MAIL_TO 未配置）")
 
-    message = MIMEMultipart("alternative")
+    alternative = MIMEMultipart("alternative")
+    alternative.attach(MIMEText(plain_body, "plain", "utf-8"))
+    alternative.attach(MIMEText(html_body, "html", "utf-8"))
+
+    if attachment:
+        filename, payload = attachment
+        message = MIMEMultipart("mixed")
+        message.attach(alternative)
+        part = MIMEBase("application", "pdf")
+        part.set_payload(payload)
+        encoders.encode_base64(part)
+        # 中文名走 RFC 2231（`name*=`/`filename*=`），同时给出纯 ASCII 的
+        # `name=`/`filename=` 兜底：前者让 Gmail / 新版客户端显示出中文名，
+        # 后者保证老客户端也能存成一个合法文件名。
+        #
+        # 这里**手写整条头部**而不是用 ``set_param``：``set_param`` 会先按
+        # RFC 2231 把已有的 ``name*`` 解码成 ``name``，再用解码结果重建头部，
+        # 于是后调用的 ``set_param("name", ascii_name)`` 会把中文名**悄悄吃掉**
+        # （实测只剩下 ``name="2026-10-02-3-.pdf"``）。写死字符串最稳。
+        ascii_name = _ascii_filename(filename)
+        encoded_name = quote(str(filename), safe="")
+        # ``Message.__setitem__`` 是**追加**不是覆盖，而 MIMEBase 构造时已经写过一条
+        # ``Content-Type``；不先删掉就会发出两条同名的头部（客户端只看第一条）。
+        del part["Content-Type"]
+        part["Content-Type"] = (
+            f'application/pdf; name="{ascii_name}"; name*=utf-8\'\'{encoded_name}'
+        )
+        part["Content-Disposition"] = (
+            f'attachment; filename="{ascii_name}"; filename*=utf-8\'\'{encoded_name}'
+        )
+        message.attach(part)
+    else:
+        message = alternative
+
     # 中文主题必须显式做 RFC 2047 编码
     message["Subject"] = Header(subject, "utf-8").encode()
     message["From"] = SMTP_USER
     message["To"] = ", ".join(recipients)
     message["Date"] = formatdate(localtime=True)
     message["Message-ID"] = make_msgid(domain="literature-bot")
-
-    message.attach(MIMEText(plain_body, "plain", "utf-8"))
-    message.attach(MIMEText(html_body, "html", "utf-8"))
 
     server = _connect()
     try:
@@ -319,7 +421,16 @@ def send_mail(subject: str, html_body: str, plain_body: str, recipients: list[st
         except smtplib.SMTPException:
             pass
 
-    log.info("邮件已发送至 %s（主题：%s）", ", ".join(recipients), subject)
+    if attachment:
+        log.info(
+            "邮件已发送至 %s（主题：%s，附件：%s / %s KB）",
+            ", ".join(recipients),
+            subject,
+            attachment[0],
+            max(1, len(attachment[1]) // 1024),
+        )
+    else:
+        log.info("邮件已发送至 %s（主题：%s）", ", ".join(recipients), subject)
 
 
 def build_subject(
@@ -357,6 +468,10 @@ def send(
     recipients: list[str] | None = None,
     title: str | None = None,
     max_items: int | None = None,
+    attachment_name: str | None = None,
+    attachment_count: int = 0,
+    attachment_skipped: int = 0,
+    attachment: tuple[str, bytes] | None = None,
 ) -> dict:
     """渲染并发送。返回统计信息供日志记录。
 
@@ -373,18 +488,30 @@ def send(
         ai_failed=ai_failed,
         title=title,
         max_items=max_items,
+        attachment_name=attachment_name,
+        attachment_count=attachment_count,
+        attachment_skipped=attachment_skipped,
     )
 
     subject = build_subject(works, run_date, title, max_items=max_items)
-    send_mail(subject, html_body, plain_body, recipients=recipients)
+    send_mail(subject, html_body, plain_body, recipients=recipients, attachment=attachment)
     limit = MAX_EMAIL_ITEMS if max_items is None else max(1, int(max_items))
     return {"subject": subject, "count": min(len(works), limit), "html": html_body}
 
 
-def save_preview(html_body: str, run_date: str, outbox_dir: str, suffix: str = "") -> str:
+def save_preview(
+    html_body: str,
+    run_date: str,
+    outbox_dir: str,
+    suffix: str = "",
+    *,
+    attachment: tuple[str, bytes] | None = None,
+) -> str:
     """``--dry-run`` 模式：把邮件 HTML 写到本地文件，供浏览器预览。
 
     ``suffix`` 用于多主题时区分每个主题的预览（如 ``-无负极钠离子电池``）。
+    有附件时会把 PDF **一并写到同一个目录**，这样本地预览就能看见真实附件 ——
+    但**不会发邮件**，``--dry-run`` 依然零副作用。
     """
     import os
 
@@ -392,5 +519,10 @@ def save_preview(html_body: str, run_date: str, outbox_dir: str, suffix: str = "
     path = os.path.join(outbox_dir, f"{run_date}{suffix}.html")
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(html_body)
+    if attachment:
+        pdf_path = os.path.join(outbox_dir, attachment[0])
+        with open(pdf_path, "wb") as handle:
+            handle.write(attachment[1])
+        log.info("[dry-run] PDF 附件已写入：%s", pdf_path)
     log.info("[dry-run] 邮件预览已写入：%s", path)
     return path

@@ -37,6 +37,26 @@ from src.openalex_client import (  # noqa: E402
 )
 
 
+def _pdf_text(payload: bytes) -> str:
+    """把附件 PDF 里的文字抠出来，供断言用（不引入第三方 PDF 库）。
+
+    手写 PDF 的正文流是 FlateDecode 压缩的、每行文字是 UTF-16BE 的 hex 串，
+    这里手工解一遍。只在单测里用，生产代码不需要反向解析。
+    """
+    import re as _re
+    import zlib as _zlib
+
+    document = payload.decode("latin-1")
+    chunks: list[str] = []
+    for stream in _re.findall(r"stream\r?\n(.*?)\r?\nendstream", document, _re.S):
+        ops = _zlib.decompress(stream.encode("latin-1")).decode("latin-1")
+        chunks += [
+            bytes.fromhex(hex_text).decode("utf-16-be")
+            for hex_text in _re.findall(r"<([0-9A-Fa-f]+)>\s*Tj", ops)
+        ]
+    return "\n".join(chunks)
+
+
 class TestDoiNormalize(unittest.TestCase):
     def test_strips_https_prefix(self):
         self.assertEqual(
@@ -1335,6 +1355,7 @@ class TestMultiTopicOrchestration(unittest.TestCase):
             {"name": "无负极钠离子电池", "topic_query": "anode free sodium", "keywords": ["无负极"]},
         ]
         self.sent: list[tuple[str, str]] = []
+        self.attachments: list[tuple[str, bytes] | None] = []
         self.fetched: list[str] = []
         # 多源是 main 的默认行为 —— 不把备用源 stub 掉，单测就会真的去
         # 请求 Crossref / Semantic Scholar（慢、依赖网络、还会被限流）。
@@ -1370,19 +1391,22 @@ class TestMultiTopicOrchestration(unittest.TestCase):
         ]
         return passed, [], []
 
+    def _fake_send(self, subject, html_body, plain_body, recipients=None, attachment=None):
+        """``send_mail`` 的桩。
+
+        ``attachment`` 必须是 keyword-only 带默认值的参数 —— 否则以后给
+        ``send_mail`` 再加参数时，这里会静默变成"参数个数不对"的失败。
+        """
+        self.sent.append((subject, html_body))
+        self.attachments.append(attachment)
+
     def _patches(self):
         return [
             patch.object(main_module, "validate_env", lambda **_kw: None),
             patch.object(main_module.openalex_client, "fetch_works", side_effect=self._fake_fetch),
             patch.object(main_module.abstract_source, "enrich_abstracts", side_effect=lambda works: works),
             patch.object(main_module.ai_matcher, "evaluate_works", side_effect=self._fake_eval),
-            patch.object(
-                main_module.mailer,
-                "send_mail",
-                side_effect=lambda subject, html_body, plain_body, recipients=None: self.sent.append(
-                    (subject, html_body)
-                ),
-            ),
+            patch.object(main_module.mailer, "send_mail", side_effect=self._fake_send),
         ]
 
     def _run(self, argv: list[str] | None = None):
@@ -1465,11 +1489,7 @@ class TestMultiTopicOrchestration(unittest.TestCase):
         ), patch.object(
             main_module.ai_matcher, "evaluate_works", side_effect=self._fake_eval
         ), patch.object(
-            main_module.mailer,
-            "send_mail",
-            side_effect=lambda subject, html_body, plain_body, recipients=None: self.sent.append(
-                (subject, html_body)
-            ),
+            main_module.mailer, "send_mail", side_effect=self._fake_send
         ):
             with self.assertRaises(RuntimeError):
                 main_module.run(args)
@@ -1533,11 +1553,7 @@ class TestMultiTopicOrchestration(unittest.TestCase):
         ), patch.object(
             main_module.ai_matcher, "evaluate_works", side_effect=self._fake_eval
         ), patch.object(
-            main_module.mailer,
-            "send_mail",
-            side_effect=lambda subject, html_body, plain_body, recipients=None: self.sent.append(
-                (subject, html_body)
-            ),
+            main_module.mailer, "send_mail", side_effect=self._fake_send
         ):
             self.assertEqual(main_module.run(args), 0)
 
@@ -2632,46 +2648,105 @@ class TestEmailItemLimit(unittest.TestCase):
             for work in works
         ], [], []
 
-    def _preview_html(self, argv: list[str] | None = None) -> str:
-        args = main_module.build_parser().parse_args(
-            (argv or []) + ["--dry-run", "--topic", "富锂锰正极"]
-        )
-        with patch.object(main_module, "validate_env", lambda **_kw: None), patch.object(
-            main_module.abstract_source, "enrich_abstracts", side_effect=lambda works: works
-        ), patch.object(
-            main_module.ai_matcher, "evaluate_works", side_effect=self._fake_eval
-        ), patch.object(
-            main_module.mailer, "send_mail", side_effect=AssertionError("dry-run 不该发邮件")
-        ):
-            self.assertEqual(main_module.run(args), 0)
+    @staticmethod
+    def _never_send(*_args, **_kwargs):
+        raise AssertionError("dry-run 不该发邮件")
 
+    def _run_pipeline(self, argv: list[str], *, send, extra=()) -> int:
+        """按给定命令行跑一轮（四个网络/IO 依赖全部换成桩）。
+
+        ``send`` 是 ``send_mail`` 的 side_effect：dry-run 传 ``_never_send``，
+        真发传一个收集器。``extra`` 用于追加 ``patch.object``（如临时改
+        ``ATTACH_PDF_MAX_ITEMS``）。
+        """
+        args = main_module.build_parser().parse_args(argv + ["--topic", "富锂锰正极"])
+        patchers = [
+            patch.object(main_module, "validate_env", lambda **_kw: None),
+            patch.object(main_module.abstract_source, "enrich_abstracts", side_effect=lambda works: works),
+            patch.object(main_module.ai_matcher, "evaluate_works", side_effect=self._fake_eval),
+            patch.object(main_module.mailer, "send_mail", side_effect=send),
+        ]
+        with contextlib.ExitStack() as stack:
+            for patcher in list(extra) + patchers:
+                stack.enter_context(patcher)
+            return main_module.run(args)
+
+    def _latest(self, suffix: str) -> str:
+        """outbox 里最新的某个后缀的文件名。
+
+        必须先按后缀过滤：dry-run 现在会同时写出 ``.html`` 预览和 ``.pdf``
+        附件，附件总是后写的，不过滤就会拿到二进制 PDF 当 HTML 解。
+        """
         names = sorted(
-            os.listdir(main_module.OUTBOX_DIR),
+            (name for name in os.listdir(main_module.OUTBOX_DIR) if name.endswith(suffix)),
             key=lambda name: os.path.getmtime(os.path.join(main_module.OUTBOX_DIR, name)),
         )
-        self.assertTrue(names, "dry-run 应该写出预览文件")
-        with open(os.path.join(main_module.OUTBOX_DIR, names[-1]), encoding="utf-8") as handle:
+        self.assertTrue(names, f"dry-run 应该写出 {suffix} 文件")
+        return names[-1]
+
+    def _preview_html(self, argv: list[str] | None = None, extra=()) -> str:
+        self.assertEqual(
+            self._run_pipeline((argv or []) + ["--dry-run"], send=self._never_send, extra=extra), 0
+        )
+        with open(
+            os.path.join(main_module.OUTBOX_DIR, self._latest(".html")), encoding="utf-8"
+        ) as handle:
             return handle.read()
+
+    def _attachment(self, argv: list[str] | None = None, extra=()) -> tuple[str, bytes]:
+        self.assertEqual(
+            self._run_pipeline((argv or []) + ["--dry-run"], send=self._never_send, extra=extra), 0
+        )
+        name = self._latest(".pdf")
+        with open(os.path.join(main_module.OUTBOX_DIR, name), "rb") as handle:
+            return name, handle.read()
+
+    def _attachment_names(self) -> list[str]:
+        return [name for name in os.listdir(main_module.OUTBOX_DIR) if name.endswith(".pdf")]
 
     def test_first_run_widens_the_limit_to_fifty(self):
         html_body = self._preview_html()
-        self.assertIn("单封邮件上限（50 篇）", html_body)
-        # 60 篇候选 → 展示 50、溢出 10
-        self.assertIn("<b>10</b> 篇相关文献因单封邮件上限（50 篇）未在此展示", html_body)
+        # 60 篇候选 → 正文展示 50、剩下 10 篇不再“消失”：排进 PDF 附件一起发出
+        self.assertIn("超出正文上限（50 篇）", html_body)
+        self.assertIn("<b>10</b> 篇相关文献超出正文上限（50 篇）", html_body)
+        self.assertIn("排进附件", html_body)
+        self.assertIn("（共 10 篇）", html_body)
+        self.assertNotIn("未在此展示", html_body)
+
+        name, payload = self._attachment()
+        self.assertTrue(name.endswith(".pdf"), name)
+        self.assertTrue(name.startswith("富锂锰正极"), name)  # 附件名带主题名
+        self.assertTrue(payload.startswith(b"%PDF-"), payload[:8])
+        self.assertTrue(payload.rstrip().endswith(b"%%EOF"))
+        # 附件里装的确实是正文没展示的那几篇（尾部第 59 篇在 50 篇正文之外）
+        self.assertIn("10.1/lit59", _pdf_text(payload))
 
     def test_regular_run_keeps_the_twenty_item_limit(self):
         with patch.object(main_module.dedup, "is_first_run", return_value=False):
             html_body = self._preview_html()
-        self.assertIn("单封邮件上限（20 篇）", html_body)
+        # 常规上限 20 篇，溢出 40 篇全部进附件
+        self.assertIn("<b>40</b> 篇相关文献超出正文上限（20 篇）", html_body)
+        self.assertIn("（共 40 篇）", html_body)
 
     def test_explicit_max_items_wins_in_both_cases(self):
         self.assertIn(
-            "单封邮件上限（5 篇）", self._preview_html(["--max-items", "5"])
+            "超出正文上限（5 篇）", self._preview_html(["--max-items", "5"])
         )
         with patch.object(main_module.dedup, "is_first_run", return_value=False):
             self.assertIn(
-                "单封邮件上限（8 篇）", self._preview_html(["--max-items", "8"])
+                "超出正文上限（8 篇）", self._preview_html(["--max-items", "8"])
             )
+
+    def test_no_attachment_flag_restores_the_old_truncation(self):
+        html_body = self._preview_html(["--no-attachment"])
+        self.assertIn("<b>10</b> 篇相关文献因单封邮件上限（50 篇）未在此展示", html_body)
+        self.assertNotIn("排进附件", html_body)
+        self.assertEqual(self._attachment_names(), [])
+
+    def test_overall_switch_can_turn_the_attachment_off(self):
+        html_body = self._preview_html(extra=[patch.object(main_module, "OVERFLOW_ATTACHMENT", False)])
+        self.assertNotIn("排进附件", html_body)
+        self.assertEqual(self._attachment_names(), [])
 
     def test_cli_default_is_resolved_at_runtime(self):
         """--max-items 的默认值必须是 None，否则首次放宽无从判断。"""
@@ -2679,6 +2754,73 @@ class TestEmailItemLimit(unittest.TestCase):
         self.assertEqual(config.MAX_EMAIL_ITEMS, 20)
         self.assertEqual(config.MAX_EMAIL_ITEMS_FIRST_RUN, 50)
 
+
+    def test_first_run_email_subject_agrees_with_the_body(self):
+        sent: list[tuple[str, str]] = []
+        args = main_module.build_parser().parse_args(["--topic", "富锂锰正极"])
+        with patch.object(main_module, "validate_env", lambda **_kw: None), patch.object(
+            main_module.abstract_source, "enrich_abstracts", side_effect=lambda works: works
+        ), patch.object(
+            main_module.ai_matcher, "evaluate_works", side_effect=self._fake_eval
+        ), patch.object(
+            main_module.mailer,
+            "send_mail",
+            side_effect=lambda subject, html_body, plain_body, recipients=None, attachment=None: sent.append(
+                (subject, html_body)
+            ),
+        ):
+            self.assertEqual(main_module.run(args), 0)
+
+        self.assertEqual(len(sent), 1)
+        subject, html_body = sent[0]
+        self.assertTrue(subject.endswith("· 50 篇"), subject)
+        self.assertIn("超出正文上限（50 篇）", html_body)
+
+    def test_attachment_items_are_marked_as_pushed(self):
+        """排进附件 = 已经送到用户手里，必须记已读：
+
+        不记的话下周会把它们原封不动地重新打分一遍，白烧 AI 额度。
+        """
+        sent: list[tuple[str, bytes] | None] = []
+
+        def collect(subject, html_body, plain_body, recipients=None, attachment=None):
+            sent.append(attachment)
+
+        self.assertEqual(self._run_pipeline([], send=collect), 0)
+
+        self.assertEqual(len(sent), 1)
+        self.assertIsNotNone(sent[0], "首次运行有 10 篇溢出，应该带附件")
+        # 正文 50 篇 + 附件 10 篇 = 60 篇全部标记已读
+        self.assertEqual(dedup.topic_counts(), {"富锂锰正极": 60})
+        self.assertEqual(len(dedup.load_pushed("富锂锰正极")), 60)
+
+    def test_attachment_cap_leaves_the_overflow_unmarked(self):
+        """附件也有篇幅上限：装不下的宁可下轮重评，也不能冒充“已读”。"""
+        sent: list[tuple[str, str]] = []
+
+        def collect(subject, html_body, plain_body, recipients=None, attachment=None):
+            sent.append((subject, html_body))
+
+        self.assertEqual(
+            self._run_pipeline([], send=collect, extra=[patch.object(main_module, "ATTACH_PDF_MAX_ITEMS", 3)]),
+            0,
+        )
+
+        _, html_body = sent[0]
+        self.assertIn("（共 3 篇）", html_body)
+        self.assertIn("附件已收满", html_body)
+        self.assertIn("另有 <b>7</b> 篇未装入附件", html_body)
+        # 正文 50 + 附件 3 = 53；剩下 7 篇没被标记
+        self.assertEqual(dedup.topic_counts(), {"富锂锰正极": 53})
+
+    def test_attachment_failure_never_blocks_the_email(self):
+        """PDF 生成挂了也必须把正文发出去 —— 正文才是主线。"""
+        with patch.object(main_module.pdf_report, "build", side_effect=RuntimeError("PDF 挂了")):
+            html_body = self._preview_html()
+
+        self.assertNotIn("排进附件", html_body)
+        self.assertIn("未在此展示", html_body)  # 退回旧的截断提示
+        self.assertEqual(self._attachment_names(), [])
 
     def test_subject_count_follows_the_same_limit(self):
         """主题行写 20 篇而正文 50 篇，看起来就像邮件被截断了。"""
@@ -2693,26 +2835,414 @@ class TestEmailItemLimit(unittest.TestCase):
             f"{config.MAX_EMAIL_ITEMS} 篇",
         )
 
-    def test_first_run_email_subject_agrees_with_the_body(self):
-        sent: list[tuple[str, str]] = []
-        args = main_module.build_parser().parse_args(["--topic", "富锂锰正极"])
-        with patch.object(main_module, "validate_env", lambda **_kw: None), patch.object(
-            main_module.abstract_source, "enrich_abstracts", side_effect=lambda works: works
-        ), patch.object(
-            main_module.ai_matcher, "evaluate_works", side_effect=self._fake_eval
-        ), patch.object(
-            main_module.mailer,
-            "send_mail",
-            side_effect=lambda subject, html_body, plain_body, recipients=None: sent.append(
-                (subject, html_body)
-            ),
-        ):
-            self.assertEqual(main_module.run(args), 0)
 
-        self.assertEqual(len(sent), 1)
-        subject, html_body = sent[0]
-        self.assertTrue(subject.endswith("· 50 篇"), subject)
-        self.assertIn("单封邮件上限（50 篇）", html_body)
+class TestAuthorNames(unittest.TestCase):
+    """``src/authors.py``：作者名的清洗、比较与那行显示文字。"""
+
+    def setUp(self):
+        from src import authors
+
+        self.authors = authors
+
+    def test_prints_first_and_corresponding(self):
+        self.assertEqual(
+            self.authors.author_line({"first_author": "Wei Zhang", "corresponding_author": "Yan Li"}),
+            "Wei Zhang（一作） · Yan Li（通讯）",
+        )
+
+    def test_same_person_is_merged_into_one_label(self):
+        """一作兼通讯只写一个名字，别让用户看到两个人。"""
+        self.assertEqual(
+            self.authors.author_line({"first_author": "J. Kim", "corresponding_author": "J Kim"}),
+            "J. Kim（一作兼通讯）",
+        )
+
+    def test_only_first_author_when_corresponding_is_unknown(self):
+        """Crossref / S2 只有一作：如实省略通讯，绝不拿末位作者冒充。"""
+        self.assertEqual(self.authors.author_line({"first_author": "Wei Zhang"}), "Wei Zhang（一作）")
+
+    def test_only_corresponding_when_first_is_unknown(self):
+        self.assertEqual(self.authors.author_line({"corresponding_author": "Yan Li"}), "Yan Li（通讯）")
+
+    def test_unknown_authors_produce_no_line_at_all(self):
+        self.assertEqual(self.authors.author_line({}), "")
+        self.assertEqual(self.authors.author_line({"first_author": "  ", "corresponding_author": None}), "")
+        self.assertNotIn("未知", self.authors.author_line({}))
+
+    def test_max_names_can_keep_only_the_first(self):
+        work = {"first_author": "A B", "corresponding_author": "C D"}
+        self.assertEqual(self.authors.author_line(work, max_names=1), "A B（一作）")
+
+    def test_clean_name_collapses_whitespace(self):
+        self.assertEqual(self.authors.clean_name("  Wei\n\tZhang  "), "Wei Zhang")
+        self.assertEqual(self.authors.clean_name(None), "")
+
+    def test_join_name_prefers_given_family_and_falls_back(self):
+        self.assertEqual(self.authors.join_name("Wei", "Zhang"), "Wei Zhang")
+        self.assertEqual(self.authors.join_name(None, None, "某研究所"), "某研究所")
+        self.assertEqual(self.authors.join_name("", "", ""), "")
+
+    def test_same_person_ignores_punctuation_and_case(self):
+        self.assertTrue(self.authors.same_person("J. Kim", "j kim"))
+        self.assertTrue(self.authors.same_person("李四", "李 四"))
+        self.assertFalse(self.authors.same_person("J. Kim", "K. Jim"))
+        self.assertFalse(self.authors.same_person("", ""))
+
+
+class TestAuthorExtraction(unittest.TestCase):
+    """各源把作者塞进统一结构，合并时缺失的补齐、先到的不被覆盖。"""
+
+    AUTHORSHIPS = [
+        {
+            "author": {"display_name": "Wei Zhang"},
+            "author_position": "first",
+            "is_corresponding": False,
+        },
+        {
+            "author": {"display_name": "Yan Li"},
+            "author_position": "last",
+            "is_corresponding": True,
+        },
+    ]
+
+    def test_openalex_picks_first_and_corresponding(self):
+        self.assertEqual(
+            openalex_client.parse_authors(self.AUTHORSHIPS), ("Wei Zhang", "Yan Li")
+        )
+
+    def test_corresponding_ignores_author_position(self):
+        """通讯作者跟署名位置无关 —— 只看 is_corresponding。"""
+        authorships = [
+            {"author": {"display_name": "A One"}, "author_position": "first", "is_corresponding": True},
+            {"author": {"display_name": "Z Last"}, "author_position": "last", "is_corresponding": False},
+        ]
+        self.assertEqual(openalex_client.parse_authors(authorships), ("A One", "A One"))
+
+    def test_missing_authorships_give_empty_strings(self):
+        self.assertEqual(openalex_client.parse_authors(None), ("", ""))
+        self.assertEqual(openalex_client.parse_authors([]), ("", ""))
+
+    def test_author_name_falls_back_to_raw_name(self):
+        self.assertEqual(openalex_client.author_name({"display_name": "Wei Zhang"}), "Wei Zhang")
+        self.assertEqual(openalex_client.author_name({"raw_author_name": "W. Zhang"}), "W. Zhang")
+        self.assertEqual(openalex_client.author_name(None), "")
+
+    def test_parse_work_carries_both_author_fields(self):
+        work = parse_work(
+            {
+                "doi": "10.1/x",
+                "display_name": "T",
+                "primary_location": None,
+                "authorships": self.AUTHORSHIPS,
+            }
+        )
+        assert work is not None
+        self.assertEqual(work["first_author"], "Wei Zhang")
+        self.assertEqual(work["corresponding_author"], "Yan Li")
+
+    def test_crossref_takes_the_sequence_first_entry(self):
+        item = {
+            "author": [
+                {"given": "Yan", "family": "Li", "sequence": "additional"},
+                {"given": "Wei", "family": "Zhang", "sequence": "first"},
+            ]
+        }
+        self.assertEqual(crossref_source._first_author(item), "Wei Zhang")
+
+    def test_crossref_handles_organisation_authors(self):
+        self.assertEqual(
+            crossref_source._first_author({"author": [{"name": "某课题组"}]}), "某课题组"
+        )
+        self.assertEqual(crossref_source._first_author({}), "")
+
+    def test_semantic_scholar_takes_the_first_name(self):
+        self.assertEqual(
+            semantic_scholar_source._first_author({"authors": [{"name": "W. Zhang"}, {"name": "Y. Li"}]}),
+            "W. Zhang",
+        )
+        self.assertEqual(semantic_scholar_source._first_author({"authors": ["W. Zhang"]}), "W. Zhang")
+        self.assertEqual(semantic_scholar_source._first_author({}), "")
+
+    def test_make_work_cleans_author_names(self):
+        work = source_base.make_work(
+            doi="10.1/a",
+            title="T",
+            source="openalex",
+            first_author="  Wei   Zhang ",
+            corresponding_author="Yan Li",
+        )
+        assert work is not None
+        self.assertEqual(work["first_author"], "Wei Zhang")
+        self.assertEqual(work["corresponding_author"], "Yan Li")
+
+    def test_make_work_without_authors_gives_empty_strings(self):
+        work = source_base.make_work(doi="10.1/a", title="T", source="crossref")
+        assert work is not None
+        self.assertEqual(work["first_author"], "")
+        self.assertEqual(work["corresponding_author"], "")
+
+    def test_merge_keeps_openalex_authors_and_backfills_from_crossref(self):
+        """OpenAlex 有通讯作者、Crossref 只有一作：合并结果两个字段都全。"""
+        merged, _ = source_base.merge_works([
+            ("openalex", [{
+                "uid": "doi:10.1/a", "doi": "10.1/a", "title": "T",
+                "first_author": "Wei Zhang", "corresponding_author": "Yan Li",
+            }]),
+            ("crossref", [{
+                "uid": "doi:10.1/a", "doi": "10.1/a", "title": "T",
+                "first_author": "W. Zhang", "corresponding_author": "",
+            }]),
+        ])
+        self.assertEqual(merged[0]["first_author"], "Wei Zhang")  # 先到的不被覆盖
+        self.assertEqual(merged[0]["corresponding_author"], "Yan Li")
+
+    def test_merge_backfills_a_missing_first_author(self):
+        merged, _ = source_base.merge_works([
+            ("openalex", [{"uid": "doi:10.1/a", "doi": "10.1/a", "title": "T"}]),
+            ("semantic_scholar", [{
+                "uid": "doi:10.1/a", "doi": "10.1/a", "title": "T",
+                "first_author": "W. Zhang", "corresponding_author": "",
+            }]),
+        ])
+        self.assertEqual(merged[0]["first_author"], "W. Zhang")
+
+
+class TestPdfReport(unittest.TestCase):
+    """手写 PDF：GBK 安全化、按显示宽度硬换行、多页不切条目。"""
+
+    def _work(self, index: int, **overrides) -> dict:
+        work = {
+            "doi": f"10.1/lit{index}",
+            "title": f"Lithium-rich cathode paper {index}",
+            "journal": "Joule",
+            "pub_date": "2026-09-01",
+            "final_score": 77,
+            "ai_score": 70,
+            "ai_takeaway": "解读文字",
+            "ai_reason": "理由文字",
+            "first_author": "Wei Zhang",
+            "corresponding_author": "Yan Li",
+        }
+        work.update(overrides)
+        return work
+
+    def test_gbk_safe_drops_characters_the_font_cannot_show(self):
+        from src import pdf_report
+
+        # 预定义中文字体只覆盖 Adobe-GB1，emoji / 罕见字符显示成方块，宁可丢掉
+        self.assertEqual(pdf_report.gbk_safe("富锂锰正极👍"), "富锂锰正极")
+        # 各种“漂亮空白”（全角空格、不断行空格）统一成普通空格
+        self.assertEqual(pdf_report.gbk_safe("Wei\u3000Zhang"), "Wei Zhang")
+        self.assertEqual(pdf_report.gbk_safe("Wei\u00a0Zhang"), "Wei Zhang")
+
+    def test_gbk_safe_keeps_gbk_characters_and_folds_the_rest(self):
+        from src import pdf_report
+
+        # 全角字母在 GBK 里有码位，原样保留；下标数字 GBK 没有，NFKC 折成 1/2/3
+        self.assertEqual(pdf_report.gbk_safe("Ｌｉ₁₂₃"), "Ｌｉ123")
+        self.assertEqual(pdf_report.gbk_safe("５０ mm"), "５０ mm")
+
+    def test_wrap_never_exceeds_the_given_width(self):
+        from src import pdf_report
+
+        text = "富锂锰正极材料的电压衰减机理" * 6 + " and a long latin word here" * 3
+        lines = pdf_report._wrap(text, 9.5, 200.0)
+        self.assertGreater(len(lines), 1)
+        for line in lines:
+            self.assertLessEqual(pdf_report._text_width(line, 9.5), 200.0, repr(line))
+
+    def test_wrap_respects_max_lines_and_ellipsises(self):
+        from src import pdf_report
+
+        lines = pdf_report._wrap("很长的解读" * 60, 9.5, 200.0, max_lines=3)
+        self.assertEqual(len(lines), 3)
+        self.assertTrue(lines[-1].endswith("…"), lines[-1])
+
+    def test_filename_is_readable_and_sanitised(self):
+        from src import pdf_report
+
+        self.assertEqual(
+            pdf_report.filename_for("富锂锰正极", "2026-10-02", 12),
+            "富锂锰正极-2026-10-02-附件12篇.pdf",
+        )
+        # 主题名里的路径分隔符不能带进文件名
+        self.assertNotIn("/", pdf_report.filename_for("A/B:C", "2026-10-02", 1))
+        self.assertNotIn(":", pdf_report.filename_for("A/B:C", "2026-10-02", 1))
+
+    def test_build_returns_a_real_pdf(self):
+        from src import pdf_report
+
+        name, payload = pdf_report.build([self._work(1)], "2026-10-02", topic_name="富锂锰正极")
+        self.assertTrue(name.endswith(".pdf"), name)
+        self.assertTrue(payload.startswith(b"%PDF-"), payload[:8])
+        self.assertTrue(payload.rstrip().endswith(b"%%EOF"))
+        text = _pdf_text(payload)
+        self.assertIn("10.1/lit1", text)
+        self.assertIn("Wei Zhang（一作）", text)
+        self.assertIn("Yan Li（通讯）", text)
+
+    def test_build_paginates_without_splitting_items(self):
+        from src import pdf_report
+
+        works = [self._work(i) for i in range(1, 41)]
+        name, payload = pdf_report.build(works, "2026-10-02", topic_name="富锂锰正极")
+        text = payload.decode("latin-1")
+        pages = text.count("/Type /Page ")
+        self.assertGreater(pages, 1)
+        self.assertIn(f"/Count {pages}".encode(), payload)
+        # 条目连着编到 40，说明没有整条被丢掉
+        body = _pdf_text(payload)
+        self.assertIn("40. Joule", body)
+
+    def test_build_survives_items_without_optional_fields(self):
+        from src import pdf_report
+
+        name, payload = pdf_report.build(
+            [{"doi": "", "title": "", "journal": "", "pub_date": ""}], "2026-10-02"
+        )
+        self.assertTrue(payload.startswith(b"%PDF-"))
+        self.assertTrue(name.endswith(".pdf"))
+
+
+class TestMailAttachment(unittest.TestCase):
+    """附件与正文的 MIME 结构，以及 dry-run 预览落盘。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.sent: list = []
+
+        class FakeSMTP:
+            def __init__(self, sink):
+                self.sink = sink
+
+            def login(self, user, password):
+                self.sink.append(("login", user))
+
+            def send_message(self, message):
+                self.sink.append(("message", message))
+
+            def quit(self):
+                self.sink.append(("quit", None))
+
+        self._fake_smtp = FakeSMTP
+
+    def _patch_connect(self):
+        return patch.object(mailer, "_connect", lambda: self._fake_smtp(self.sent))
+
+    def _message(self):
+        return [item[1] for item in self.sent if item[0] == "message"][0]
+
+    def test_attachment_is_a_mixed_message_with_one_pdf_part(self):
+        payload = b"%PDF-1.4\nfake\n%%EOF\n"
+        with self._patch_connect():
+            mailer.send_mail(
+                "主题", "<p>hi</p>", "hi", recipients=["a@b.com"],
+                attachment=("富锂锰正极-2026-10-02-附件3篇.pdf", payload),
+            )
+        message = self._message()
+        self.assertEqual(message.get_content_type(), "multipart/mixed")
+        kinds = [part.get_content_type() for part in message.walk()]
+        self.assertIn("multipart/alternative", kinds)
+        self.assertIn("application/pdf", kinds)
+        pdf_part = [part for part in message.walk() if part.get_content_type() == "application/pdf"][0]
+        self.assertEqual(pdf_part.get_payload(decode=True), payload)
+        # 中文文件名走 RFC 2231；同时保留纯 ASCII 名字给老客户端
+        content_types = pdf_part.get_all("Content-Type")
+        self.assertEqual(len(content_types), 1, content_types)  # 不能发出两条同名头
+        content_type = str(content_types[0])
+        self.assertIn("name*=utf-8''", content_type)
+        self.assertIn(
+            "%E5%AF%8C%E9%94%82%E9%94%B0%E6%AD%A3%E6%9E%81-2026-10-02-%E9%99%84%E4%BB%B63%E7%AF%87.pdf",
+            content_type,
+        )
+        self.assertIn('name="2026-10-02-3-.pdf"', content_type)  # ASCII 兜底
+        dispositions = pdf_part.get_all("Content-Disposition")
+        self.assertEqual(len(dispositions), 1, dispositions)
+        disposition = str(dispositions[0])
+        self.assertTrue(disposition.startswith("attachment;"), disposition)
+        self.assertIn("filename*=utf-8''", disposition)
+        self.assertIn("%E5%AF%8C", disposition)
+        # 主题行仍然是编码过的中文，没有被附件挤掉
+        self.assertTrue(message.get("Subject"), message.get("Subject"))
+
+    def test_without_attachment_the_message_stays_alternative(self):
+        """没附件时结构与以前完全一致，避免老客户端出现奇怪的空附件。"""
+        with self._patch_connect():
+            mailer.send_mail("主题", "<p>hi</p>", "hi", recipients=["a@b.com"])
+        self.assertEqual(self._message().get_content_type(), "multipart/alternative")
+
+    def test_ascii_filename_is_a_safe_fallback(self):
+        self.assertEqual(mailer._ascii_filename("report.pdf"), "report.pdf")
+        cleaned = mailer._ascii_filename("富锂锰正极-2026-10-02-附件3篇.pdf")
+        self.assertTrue(cleaned.endswith(".pdf"), cleaned)
+        self.assertTrue(all(ord(char) < 128 for char in cleaned), cleaned)
+        self.assertEqual(mailer._ascii_filename("中文"), "literature-overflow.pdf")
+
+    def test_save_preview_writes_html_and_pdf_side_by_side(self):
+        outbox = os.path.join(self.tmp.name, "outbox")
+        path = mailer.save_preview(
+            "<p>hi</p>", "2026-10-02", outbox, suffix="-topic",
+            attachment=("富锂锰正极-2026-10-02-附件3篇.pdf", b"%PDF-1.4 x"),
+        )
+        self.assertTrue(path.endswith(".html"), path)
+        names = sorted(os.listdir(outbox))
+        self.assertEqual(len(names), 2, names)
+        self.assertTrue(any(name.endswith(".pdf") for name in names), names)
+
+    def test_save_preview_without_attachment_writes_only_html(self):
+        outbox = os.path.join(self.tmp.name, "outbox2")
+        mailer.save_preview("<p>hi</p>", "2026-10-02", outbox)
+        self.assertEqual([name for name in os.listdir(outbox) if name.endswith(".pdf")], [])
+
+    def test_build_html_notices_switch_between_attachment_and_truncation(self):
+        works = [
+            {"doi": f"10.1/a{index}", "title": "T", "journal": "Joule", "pub_date": "2026-09-01"}
+            for index in range(25)
+        ]
+        common = dict(
+            run_date="2026-10-02", lookback_days=14, first_run=False, total_candidates=30,
+            after_dedup=25, excluded=0, ai_failed=0, title="富锂锰正极顶刊周报", max_items=20,
+        )
+        with_attachment, plain_with = mailer.build_html(
+            works, **common, attachment_name="a.pdf", attachment_count=7
+        )
+        self.assertIn("排进附件", with_attachment)
+        self.assertIn("<b>5</b> 篇相关文献超出正文上限（20 篇）", with_attachment)
+        self.assertIn("（共 7 篇）", with_attachment)
+        self.assertIn("📎", plain_with)
+        self.assertIn("a.pdf", plain_with)
+
+        without_attachment, plain_without = mailer.build_html(works, **common)
+        self.assertIn("<b>5</b> 篇相关文献因单封邮件上限（20 篇）未在此展示", without_attachment)
+        self.assertNotIn("排进附件", without_attachment)
+        self.assertNotIn("附件", without_attachment)
+        self.assertNotIn("📎", plain_without)
+
+    def test_build_html_says_nothing_about_attachment_without_overflow(self):
+        """附件名传了但没溢出时，纯文本里不能出现“另 0 篇超出正文上限”。"""
+        works = [{"doi": "10.1/a", "title": "T", "journal": "Joule", "pub_date": "2026-09-01"}]
+        html_body, plain_body = mailer.build_html(
+            works, "2026-10-02", lookback_days=14, first_run=False, total_candidates=1,
+            after_dedup=1, excluded=0, ai_failed=0, title="富锂锰正极顶刊周报", max_items=20,
+            attachment_name="a.pdf", attachment_count=0,
+        )
+        self.assertNotIn("📎", plain_body)
+        self.assertNotIn("超出正文上限", html_body)
+
+    def test_build_html_warns_when_the_attachment_hit_its_cap(self):
+        works = [{"doi": "10.1/a", "title": "T", "journal": "Joule", "pub_date": "2026-09-01"}]
+        html_body, plain_body = mailer.build_html(
+            works, "2026-10-02", lookback_days=14, first_run=False, total_candidates=300,
+            after_dedup=280, excluded=0, ai_failed=0, title="富锂锰正极顶刊周报", max_items=20,
+            attachment_name="a.pdf", attachment_count=200, attachment_skipped=60,
+        )
+        self.assertIn("附件已收满", html_body)
+        self.assertIn("另有 <b>60</b> 篇未装入附件", html_body)
+        self.assertIn("被标记为已推送", html_body)
+        self.assertIn("下一轮会重新评估", html_body)
+        self.assertIn("60", plain_body)
+        self.assertIn("📎 附件已收满", plain_body)
 
 
 if __name__ == "__main__":

@@ -52,11 +52,13 @@ from . import (
     dedup,
     mailer,
     openalex_client,
+    pdf_report,
     ranking,
     sources,
 )
 from .config import (
     AI_THRESHOLD,
+    ATTACH_PDF_MAX_ITEMS,
     ISSN_FILTER,
     LOOKBACK_DAYS,
     LOOKBACK_DAYS_FIRST_RUN,
@@ -64,6 +66,7 @@ from .config import (
     MAX_EMAIL_ITEMS_FIRST_RUN,
     MAX_WORKS_FETCH,
     OUTBOX_DIR,
+    OVERFLOW_ATTACHMENT,
     RESEARCH_FIELD,
     RETRIEVAL_MODE,
     TOPIC_QUERY,
@@ -205,6 +208,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-ai",
         action="store_true",
         help="跳过 AI 打分（所有文献按 0 分处理并全部展示），仅用于排查检索与邮件链路",
+    )
+    parser.add_argument(
+        "--no-attachment",
+        action="store_true",
+        help=(
+            "关掉「超出正文上限的文献打包成 PDF 附件」的功能（默认开启，可用 "
+            "config.OVERFLOW_ATTACHMENT 全局关闭）。关闭后这些文献退回旧行为："
+            "只发正文前若干篇，其余不展示也不再标记"
+        ),
     )
     parser.add_argument(
         "--verbose",
@@ -559,6 +571,59 @@ def run_topic(
             ranking.breakdown(top),
         )
 
+    # ---- 6.6 正文装不下的 → 打包成 PDF 附件 ----
+    # 排序之后、渲染之前：正文取前 max_items 篇，剩下的（分数一样算好了）按同样
+    # 的格式排进一份 PDF 一起发出去，而不是直接丢掉。实现见 src/pdf_report.py
+    # （手写 PDF，不引入任何第三方依赖）。
+    shown_works = selected[:max_items]
+    overflow_works = selected[max_items:]
+    attachment: tuple[str, bytes] | None = None
+    attached_works: list[dict] = []
+    attach_skipped = 0
+    attach_cap = max(0, int(ATTACH_PDF_MAX_ITEMS))
+    if overflow_works and not args.no_attachment and OVERFLOW_ATTACHMENT and attach_cap:
+        attached_works = overflow_works[:attach_cap]
+        attach_skipped = len(overflow_works) - len(attached_works)
+        try:
+            attachment = pdf_report.build(
+                attached_works,
+                run_date,
+                topic_name=topic.name,
+                lookback_days=lookback_days,
+                first_run=first_run,
+                shown_count=len(shown_works),
+                total_selected=len(selected),
+                skipped=attach_skipped,
+                sources=fetched.summary(),
+            )
+            log.info(
+                "%sPDF 附件已生成：%s（%s 篇，%s KB）",
+                prefix,
+                attachment[0],
+                len(attached_works),
+                max(1, len(attachment[1]) // 1024),
+            )
+        except Exception as exc:  # noqa: BLE001 —— 附件失败绝不能拖垮整轮推送
+            log.error("%sPDF 附件生成失败，本轮改为只发正文：%s", prefix, exc)
+            attachment = None
+            attached_works = []
+            attach_skipped = 0
+    elif overflow_works:
+        why = "--no-attachment" if args.no_attachment else "config.OVERFLOW_ATTACHMENT=False"
+        log.info(
+            "%s%s：%s 篇超出正文上限的文献不做附件（它们也不会被标记，下轮重新评估）",
+            prefix,
+            why,
+            len(overflow_works),
+        )
+    if attach_skipped:
+        log.warning(
+            "%s附件篇幅上限（%s 篇）：另有 %s 篇未装入；它们不会被标记为已推送，下轮重新评估",
+            prefix,
+            attach_cap,
+            attach_skipped,
+        )
+
     # ---- 7. 渲染 ----
     # 数据源与主题都写进页头元信息：用户一眼能看出这轮的候选是几个源凑出来的。
     meta_extras = []
@@ -579,6 +644,9 @@ def run_topic(
         max_items=max_items,
         extra_meta=" ｜ ".join(meta_extras),
         extra_notices=fetched.notices(),
+        attachment_name=attachment[0] if attachment else None,
+        attachment_count=len(attached_works),
+        attachment_skipped=attach_skipped,
     )
 
     stats = {
@@ -587,7 +655,8 @@ def run_topic(
         "after_dedup": after_dedup,
         "excluded": len(excluded),
         "selected": len(selected),
-        "shown": min(len(selected), max_items),
+        "shown": len(shown_works),
+        "attached": len(attached_works),
         "mailed": 0,
         "sources": fetched.summary(),
     }
@@ -595,7 +664,9 @@ def run_topic(
     # ---- 8. 输出 ----
     if args.dry_run:
         suffix = f"-{_safe_filename(topic.name)}" if total > 1 else ""
-        path = mailer.save_preview(html_body, run_date, OUTBOX_DIR, suffix=suffix)
+        path = mailer.save_preview(
+            html_body, run_date, OUTBOX_DIR, suffix=suffix, attachment=attachment
+        )
         log.info("%s[dry-run] 未发送邮件、未修改去重状态；预览文件：%s", prefix, path)
         _log_summary(
             topic.name,
@@ -611,27 +682,28 @@ def run_topic(
     subject = mailer.build_subject(selected, run_date, topic.email_title, max_items=max_items)
 
     # 发送成功后才回写状态（关键：避免邮件失败导致文献永久丢失）
-    mailer.send_mail(subject, html_body, plain_body, recipients=recipients)
+    mailer.send_mail(subject, html_body, plain_body, recipients=recipients, attachment=attachment)
     log.info("%s邮件发送成功：%s", prefix, subject)
+    if attachment:
+        log.info("%s附件随之发出：%s", prefix, attachment[0])
     stats["mailed"] = 1
-
-    shown = selected[:max_items]
 
     # ------------------------------------------------------------------
     # 回写"已读"标记的规则（按主题各自的记录）
     # ------------------------------------------------------------------
-    # 主题检索下候选近 200 篇，而邮件只发 20 篇。若只记录展示过的那 20 篇，
+    # 主题检索下候选近 200 篇，而邮件正文只发 20 篇。若只记录展示过的那 20 篇，
     # 剩下 170+ 篇下周会被原封不动地重新打分一遍 —— 每周白烧 5 倍 AI 费用。
     #
-    # 记录：实际展示过的 + AI 明确判定不相关（低于阈值）**且当时有摘要**的
-    #      —— 分数确定，重打是纯浪费。
+    # 记录：正文展示过的 + **已排进 PDF 附件一起发出去的** + AI 明确判定不相关
+    #      （低于阈值）**且当时有摘要**的 —— 分数确定，重打是纯浪费。
     #
     # 故意**不**记录：
-    #   * 通过阈值但被 20 篇上限挤掉的"备选" —— 下次还有机会入选
+    #   * 通过阈值但连附件都没装下的（超出 ATTACH_PDF_MAX_ITEMS）—— 下次还有
+    #     机会入选，绝不能让"已读"把它锁死
     #   * AI 调用失败 —— 分数不可信，必须下轮重试
     #   * 缺摘要被判不相关 —— 出版商索引有延迟，下周摘要可能才出现，
     #     结论可能完全反转，不能让"已读"把它永久锁死
-    to_mark = shown + [w for w in rejected if w.get("abstract")]
+    to_mark = shown_works + attached_works + [w for w in rejected if w.get("abstract")]
     if to_mark:
         dedup.mark_pushed(to_mark, run_date=run_date, topic_key=topic.key)
     else:
@@ -639,18 +711,20 @@ def run_topic(
         dedup.save_state([], run_date=run_date, topic_key=topic.key)
 
     log.info(
-        "%s状态回写：%s 篇标记已读（展示 %s + 已判定不相关 %s）；未标记的备选 %s 篇下轮会重新评估",
+        "%s状态回写：%s 篇标记已读（正文 %s + 附件 %s + 已判定不相关 %s）；"
+        "未标记的备选 %s 篇下轮会重新评估",
         prefix,
         len(to_mark),
-        len(shown),
-        len(to_mark) - len(shown),
-        max(0, len(selected) - len(shown)),
+        len(shown_works),
+        len(attached_works),
+        len(to_mark) - len(shown_works) - len(attached_works),
+        max(0, len(selected) - len(shown_works) - len(attached_works)),
     )
     _log_summary(
         topic.name,
         total_candidates,
         after_dedup,
-        len(shown),
+        len(shown_works),
         len(ai_failed),
         dry_run=False,
         excluded=len(excluded),

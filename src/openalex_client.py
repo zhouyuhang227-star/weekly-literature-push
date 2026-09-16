@@ -77,6 +77,7 @@ SELECT_FIELDS = ",".join(
         "cited_by_count",
         "type",
         "primary_location",
+        "authorships",
         "abstract_inverted_index",
     ]
 )
@@ -524,6 +525,7 @@ def parse_work(work: dict) -> dict | None:
         return None
 
     source = (work.get("primary_location") or {}).get("source") or {}
+    first_author, corresponding_author = parse_authors(work.get("authorships"))
     return {
         "doi": doi,
         "doi_url": f"https://doi.org/{doi}",
@@ -535,7 +537,63 @@ def parse_work(work: dict) -> dict | None:
         "type": work.get("type") or "",
         "openalex_id": work.get("id") or "",
         "abstract": reconstruct_abstract(work.get("abstract_inverted_index")),
+        # 只有 OpenAlex 提供 is_corresponding，所以通讯作者只能从这里得到
+        "first_author": first_author,
+        "corresponding_author": corresponding_author,
     }
+
+
+def parse_authors(authorships) -> tuple[str, str]:
+    """从 ``authorships`` 抽出 ``(第一作者, 第一通讯作者)``，拿不到就是空串。
+
+    OpenAlex 的结构是 ``authorships: [{author: {display_name}, is_corresponding,
+    author_position: "first"/"middle"/"last"}, ...]``。注意两点：
+
+    * **不要用 ``author_position`` 取通讯**：通讯作者跟署名位置无关。
+      只看 ``is_corresponding is True``，并按 ``authorships`` 的原始顺序
+      取第一个（OpenAlex 的顺序就是署名顺序）。
+    * 一作优先用 ``author_position == "first"``（有些记录的顺序字段更可靠），
+      没标就退回列表第一条 —— 比直接取 ``[0]`` 稳。
+
+    共同一作（多个 ``is_corresponding``、脚注标共一）在这里**不做区分**：
+    元数据里没有共一信息（那是出版社 PDF 脚注里的文字）。
+    """
+    entries = [entry for entry in (authorships or []) if isinstance(entry, dict)]
+    if not entries:
+        return "", ""
+
+    def name_of(entry: dict) -> str:
+        return author_name((entry or {}).get("author"))
+
+    first = ""
+    for entry in entries:
+        if str(entry.get("author_position") or "").strip().lower() == "first":
+            first = name_of(entry)
+            if first:
+                break
+    if not first:
+        for entry in entries:
+            first = name_of(entry)
+            if first:
+                break
+
+    corresponding = ""
+    for entry in entries:
+        if entry.get("is_corresponding") is True:
+            corresponding = name_of(entry)
+            if corresponding:
+                break
+    return first, corresponding
+
+
+def author_name(author) -> str:
+    """作者名：优先 ``display_name``（排版过的写法），退回 ``raw_author_name``。"""
+    from . import authors
+
+    if not isinstance(author, dict):
+        return authors.clean_name(author)
+    return authors.clean_name(author.get("display_name") or author.get("raw_author_name"))
+
 
 
 def fetch_works(
