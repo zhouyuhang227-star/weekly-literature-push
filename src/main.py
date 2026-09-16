@@ -61,6 +61,7 @@ from .config import (
     LOOKBACK_DAYS,
     LOOKBACK_DAYS_FIRST_RUN,
     MAX_EMAIL_ITEMS,
+    MAX_EMAIL_ITEMS_FIRST_RUN,
     MAX_WORKS_FETCH,
     OUTBOX_DIR,
     RESEARCH_FIELD,
@@ -116,9 +117,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-items",
         type=int,
-        default=MAX_EMAIL_ITEMS,
+        default=None,
         metavar="N",
-        help=f"单封邮件最多展示篇数（默认 {MAX_EMAIL_ITEMS}）",
+        help=(
+            "单封邮件最多展示篇数"
+            f"（默认：首次 {MAX_EMAIL_ITEMS_FIRST_RUN} 篇，之后 {MAX_EMAIL_ITEMS} 篇）"
+        ),
     )
     parser.add_argument(
         "--max-fetch",
@@ -294,7 +298,10 @@ def show_config(args: argparse.Namespace) -> int:
         f"  时间窗          首次 {LOOKBACK_DAYS_FIRST_RUN} 天 / 之后 {LOOKBACK_DAYS} 天"
         f"（最多拉取 {MAX_WORKS_FETCH} 篇）"
     )
-    print(f"  AI 入选线       ≥ {AI_THRESHOLD} 分，单封最多展示 {MAX_EMAIL_ITEMS} 篇")
+    print(
+        f"  AI 入选线       ≥ {AI_THRESHOLD} 分，单封最多展示 "
+        f"首次 {MAX_EMAIL_ITEMS_FIRST_RUN} 篇 / 之后 {MAX_EMAIL_ITEMS} 篇"
+    )
     print(f"  排序规则        {ranking.describe()}")
     print(
         "  期刊加成        "
@@ -482,6 +489,15 @@ def run_topic(
         "首次运行预热" if first_run else "常规滚动",
     )
 
+    # 展示上限：首次预热窗（90 天）候选远多于常规轮，用 20 篇会把大量相关文献直接
+    # 截掉；预热只需要来一次，所以默认放宽到 MAX_EMAIL_ITEMS_FIRST_RUN。
+    # 命令行显式传了 --max-items 就以命令行为准（args.max_items 默认 None 正是为此）。
+    max_items = (
+        args.max_items
+        if args.max_items is not None
+        else (MAX_EMAIL_ITEMS_FIRST_RUN if first_run else MAX_EMAIL_ITEMS)
+    )
+
     # ---- 3. 检索（第 1 层筛选：多数据源并集 → 按 DOI 合并）----
     # 见 src/sources/__init__.py：每轮把所有启用的源**都问一遍**再合并，
     # 而不是「主源挂了才切备用」—— 后者会把源故障伪装成「本周没有新论文」，
@@ -560,7 +576,7 @@ def run_topic(
         excluded=len(excluded),
         ai_failed=len(ai_failed),
         title=topic.email_title,
-        max_items=args.max_items,
+        max_items=max_items,
         extra_meta=" ｜ ".join(meta_extras),
         extra_notices=fetched.notices(),
     )
@@ -571,7 +587,7 @@ def run_topic(
         "after_dedup": after_dedup,
         "excluded": len(excluded),
         "selected": len(selected),
-        "shown": min(len(selected), args.max_items),
+        "shown": min(len(selected), max_items),
         "mailed": 0,
         "sources": fetched.summary(),
     }
@@ -592,14 +608,14 @@ def run_topic(
         )
         return stats
 
-    subject = mailer.build_subject(selected, run_date, topic.email_title)
+    subject = mailer.build_subject(selected, run_date, topic.email_title, max_items=max_items)
 
     # 发送成功后才回写状态（关键：避免邮件失败导致文献永久丢失）
     mailer.send_mail(subject, html_body, plain_body, recipients=recipients)
     log.info("%s邮件发送成功：%s", prefix, subject)
     stats["mailed"] = 1
 
-    shown = selected[: args.max_items]
+    shown = selected[:max_items]
 
     # ------------------------------------------------------------------
     # 回写"已读"标记的规则（按主题各自的记录）

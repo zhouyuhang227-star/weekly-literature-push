@@ -2139,8 +2139,12 @@ class TestCrossrefAdapter(unittest.TestCase):
             self._item(doi="10.1002/adma.2", title="Li-rich layered oxide with anion redox"),
         ]
         works, _ = self._run(items, ["li-rich", "anion redox"])
-        self.assertEqual({w["doi"] for w in works}, {"10.1002/adma.2"})
-        self.assertEqual(len(works), len(config.JOURNALS))  # 每本刊各命中一次
+        title_only = set(config.CROSSREF_TITLE_ONLY_JOURNALS)
+        # 无摘要的刊会放宽复核，所以只对"其余刊"断言「误命中被剔掉了」
+        kept = {w["doi"] for w in works if w["journal"] not in title_only}
+        self.assertEqual(kept, {"10.1002/adma.2"})
+        normal = len(config.JOURNALS) - len(title_only)
+        self.assertEqual(len(works), normal * 1 + len(title_only) * 2)
 
     def test_journal_name_comes_from_config_so_tier_bonus_still_resolves(self):
         # mock 让 15 本刊都返回同一批条目（真实场景里每本刊只会返回自己的论文），
@@ -2167,6 +2171,35 @@ class TestCrossrefAdapter(unittest.TestCase):
     def test_every_journal_failing_raises(self):
         with self.assertRaises(RuntimeError):
             self._run([], ["li-rich"], status_code=500)
+
+    # -- 「无摘要刊」放宽复核 -------------------------------------------
+    def test_title_only_journals_relax_the_recheck_when_the_abstract_is_missing(self):
+        """Joule / Nature Energy 在 Crossref 不带摘要 ⇒ 复核只能看标题 ⇒ 放宽。
+
+        实测反例：Joule 近 30 天 2 条命中（全固态锂传输 / 储氢）剔除是对的，
+        但同一本刊里标题写成 "Reversible anion storage in cathodes" 的富锂锰论文
+        会被同一个判据杀掉 —— 而 OpenAlex 挂掉的那轮它没有任何兜底。
+        """
+        items = [
+            self._item(doi="10.1016/j.joule.1", title="Reversible anion storage in cathodes")
+        ]
+        works, _ = self._run(items, ["li-rich", "anion redox"])
+        # 名单内的刊全部留下（没摘要 ⇒ 判据残缺 ⇒ 交给 AI），其余刊照旧剔除
+        self.assertEqual(
+            {w["journal"] for w in works}, set(config.CROSSREF_TITLE_ONLY_JOURNALS)
+        )
+
+    def test_relaxation_requires_a_missing_abstract(self):
+        """有摘要就说明复核是完整的，哪怕在放宽名单里也不能放行。"""
+        items = [
+            self._item(
+                doi="10.1016/j.joule.2",
+                title="Catalytic strategies for hydrogen release",
+                abstract="<jats:p>Hydrogen storage and release.</jats:p>",
+            )
+        ]
+        works, _ = self._run(items, ["anion redox"])
+        self.assertEqual(works, [])
 
 
 class TestSemanticScholarAdapter(unittest.TestCase):
@@ -2329,6 +2362,145 @@ class TestSourceCliWiring(unittest.TestCase):
         self.assertIn("OpenAlex", text)
         self.assertIn("Crossref", text)
         self.assertIn("Semantic Scholar", text)
+
+
+class TestEmailItemLimit(unittest.TestCase):
+    """邮件展示上限：首次预热 50 篇、之后 20 篇，命令行显式指定始终优先。
+
+    首次窗口宽 6 倍，候选量也是同一量级（实测 50～110 篇），20 篇会把大半相关
+    文献直接截掉；预热只来一次，所以单独放宽。这里锁定三个分支，免得以后
+    改 ``--max-items`` 的默认值时把"首次放宽"悄悄弄丢。
+    """
+
+    CANDS = 60
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._orig_file = config.PUSHED_FILE
+        self._orig_topics = config.RESEARCH_TOPICS
+        self._orig_outbox = main_module.OUTBOX_DIR
+        config.PUSHED_FILE = os.path.join(self.tmp.name, "pushed.json")
+        main_module.OUTBOX_DIR = os.path.join(self.tmp.name, "outbox")
+        config.RESEARCH_TOPICS = [
+            {"name": "富锂锰正极", "topic_query": "lithium rich cathode", "keywords": ["富锂锰"]}
+        ]
+        # 三个源都换成桩：这个用例只关心"展示几篇"，不该联网
+        self._saved_adapters = dict(source_layer.ADAPTERS)
+        self.addCleanup(self._restore)
+        for name in source_layer.ALL_SOURCES:
+            source_layer.ADAPTERS[name] = self._fake_source
+
+    def _restore(self):
+        config.PUSHED_FILE = self._orig_file
+        config.RESEARCH_TOPICS = self._orig_topics
+        main_module.OUTBOX_DIR = self._orig_outbox
+        source_layer.ADAPTERS.clear()
+        source_layer.ADAPTERS.update(self._saved_adapters)
+        self.tmp.cleanup()
+
+    def _fake_source(self, keywords, lookback_days, max_works=None, **_kw):
+        return [
+            {
+                "doi": f"10.1/lit{index}",
+                "openalex_id": f"W{index}",
+                "title": f"Lithium-rich cathode paper {index}",
+                "journal": "Joule",
+                "issn": "2542-4351",
+                "pub_date": "2026-09-01",
+                "abstract": "abstract text",
+                "doi_url": f"https://doi.org/10.1/lit{index}",
+            }
+            for index in range(self.CANDS)
+        ]
+
+    @staticmethod
+    def _fake_eval(works, **_kw):
+        return [
+            dict(work, ai_score=70, ai_takeaway="解读", ai_reason="理由", ai_error=False)
+            for work in works
+        ], [], []
+
+    def _preview_html(self, argv: list[str] | None = None) -> str:
+        args = main_module.build_parser().parse_args(
+            (argv or []) + ["--dry-run", "--topic", "富锂锰正极"]
+        )
+        with patch.object(main_module, "validate_env", lambda **_kw: None), patch.object(
+            main_module.abstract_source, "enrich_abstracts", side_effect=lambda works: works
+        ), patch.object(
+            main_module.ai_matcher, "evaluate_works", side_effect=self._fake_eval
+        ), patch.object(
+            main_module.mailer, "send_mail", side_effect=AssertionError("dry-run 不该发邮件")
+        ):
+            self.assertEqual(main_module.run(args), 0)
+
+        names = sorted(
+            os.listdir(main_module.OUTBOX_DIR),
+            key=lambda name: os.path.getmtime(os.path.join(main_module.OUTBOX_DIR, name)),
+        )
+        self.assertTrue(names, "dry-run 应该写出预览文件")
+        with open(os.path.join(main_module.OUTBOX_DIR, names[-1]), encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_first_run_widens_the_limit_to_fifty(self):
+        html_body = self._preview_html()
+        self.assertIn("单封邮件上限（50 篇）", html_body)
+        # 60 篇候选 → 展示 50、溢出 10
+        self.assertIn("<b>10</b> 篇相关文献因单封邮件上限（50 篇）未在此展示", html_body)
+
+    def test_regular_run_keeps_the_twenty_item_limit(self):
+        with patch.object(main_module.dedup, "is_first_run", return_value=False):
+            html_body = self._preview_html()
+        self.assertIn("单封邮件上限（20 篇）", html_body)
+
+    def test_explicit_max_items_wins_in_both_cases(self):
+        self.assertIn(
+            "单封邮件上限（5 篇）", self._preview_html(["--max-items", "5"])
+        )
+        with patch.object(main_module.dedup, "is_first_run", return_value=False):
+            self.assertIn(
+                "单封邮件上限（8 篇）", self._preview_html(["--max-items", "8"])
+            )
+
+    def test_cli_default_is_resolved_at_runtime(self):
+        """--max-items 的默认值必须是 None，否则首次放宽无从判断。"""
+        self.assertIsNone(main_module.build_parser().parse_args([]).max_items)
+        self.assertEqual(config.MAX_EMAIL_ITEMS, 20)
+        self.assertEqual(config.MAX_EMAIL_ITEMS_FIRST_RUN, 50)
+
+
+    def test_subject_count_follows_the_same_limit(self):
+        """主题行写 20 篇而正文 50 篇，看起来就像邮件被截断了。"""
+        works = [{"doi": f"10.1/x{index}"} for index in range(60)]
+        self.assertEqual(
+            mailer.build_subject(works, "2026-09-16", "富锂锰正极顶刊周报", max_items=50),
+            "富锂锰正极顶刊周报 · 2026-09-16 · 50 篇",
+        )
+        # 不传就退回常规上限，保持旧调用方的行为
+        self.assertEqual(
+            mailer.build_subject(works, "2026-09-16").split(" · ")[-1],
+            f"{config.MAX_EMAIL_ITEMS} 篇",
+        )
+
+    def test_first_run_email_subject_agrees_with_the_body(self):
+        sent: list[tuple[str, str]] = []
+        args = main_module.build_parser().parse_args(["--topic", "富锂锰正极"])
+        with patch.object(main_module, "validate_env", lambda **_kw: None), patch.object(
+            main_module.abstract_source, "enrich_abstracts", side_effect=lambda works: works
+        ), patch.object(
+            main_module.ai_matcher, "evaluate_works", side_effect=self._fake_eval
+        ), patch.object(
+            main_module.mailer,
+            "send_mail",
+            side_effect=lambda subject, html_body, plain_body, recipients=None: sent.append(
+                (subject, html_body)
+            ),
+        ):
+            self.assertEqual(main_module.run(args), 0)
+
+        self.assertEqual(len(sent), 1)
+        subject, html_body = sent[0]
+        self.assertTrue(subject.endswith("· 50 篇"), subject)
+        self.assertIn("单封邮件上限（50 篇）", html_body)
 
 
 if __name__ == "__main__":

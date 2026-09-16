@@ -774,6 +774,29 @@ CROSSREF_CONCURRENCY = 5
 # 想换邮箱就改这里，或在 GitHub 仓库 Secrets 里设 CROSSREF_MAILTO。
 CROSSREF_MAILTO = os.environ.get("CROSSREF_MAILTO", "") or "literature-push-bot@users.noreply.github.com"
 
+# Crossref：**不给摘要的刊**。
+#
+# 为什么需要这张名单：Crossref 的 ``query.title`` 是分词匹配，必须本地拿
+# ``search_terms`` 复核（同时看标题和摘要）。但这几本刊在 Crossref 里**根本不带
+# abstract**，复核退化成「只看标题」—— 一篇真正做富锂锰正极、标题却写成
+# "Reversible anion storage in Li2MnO3-based cathodes" 的论文会被误杀。
+# 所以对这几本刊：**记录没有摘要时不做复核**，直接放进候选，交给 AI 相关性
+# 阈值（``AI_THRESHOLD``）兜底 —— AI 看得到完整信息，比拿一个残缺判据硬剔更可靠。
+#
+# 实测（2026-09-16，各刊近半年各抽 100 篇，看 Crossref 是否带 abstract）：
+#   Joule                 0 / 100   ← 一条摘要都没有
+#   Energy & Environmental Science  0 条记录（RSC 未按 ISSN 关联，见 README）
+#   Nature Energy         8 / 100
+#   Advanced Materials   91 / 100   ← Wiley 系很好，不需要放宽
+#
+# 只有「该刊在名单里 + 这条记录确实没摘要」两个条件同时成立才放宽，
+# 所以本名单的副作用有上界，不会因为一本刊就放过整片噪音。加刊后建议实测一遍。
+CROSSREF_TITLE_ONLY_JOURNALS: tuple[str, ...] = (
+    "Joule",
+    "Nature Energy",
+    "Energy & Environmental Science",
+)
+
 # Semantic Scholar bulk search 单轮最多取回条数（接口硬上限 1000）。
 # 实测富锂锰正极 14 个召回词 + 90 天 = 685 条，所以 1000 足够一页拉完。
 S2_BULK_LIMIT = 1000
@@ -834,7 +857,16 @@ OPENALEX_MAILTO = os.getenv("OPENALEX_MAILTO") or SMTP_USER or ""
 # 只有本地反复调试才会把当天额度打光）。
 OPENALEX_API_KEY = (os.getenv("OPENALEX_API_KEY") or "").strip()
 
-MAX_EMAIL_ITEMS = 20  # 单封邮件最多展示篇数，规避 Gmail 102KB 截断并控制可读性
+MAX_EMAIL_ITEMS = 20  # 常规轮：单封邮件最多展示篇数，规避 Gmail 102KB 截断并控制可读性
+
+# 首次运行（90 天预热窗）的展示上限单独放宽。
+#
+# 预热窗比常规窗宽 6 倍，候选量也是同一个量级（实测 50～110 篇），而 20 篇的
+# 上限会把绝大多数相关文献直接截掉 —— 而预热**只需要来一次**，多展示几十篇
+# 不会造成长期负担。之后每轮自动回到 MAX_EMAIL_ITEMS。
+# ⚠️ 别把这个值调得太离谱：Gmail 对超过 102KB 的邮件正文会截断（“查看全文”），
+#    50 篇实测约 80KB，尚在安全线内。
+MAX_EMAIL_ITEMS_FIRST_RUN = 50
 
 # ---------------------------------------------------------------------------
 # 由「研究方向」派生的展示文案

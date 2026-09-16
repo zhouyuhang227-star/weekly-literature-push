@@ -322,16 +322,25 @@ def send_mail(subject: str, html_body: str, plain_body: str, recipients: list[st
     log.info("邮件已发送至 %s（主题：%s）", ", ".join(recipients), subject)
 
 
-def build_subject(works: list[dict], run_date: str, title: str | None = None) -> str:
+def build_subject(
+    works: list[dict],
+    run_date: str,
+    title: str | None = None,
+    max_items: int | None = None,
+) -> str:
     """邮件主题。
 
     ``main.py`` 与 ``send()`` 都要用它，之前两处各写一份已出现过不一致，
     现在统一到这里，标题前缀默认由 ``config.EMAIL_TITLE`` 派生；
     多主题调研时由调用方传入该主题自己的标题。
+
+    ``max_items`` 要与 ``build_html`` 用**同一个值**：首次预热轮正文展示 50 篇，
+    主题行却写 20 篇的话，看起来就像邮件被截断了。
     """
     prefix = title or EMAIL_TITLE
     if works:
-        count = min(len(works), MAX_EMAIL_ITEMS)
+        limit = MAX_EMAIL_ITEMS if max_items is None else max(1, int(max_items))
+        count = min(len(works), limit)
         return f"{prefix} · {run_date} · {count} 篇"
     return f"{prefix} · {run_date} · 本周无新文献"
 
@@ -347,6 +356,7 @@ def send(
     ai_failed: int = 0,
     recipients: list[str] | None = None,
     title: str | None = None,
+    max_items: int | None = None,
 ) -> dict:
     """渲染并发送。返回统计信息供日志记录。
 
@@ -362,11 +372,13 @@ def send(
         after_dedup=after_dedup,
         ai_failed=ai_failed,
         title=title,
+        max_items=max_items,
     )
 
-    subject = build_subject(works, run_date, title)
+    subject = build_subject(works, run_date, title, max_items=max_items)
     send_mail(subject, html_body, plain_body, recipients=recipients)
-    return {"subject": subject, "count": min(len(works), MAX_EMAIL_ITEMS), "html": html_body}
+    limit = MAX_EMAIL_ITEMS if max_items is None else max(1, int(max_items))
+    return {"subject": subject, "count": min(len(works), limit), "html": html_body}
 
 
 def save_preview(html_body: str, run_date: str, outbox_dir: str, suffix: str = "") -> str:

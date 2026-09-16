@@ -24,6 +24,10 @@
    实测 eISSN ``1754-5706`` 与 pISSN ``1754-5692`` 的 total 都是 0（RSC 的论文
    没有按 ISSN 关联到 Crossref 的期刊记录里）。该刊只能由 OpenAlex 覆盖，
    这里会记一条 INFO 说明，**不静默**。
+3. **有些刊 Crossref 不给摘要**（实测 Joule 0/100 条带 abstract，Nature Energy
+   8/100，而 Wiley 系刊 91/100）。对这几本刊，本地复核只能看到标题，反而会误杀
+   「标题不含字面词但确实是本主题」的论文 ⇒ 名单里的刊**记录无摘要时不做复核**，
+   交由 AI 阈值兜底（``config.CROSSREF_TITLE_ONLY_JOURNALS``）。放宽的条数会记 INFO。
 """
 
 from __future__ import annotations
@@ -105,8 +109,8 @@ def _to_work(item: dict, journal: str, issn: str) -> dict | None:
 def _fetch_one(
     journal: str, issn: str, query: str, iso_from: str, rows: int,
     terms: list[str], checkable: list[str],
-) -> tuple[list[dict], int, int]:
-    """查一本刊。返回 ``(复核通过的 work, 被复核剔除的条数, 原始条数)``。"""
+) -> tuple[list[dict], int, int, int]:
+    """查一本刊。返回 ``(复核通过的 work, 被复核剔除的条数, 原始条数, 放宽的条数)``。"""
     params: dict[str, object] = {
         "filter": f"from-pub-date:{iso_from},type:journal-article",
         "query.title": query,
@@ -127,17 +131,26 @@ def _fetch_one(
         raise RuntimeError(f"HTTP {resp.status_code}")
 
     items = (resp.json().get("message") or {}).get("items") or []
+    # ★ 这几本刊 Crossref 常不给摘要，复核只能看到标题（见 config 里的实测数据）。
+    #   标题不含字面词但确实是本主题的论文会被误杀 ⇒ 这种残缺判据不如交给 AI。
+    title_only = journal in config.CROSSREF_TITLE_ONLY_JOURNALS
+
     works: list[dict] = []
     dropped = 0
+    relaxed = 0
     for item in items:
         work = _to_work(item, journal, issn)
         if work is None:
             continue
         if checkable and not matches_recall_terms(work, terms):
-            dropped += 1
-            continue
+            # 只有「该刊偶发缺摘要」才放宽；这条恰好有摘要时复核是完整的，照旧剔。
+            if title_only and not (work.get("abstract") or "").strip():
+                relaxed += 1
+            else:
+                dropped += 1
+                continue
         works.append(work)
-    return works, dropped, len(items)
+    return works, dropped, len(items), relaxed
 
 
 def fetch(
@@ -184,6 +197,8 @@ def fetch(
     works: list[dict] = []
     errors: list[str] = []
     empty: list[str] = []
+    relaxed_journals: list[str] = []
+    relaxed_total = 0
 
     with ThreadPoolExecutor(
         max_workers=max(1, int(config.CROSSREF_CONCURRENCY))
@@ -197,7 +212,7 @@ def fetch(
         for future in as_completed(futures):
             journal = futures[future]
             try:
-                got, dropped, raw = future.result()
+                got, dropped, raw, relaxed = future.result()
             except Exception as exc:  # noqa: BLE001 - 单刊失败不该拖垮整轮
                 log.warning("Crossref 查询《%s》失败：%s", journal, exc)
                 errors.append(f"{journal}（{exc}）")
@@ -205,9 +220,12 @@ def fetch(
             works.extend(got)
             if raw == 0:
                 empty.append(journal)
+            if relaxed:
+                relaxed_total += relaxed
+                relaxed_journals.append(f"{journal} {relaxed} 条")
             log.debug(
-                "Crossref《%s》：取回 %s 条 → 复核后 %s 条（剔除 %s 条）",
-                journal, raw, len(got), dropped,
+                "Crossref《%s》：取回 %s 条 → 复核后 %s 条（剔除 %s 条，放宽 %s 条）",
+                journal, raw, len(got), dropped, relaxed,
             )
 
     if errors and len(errors) == len(journals):
@@ -223,6 +241,13 @@ def fetch(
             "（若含 Energy & Environmental Science 属正常 —— RSC 的论文未按 ISSN "
             "关联进 Crossref，该刊只能由 OpenAlex 覆盖）",
             len(empty), "、".join(empty),
+        )
+    if relaxed_total:
+        # 放宽复核是**主动降低筛选强度**，必须留痕，否则又成了静默降级。
+        log.info(
+            "Crossref 有 %s 条命中因「该刊不给摘要、复核只能看标题」而放宽：%s"
+            "（这几本刊已在 config.CROSSREF_TITLE_ONLY_JOURNALS 里，交由 AI 阈值兜底）",
+            relaxed_total, "、".join(relaxed_journals),
         )
 
     log.info("Crossref 命中 %s 条（本地复核后）", len(works))
