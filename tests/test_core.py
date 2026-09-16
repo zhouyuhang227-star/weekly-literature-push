@@ -821,6 +821,176 @@ class TestEvaluateWorksPartition(unittest.TestCase):
         self.assertEqual(ai_matcher.evaluate_works([], threshold=60), ([], [], []))
 
 
+class TestEvaluateWorksForcedKeep(unittest.TestCase):
+    """AI 那一层的硬保底：分数再低也进"入选"，AI 挂了也要进。
+
+    这一层最先出问题的地方是**划分顺序**：如果先按阈值分堆、再挑保底，
+    一篇 20 分的无负极论文会因为"低于阈值"被回写已读标记而永远不见天日。
+    """
+
+    def _keep_work(self) -> dict:
+        return {"doi": "10.1/keep", "title": "Anode-free sodium metal battery", "pub_date": "2026-09-01"}
+
+    def test_low_score_keep_bypasses_the_threshold(self):
+        with patch.object(ai_matcher, "call_ai", return_value=(20, "解读", "理由")):
+            passed, failed, rejected = ai_matcher.evaluate_works([self._keep_work()], threshold=60)
+
+        self.assertEqual([w["doi"] for w in passed], ["10.1/keep"])
+        self.assertEqual(passed[0]["keep_reason"], "无负极")
+        # 不得同时落进"低于阈值"：main.py 会据此回写已读标记
+        self.assertEqual(rejected, [])
+        self.assertEqual(failed, [])
+
+    def test_keep_survives_an_ai_outage(self):
+        """AI 调用失败时也必须发出：宁可少一段解读，不能丢文献。"""
+        with patch.object(ai_matcher, "call_ai", side_effect=RuntimeError("API 挂了")):
+            passed, failed, rejected = ai_matcher.evaluate_works([self._keep_work()], threshold=60)
+
+        self.assertEqual([w["doi"] for w in passed], ["10.1/keep"])
+        self.assertEqual(failed, [])  # 进了"失败"堆就不会出现在邮件里
+        self.assertEqual(rejected, [])
+        self.assertEqual(passed[0]["ai_score"], 0)
+        self.assertIn("保底规则", passed[0]["ai_reason"])
+
+    def test_low_score_non_keep_is_still_rejected(self):
+        work = {"doi": "10.1/low", "title": "irrelevant work", "pub_date": "2026-09-01"}
+        with patch.object(ai_matcher, "call_ai", return_value=(20, "解读", "理由")):
+            passed, failed, rejected = ai_matcher.evaluate_works([work], threshold=60)
+        self.assertEqual(passed, [])
+        self.assertEqual(failed, [])
+        self.assertEqual([w["doi"] for w in rejected], ["10.1/low"])
+
+    def test_outage_on_a_non_keep_paper_still_goes_to_failed(self):
+        work = {"doi": "10.1/boom", "title": "irrelevant work", "pub_date": "2026-09-01"}
+        with patch.object(ai_matcher, "call_ai", side_effect=RuntimeError("API 挂了")):
+            passed, failed, rejected = ai_matcher.evaluate_works([work], threshold=60)
+        self.assertEqual([w["doi"] for w in failed], ["10.1/boom"])
+        self.assertEqual(passed, [])
+        self.assertEqual(rejected, [])
+
+    def test_keep_paper_keeps_its_real_score_when_the_ai_worked(self):
+        """保底只免掉阈值，不改分数 —— 分数照旧参与排序。"""
+        with patch.object(ai_matcher, "call_ai", return_value=(58, "解读", "理由")):
+            passed, _, _ = ai_matcher.evaluate_works([self._keep_work()], threshold=60)
+        self.assertEqual(passed[0]["ai_score"], 58)
+        self.assertFalse(passed[0]["ai_error"])
+
+
+class TestForcedKeepRanking(unittest.TestCase):
+    """保底论文不仅要"留下"，还要排在最前 —— 否则会掉进 PDF 附件里没人看。
+
+    置顶看起来违背"按分数排"，所以卡片上会打一个绿色标签解释原因；
+    这里锁的是排序行为本身。
+    """
+
+    @staticmethod
+    def _works() -> list[dict]:
+        return [
+            {"doi": "10.1/plain", "ai_score": 95, "pub_date": "2026-09-01", "title": "plain work"},
+            {
+                "doi": "10.1/keep",
+                "ai_score": 55,
+                "pub_date": "2026-09-02",
+                "title": "Anode-free sodium metal battery",
+            },
+        ]
+
+    def test_keep_is_pinned_above_a_higher_ai_score(self):
+        self.assertEqual([w["doi"] for w in ranking.rank(self._works())], ["10.1/keep", "10.1/plain"])
+
+    def test_annotate_writes_force_keep(self):
+        work = {"ai_score": 50, "title": "Anode-free sodium metal battery"}
+        ranking.annotate([work])
+        self.assertTrue(work["force_keep"])
+        self.assertEqual(work["content_bonus"], 10)
+
+    def test_non_kept_work_is_not_pinned(self):
+        work = {"ai_score": 50, "title": "Anionic redox in Li-rich layered oxides"}
+        ranking.annotate([work])
+        self.assertFalse(work["force_keep"])
+
+    def test_order_within_the_same_group_is_still_by_final_score(self):
+        works = [
+            {
+                "doi": "10.1/keep-low",
+                "ai_score": 30,
+                "pub_date": "2026-09-01",
+                "title": "Anode-free sodium battery A",
+            },
+            {
+                "doi": "10.1/keep-high",
+                "ai_score": 45,
+                "pub_date": "2026-09-02",
+                "title": "Anode-free sodium battery B",
+            },
+            {"doi": "10.1/plain-high", "ai_score": 90, "pub_date": "2026-09-03", "title": "plain A"},
+            {"doi": "10.1/plain-low", "ai_score": 70, "pub_date": "2026-09-04", "title": "plain B"},
+        ]
+        self.assertEqual(
+            [w["doi"] for w in ranking.rank(works)],
+            ["10.1/keep-high", "10.1/keep-low", "10.1/plain-high", "10.1/plain-low"],
+        )
+
+    def test_forced_count(self):
+        self.assertEqual(ranking.forced_count([{"force_keep": True}, {}, {"force_keep": False}]), 1)
+        self.assertEqual(ranking.forced_count([]), 0)
+
+    def test_describe_mentions_the_pinning(self):
+        self.assertIn("保底", ranking.describe())
+
+
+class TestMailerKeepNotice(unittest.TestCase):
+    """页头与卡片都要说明"为什么它排在前面"，否则 AI 55 分排在 95 分前面像 bug。"""
+
+    @staticmethod
+    def _html(works: list[dict]) -> str:
+        html_body, _ = mailer.build_html(
+            ranking.rank(works), "2026-09-10", lookback_days=14, first_run=False
+        )
+        return html_body
+
+    def test_card_and_header_explain_the_keep(self):
+        html_body = self._html(
+            [{"doi": "10.1/k", "title": "Anode-free sodium metal battery", "ai_score": 50}]
+        )
+        self.assertIn("硬保底 · 无负极", html_body)
+        self.assertIn("保底规则", html_body)
+        self.assertIn("置顶", html_body)
+
+    def test_no_notice_when_nothing_is_kept(self):
+        html_body = self._html([{"doi": "10.1/x", "title": "Li-rich cathode work", "ai_score": 80}])
+        self.assertNotIn("保底规则", html_body)
+        self.assertNotIn("硬保底", html_body)
+
+    def test_plain_text_alternative_lists_the_keep(self):
+        work = {"doi": "10.1/k", "title": "Anode-free sodium metal battery", "ai_score": 50}
+        _, plain = mailer.build_html(
+            ranking.rank([work]), "2026-09-10", lookback_days=14, first_run=False
+        )
+        self.assertIn("硬保底 · 无负极", plain)
+
+
+class TestPdfKeepMarker(unittest.TestCase):
+    """排进附件的保底论文也要标出来（无负极论文特别多时确实会溢出到附件）。"""
+
+    def test_forced_paper_is_marked_in_the_pdf(self):
+        from src import pdf_report
+
+        work = {
+            "doi": "10.1/k",
+            "title": "Anode-free sodium metal battery",
+            "journal": "JACS",
+            "pub_date": "2026-09-01",
+            "ai_score": 50,
+        }
+        ranking.annotate([work])
+        blocks = pdf_report._item_blocks(work, 1)
+        texts = [str(text) for _style, text in blocks]
+        self.assertTrue(any("硬保底" in text for text in texts), texts)
+        # 不能用 emoji：PDF 走 Adobe-GB1，emoji 会被 gbk_safe() 悄悄丢掉
+        self.assertNotIn("🎯", "".join(texts))
+
+
 class TestS2CircuitBreaker(unittest.TestCase):
     """Semantic Scholar 连续限流时必须熔断，否则每轮白等一分钟。
 
@@ -1575,10 +1745,13 @@ class TestMultiTopicOrchestration(unittest.TestCase):
         # 「靠什么排序 / 靠什么剔除」也要能离线看到，不然改规则全靠猜
         self.assertIn("内容加分（全局）", text)
         self.assertIn("固态电池 +1", text)
-        self.assertIn("无负极 +3", text)
+        self.assertIn("无负极 +10", text)
         self.assertIn("剔除规则（全局）", text)
         self.assertIn("电解液工程", text)
         self.assertIn("隔膜改性", text)
+        # 保底规则必须能离线看到，否则老板要盯的方向配错了也发现不了
+        self.assertIn("硬保底（全局）", text)
+        self.assertIn("免剔除规则、免 AI 入选线", text)
 
     def test_show_config_lists_every_topic(self):
         from src import main as main_module
@@ -1600,7 +1773,7 @@ class TestMultiTopicOrchestration(unittest.TestCase):
 
 
 class TestContentBonusRules(unittest.TestCase):
-    """内容加分：固态电池 +1、固态聚合物电解质再 +1、无负极 +3。
+    """内容加分：固态电池 +1、固态聚合物电解质再 +1、无负极 +10。
 
     规则本身写在 ``config.BONUS_RULES`` 里，这里锁的是**行为**：
     归一化怎么写、能不能叠加、凝胶电解质会不会被误判。
@@ -1628,14 +1801,35 @@ class TestContentBonusRules(unittest.TestCase):
         work = {"title": "Gel polymer electrolyte enables a high-voltage cathode"}
         self.assertEqual(content_rules.bonus_score(work), 0)
 
-    def test_anode_free_gets_three_points(self):
+    def test_anode_free_carries_the_full_weight(self):
+        """无负极是重点关注方向，权重比其他加分高一个数量级（+10）。"""
         work = {"title": "Anode-free sodium metal batteries"}
-        self.assertEqual(content_rules.bonus_score(work), 3)
+        self.assertEqual(content_rules.bonus_score(work), 10)
+
+    def test_anode_free_spellings_are_all_recognised(self):
+        """连字符/有无连字符/"free anode"倒装/常见缩写都要能命中。"""
+        for title in (
+            "Anode-free lithium metal batteries",
+            "Anodeless sodium battery",
+            "Anode less configuration for Li metal",
+            "Li-free anode design",
+            "Na-free anode",
+            "Zero-excess sodium metal battery",
+            "Hostless metal deposition",
+            "AFLMB with a high-voltage cathode",
+        ):
+            with self.subTest(title=title):
+                self.assertEqual(content_rules.keep_hit({"title": title}), "无负极", title)
+                self.assertEqual(content_rules.bonus_score({"title": title}), 10, title)
+
+    def test_anode_free_stacks_on_top_of_other_bonuses(self):
+        """无负极 + 固态体系：两条加分叠加（10 + 1）。"""
+        self.assertEqual(content_rules.bonus_score({"title": "Zero-excess all-solid-state batteries"}), 11)
 
     def test_bonus_can_be_triggered_by_the_abstract(self):
         """加分是"排序依据"，宁滥勿缺：摘要里提到也算。"""
         work = {"title": "A new cathode design", "abstract": "assembled in an anode-free cell"}
-        self.assertEqual(content_rules.bonus_score(work), 3)
+        self.assertEqual(content_rules.bonus_score(work), 10)
 
     def test_unrelated_paper_gets_nothing(self):
         work = {"title": "Anionic redox in Li-rich layered oxides", "abstract": "voltage decay"}
@@ -1707,6 +1901,84 @@ class TestContentExclusions(unittest.TestCase):
         self.assertIsNone(content_rules.exclusion_hit(work))
 
 
+class TestKeepRules(unittest.TestCase):
+    """硬保底：命中即强制进邮件 —— 免于剔除规则、也免于 AI 入选线。
+
+    这一层的失效方式是**静默地丢文献**（规则不命中 → 什么都不报，文献就是没来），
+    所以每条路径都得钉住，包括"不能把剔除规则整体放开"这个反向约束。
+    起因：一篇无负极的钠电电解液 JACS 被「电解液工程」剔除规则杀掉了。
+    """
+
+    def test_anode_free_is_kept(self):
+        work = {"title": "Anode-free sodium metal batteries"}
+        self.assertEqual(content_rules.keep_hit(work), "无负极")
+        self.assertTrue(content_rules.is_kept(work))
+
+    def test_ordinary_paper_is_not_kept(self):
+        work = {"title": "Anionic redox in Li-rich layered oxides"}
+        self.assertIsNone(content_rules.keep_hit(work))
+        self.assertFalse(content_rules.is_kept(work))
+
+    def test_keep_can_be_triggered_by_the_abstract(self):
+        """保底范围是标题+摘要（KEEP_SCOPE）：摘要里提到同样算这个方向。"""
+        work = {"title": "A new cathode design", "abstract": "cycled in an anode-free cell"}
+        self.assertEqual(content_rules.keep_hit(work), "无负极")
+
+    def test_keep_scope_can_be_narrowed_to_the_title(self):
+        work = {"title": "Electrolyte engineering for sodium batteries", "abstract": "anode-free"}
+        self.assertIsNotNone(content_rules.keep_hit(work))
+        with patch.object(config, "KEEP_RULES", [dict(config.KEEP_RULES[0], scope="title")]):
+            self.assertIsNone(content_rules.keep_hit(work))
+
+    def test_anode_free_electrolyte_paper_survives_partitioning(self):
+        """★ 核心回归：无负极 + 电解液工程 的论文必须活下来。"""
+        work = {"title": "Anode-free sodium metal batteries enabled by electrolyte engineering"}
+        kept, dropped = content_rules.partition_excluded([work])
+        self.assertEqual(dropped, [])
+        self.assertEqual([w["title"] for w in kept], [work["title"]])
+        self.assertEqual(work["keep_reason"], "无负极")
+        # 不得同时留下剔除原因：页头/日志会据此报"剔除 N 篇"，两边都写就自相矛盾
+        self.assertNotIn("exclude_reason", work)
+
+    def test_plain_electrolyte_paper_is_still_dropped(self):
+        """反向约束：保底不能把「电解液工程」这条剔除规则整体废掉。"""
+        work = {"title": "Electrolyte additives for high-voltage lithium batteries"}
+        kept, dropped = content_rules.partition_excluded([work])
+        self.assertEqual(kept, [])
+        self.assertEqual(dropped[0]["exclude_reason"], "电解液工程")
+
+    def test_exclusion_hit_still_reports_none_for_a_kept_paper(self):
+        """免剔除做在 ``exclusion_hit`` 里，所以任何调用点都绕不过去。"""
+        title = "Anode-free sodium metal batteries via electrolyte engineering"
+        self.assertIsNotNone(content_rules.exclusion_hit({"title": "Electrolyte engineering"}))
+        self.assertIsNone(content_rules.exclusion_hit({"title": title}))
+
+    def test_topic_keep_is_scoped(self):
+        """主题自己的 keep 只对该主题生效，全局的照常叠加。"""
+        scoped = config.ResearchTopic(
+            name="A", keywords=["x"], keep=[{"label": "本主题必留", "any": ["prussian blue"]}]
+        )
+        work = {"title": "Prussian blue analogue cathode"}
+        self.assertEqual(content_rules.keep_hit(work, scoped), "本主题必留")
+        self.assertIsNone(content_rules.keep_hit(work))
+
+    def test_mark_kept_writes_the_reason(self):
+        works = [{"title": "Anode-free sodium battery"}, {"title": "unrelated"}]
+        marked = content_rules.mark_kept(works)
+        self.assertEqual([w["title"] for w in marked], ["Anode-free sodium battery"])
+        self.assertEqual(works[0]["keep_reason"], "无负极")
+        self.assertNotIn("keep_reason", works[1])
+
+    def test_describe_keeps_lists_the_trigger_phrases(self):
+        """``--show-config`` 与启动日志靠它回显，写错了才看得出来。"""
+        text = content_rules.describe_keeps()
+        self.assertIn("无负极", text)
+        self.assertIn("anode free", text)
+
+    def test_summary_mentions_the_keep_layer(self):
+        self.assertIn("硬保底", content_rules.summary())
+
+
 class TestContentRuleValidation(unittest.TestCase):
     """规则写错只会静默失效，所以必须有地方报出来。"""
 
@@ -1729,6 +2001,17 @@ class TestContentRuleValidation(unittest.TestCase):
             problems = config.config_warnings("topic")
         self.assertTrue(any("永远不会生效" in p for p in problems), problems)
 
+    def test_broken_keep_rule_is_reported(self):
+        """保底规则配错只会静默失效，所以必须在校验里报出来。"""
+        with patch.object(config, "KEEP_RULES", [{"label": "坏的", "any": []}]):
+            problems = config.validate_content_rules()
+        self.assertTrue(any("KEEP_RULES" in p and "永远不会生效" in p for p in problems), problems)
+
+    def test_topic_keep_rule_is_validated(self):
+        broken = config.ResearchTopic(name="A", keywords=["x"], keep=[{"label": "坏的", "any": []}])
+        problems = config.topic_warnings("topic", broken)
+        self.assertTrue(any("keep" in p and "永远不会生效" in p for p in problems), problems)
+
 
 class TestContentBonusAffectsRanking(unittest.TestCase):
     """最终分 = AI 分 + 期刊档次加成 + 内容规则加成。"""
@@ -1741,8 +2024,8 @@ class TestContentBonusAffectsRanking(unittest.TestCase):
         }
         ranking.annotate([work])
         self.assertEqual(work["journal_bonus"], 9)
-        self.assertEqual(work["content_bonus"], 4)  # 固态 1 + 无负极 3
-        self.assertEqual(work["final_score"], 83)
+        self.assertEqual(work["content_bonus"], 11)  # 固态 1 + 无负极 10
+        self.assertEqual(work["final_score"], 90)
         self.assertEqual(work["ai_score"], 70)  # AI 分本身不动
 
     def test_content_bonus_does_not_lower_the_threshold(self):
@@ -1757,11 +2040,11 @@ class TestContentBonusAffectsRanking(unittest.TestCase):
             "ai_score": 70,
             "journal_tier": "其他",
             "journal_bonus": 0,
-            "content_bonus": 4,
-            "content_bonus_detail": [["固态电池", 1], ["无负极", 3]],
-            "final_score": 74,
+            "content_bonus": 11,
+            "content_bonus_detail": [["固态电池", 1], ["无负极", 10]],
+            "final_score": 81,
         }
-        self.assertEqual(ranking.breakdown(work), "AI 70 + 固态电池 1 + 无负极 3 = 74")
+        self.assertEqual(ranking.breakdown(work), "AI 70 + 固态电池 1 + 无负极 10 = 81")
 
     def test_content_bonus_can_overtake_a_higher_ai_score(self):
         plain = {"doi": "a", "ai_score": 72, "issn": "2542-4351", "title": "plain cathode work"}
@@ -1799,11 +2082,12 @@ class TestMailerContentTags(unittest.TestCase):
         html_body, plain = mailer.build_html(
             ranking.rank([work]), "2026-09-01", lookback_days=14, first_run=False, excluded=3
         )
-        # 70（AI）+ 7（Joule）+ 1（固态）+ 3（无负极）+ 1（固态聚合物电解质）
-        self.assertIn("最终 82 分", html_body)
+        # 70（AI）+ 7（Joule）+ 1（固态）+ 10（无负极）+ 1（固态聚合物电解质）
+        self.assertIn("最终 89 分", html_body)
         self.assertIn("Joule +7（AI 70）", html_body)
         self.assertIn("固态电池 +1", html_body)
-        self.assertIn("无负极 +3", html_body)
+        self.assertIn("无负极 +10", html_body)
+        self.assertIn("硬保底 · 无负极", html_body)
         self.assertIn("规则剔除 3 篇", html_body)
         self.assertIn("固态电池 1", plain)
 
@@ -1820,7 +2104,7 @@ class TestLiveResearchConfig(unittest.TestCase):
         scores = {rule["label"]: rule["score"] for rule in config.BONUS_RULES}
         self.assertEqual(scores["固态电池"], 1)
         self.assertEqual(scores["固态聚合物电解质"], 1)  # 在"固态"之上再加 1
-        self.assertEqual(scores["无负极"], 3)
+        self.assertEqual(scores["无负极"], 10)
 
     def test_exclusions_are_electrolyte_engineering_and_separator(self):
         self.assertEqual(

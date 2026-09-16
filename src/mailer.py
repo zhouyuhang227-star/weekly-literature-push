@@ -72,6 +72,8 @@ _STYLE = {
     "color:#92400e;font-size:11px;margin-right:6px;",
     "tag_content": "display:inline-block;padding:1px 7px;border-radius:4px;background:#e0e7ff;"
     "color:#3730a3;font-size:11px;margin-right:6px;",
+    "tag_keep": "display:inline-block;padding:1px 7px;border-radius:4px;background:#dcfce7;"
+    "color:#166534;font-size:11px;font-weight:600;margin-right:6px;",
     "empty": "background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;"
     "padding:32px 24px;text-align:center;color:#6b7280;font-size:14px;line-height:1.8;",
     "notice": "background:#fffbeb;border:1px solid #fde68a;color:#92400e;border-radius:8px;"
@@ -102,6 +104,13 @@ def _render_card(work: dict) -> str:
         final_score = int(work["final_score"])
 
     tags: list[str] = []
+    # 保底标签放最前：它是"为什么这篇 AI 分不高却排在前面"的唯一解释，
+    # 排在后面容易被长标签群淹没。
+    keep_reason = str(work.get("keep_reason") or "").strip()
+    if keep_reason or work.get("force_keep"):
+        tags.append(
+            f'<span style="{_STYLE["tag_keep"]}">🎯 硬保底 · {_esc(keep_reason or "命中保底规则")}</span>'
+        )
     if journal_bonus > 0:
         tags.append(
             f'<span style="{_STYLE["tag"]}">{_esc(tier)} +{journal_bonus}'
@@ -244,6 +253,12 @@ def build_html(
         )
     if ai_failed:
         notices.append(f"有 <b>{ai_failed}</b> 篇文献 AI 打分失败，本次未纳入统计（详见运行日志）。")
+    forced = ranking.forced_count(shown)
+    if forced:
+        notices.append(
+            f"🎯 其中 <b>{forced}</b> 篇命中了<b>保底规则</b>（重点关注方向），"
+            "已<b>置顶</b>并强制保留 —— 它们不受剔除规则与 AI 入选线限制，以免漏掉。"
+        )
     if first_run:
         notices.append(
             "这是<b>首次运行</b>，使用了更宽的预热窗口；"
@@ -262,12 +277,17 @@ def build_html(
         )
     if attachment_skipped:
         plain_lines.append(f"📎 附件已收满，另有 {int(attachment_skipped)} 篇未装入。")
+    forced = ranking.forced_count(shown)
+    if forced:
+        plain_lines.append(f"🎯 其中 {forced} 篇命中保底规则，已置顶并强制保留。")
     plain_lines.append("")
     for index, work in enumerate(shown, start=1):
         plain_lines += [
             f"{index}. {work.get('title')}",
             f"   [{work.get('journal')}] {work.get('pub_date')} · {ranking.breakdown(work)} 分",
         ]
+        if work.get("force_keep") or work.get("keep_reason"):
+            plain_lines.append(f"   🎯 硬保底 · {work.get('keep_reason') or '命中保底规则'}")
         author_text = authors.author_line(work)
         if author_text:
             plain_lines.append(f"   作者：{author_text}")
@@ -301,6 +321,7 @@ def _wrap(body: str, run_date: str, meta_line: str, title: str | None = None) ->
     <p style="{_STYLE['footer']}">
       本邮件由 GitHub Actions 自动生成。期刊范围、关键词与评分规则可在仓库 <code>src/config.py</code> 中调整。<br>
       排序规则：最终分 = AI 相关性分 + 期刊档次加成（正刊/大子刊/Joule/小子刊/JACS/Angew/AM）+ 内容加分；加成只影响排序，不改变入选线。<br>
+      例外：命中 <code>KEEP_RULES</code> 的论文免于剔除规则与 AI 入选线，并置顶展示。<br>
       邮件正文中所有字段均已做 HTML 转义，DOI 链接指向 doi.org 官方解析。
     </p>
   </div>

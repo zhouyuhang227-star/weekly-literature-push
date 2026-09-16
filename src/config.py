@@ -186,11 +186,37 @@ def journal_tiers_not_in_journals() -> list[str]:
 #   scope   选填。"all"（默认，标题+摘要）或 "title"（只看标题）。
 #           排除规则**默认只看标题**，见下面 EXCLUDE_RULES 的说明。
 #
+# 上面这套字段同时用于三类规则（都在下面）：
+#   BONUS_RULES  加分     —— 只管**排序**，分数再高也换不来入选。
+#   EXCLUDE_RULES 剔除    —— 命中就**直接丢掉**，连 AI 都不打分。
+#   KEEP_RULES   硬保底  —— 命中就**强制进邮件**，AI 分再低也留，且**免于上面所有剔除**。
+#
 # 匹配方式：先把文本归一化（转小写、标点与连字符换成空格、压缩空格），
 #   再按「词首对齐」匹配短语。所以
 #     "Solid-state" / "solid state" / "solid—state" 都能被 "solid state" 命中，
 #     "solid state batter" 也能命中 "solid-state batteries"。
 #   ⚠️ 短语别写太短（< 4 个字符），否则容易误伤（例如 "na" 会命中 "nanowire"）。
+
+#: 「无负极」构型的写法集合（**加分规则与硬保底规则共用这一份**）。
+#:
+#: 单独抽出来是因为它要出现在两个地方：``BONUS_RULES``（加分）与
+#: ``KEEP_RULES``（硬保底，见下面）。两处如果各写一份词表，早晚会漂移 ——
+#: 加了新写法只改了一处，于是"能加分但保不住"，或者反过来，都是很难查的坑。
+#:
+#: 匹配前会先归一化（转小写、连字符换成空格），所以 ``Anode-free`` / ``anode free``
+#: 都能被 ``"anode free"`` 命中；又因为是**词首对齐**匹配，``"anode free"``
+#: 已经能覆盖 ``"anode-free sodium metal battery"`` 这类写法，不必再单列。
+ANODE_FREE_TERMS: list[str] = [
+    "anode free",
+    "anodeless",
+    "anode less",
+    "free anode",  # 覆盖 "Li-free anode" / "Na-free anode" / "metal-free anode"
+    "zero excess",
+    "hostless",
+    "lithium free anode",
+    "sodium free anode",
+    "aflmb",  # anode-free lithium metal battery（文献里常见的缩写）
+]
 
 #: 所有主题共用的内容加分。
 BONUS_RULES: list[dict] = [
@@ -229,9 +255,39 @@ BONUS_RULES: list[dict] = [
     },
     {
         # 无负极构型（含锂/钠，不限体系）
+        #
+        # 权重定得比其它加分高一个数量级是有意的：老板要求盯这个方向，
+        # 而期刊加成最高也就 +9（大子刊），AI 分满打满算 100 —— +10 足以把
+        # 一篇「AI 只给了 55 分」的无负极论文顶到能和顶刊论文并排的位置。
         "label": "无负极",
-        "score": 3,
-        "any": ["anode free", "anodeless", "anode less", "zero excess", "hostless", "lithium free anode"],
+        "score": 10,
+        "any": ANODE_FREE_TERMS,
+    },
+]
+
+#: 命中即**硬保底**（无论 AI 打多少分都进邮件，且**无视所有剔除规则**）。
+#:
+#: 和 ``BONUS_RULES`` 的区别（很容易混，务必分清）：
+#:   * ``BONUS_RULES`` 只管**排序**，不管入选 —— 加再多分，AI 分没过
+#:     ``AI_THRESHOLD`` 照样进不了邮件。
+#:   * ``KEEP_RULES`` 管**入选**：命中就强制进邮件，AI 分再低也留。
+#:
+#: 为什么需要它：无负极构型的论文经常是"电解液工程"（如《Anode-free sodium
+#: metal batteries enabled by electrolyte engineering》），而「电解液工程」
+#: 是 ``EXCLUDE_RULES`` 里的硬剔除项 —— 在**还没进 AI 打分**时就被丢掉了，
+#: 加分规则根本来不及生效。老板要盯的方向不能这样丢，所以单开这一层。
+#:
+#: ⚠️ 代价：命中即强推，所以 ``scope`` 别乱放。默认 ``all``（标题+摘要），
+#:    因为"只在摘要里提到无负极"的论文同样算这个方向；想收紧成"标题必须写明"
+#:    就显式写 ``"scope": "title"``。
+#: 字段与 ``BONUS_RULES`` 相同，只是 ``score`` 无意义（可省略）。
+KEEP_RULES: list[dict] = [
+    {
+        # label 只写方向名：邮件卡片/日志会自己在前面加「硬保底 · 」，
+        # 写进来会变成「硬保底 · 无负极（硬保底）」。
+        "label": "无负极",
+        "score": 0,
+        "any": ANODE_FREE_TERMS,
     },
 ]
 
@@ -286,9 +342,15 @@ EXCLUDE_RULES: list[dict] = [
 
 #: 全局排除说明。会拼进**每个主题**给 AI 看的描述里，让 AI 也避开这些方向。
 #: （与上面的 EXCLUDE_RULES 互补：那一条管"硬剔除"，这一句管"AI 打分时别给高分"。）
+#:
+#: ⚠️ 末尾那句例外是必需的：无负极构型的论文常常正是"电解液工程"，
+#:    如果不告诉 AI，AI 会照着"不看电解液工程"给低分、并写一段负面的理由 ——
+#:    那样硬保底虽然还能把它捞进邮件，但卡片上的解读和理由是反的。
 GLOBAL_EXCLUDE_NOTE = (
     "不看电解液工程（液态电解液添加剂 / 溶剂化结构 / 配方优化）与隔膜改性；"
     "不计入凝胶电解质。"
+    "**例外：只要涉及无负极构型（anode-free / anodeless / hostless / zero-excess，"
+    "含锂与钠体系），一律保留并给高分，即使它属于电解液工程** —— 这是重点关注方向。"
 )
 
 
@@ -306,25 +368,36 @@ def validate_rule_list(rules: object, group_name: str) -> list[str]:
         label = str(rule.get("label") or "").strip()
         if not label:
             problems.append(f'{where}缺少 "label"（显示名）')
+            # 没有显示名时就用"哪一组的第几条"当名字，报错仍然能定位
             label = where
+        else:
+            # 带上组名：同时校验 BONUS_RULES / EXCLUDE_RULES / KEEP_RULES，
+            # 只说「固态电池」的话不知道是错在哪一组里
+            label = f"{where}「{label}」"
         patterns = [str(p).strip() for p in (rule.get("any") or []) if str(p).strip()]
         if not patterns:
-            problems.append(f'「{label}」缺少非空的 "any"（命中列表）→ 这条规则永远不会生效')
+            problems.append(f'{label} 缺少非空的 "any"（命中列表）→ 这条规则永远不会生效')
         for key in ("all", "unless"):
             value = rule.get(key)
             if value is not None and not isinstance(value, (list, tuple)):
-                problems.append(f'「{label}」的 "{key}" 必须是列表')
+                problems.append(f'{label} 的 "{key}" 必须是列表')
         try:
             int(rule.get("score") or 0)
         except (TypeError, ValueError):
-            problems.append(f'「{label}」的 "score" 不是整数')
+            problems.append(f'{label} 的 "score" 不是整数')
     return problems
 
 
 def validate_content_rules() -> list[str]:
-    """检查全局的 ``BONUS_RULES`` / ``EXCLUDE_RULES``。"""
-    return validate_rule_list(BONUS_RULES, "BONUS_RULES") + validate_rule_list(
-        EXCLUDE_RULES, "EXCLUDE_RULES"
+    """检查全局的 ``BONUS_RULES`` / ``EXCLUDE_RULES`` / ``KEEP_RULES``。
+
+    ``KEEP_RULES`` 尤其要查：它的失效方式最隐蔽 —— 规则写得不对只会"从不命中"，
+    于是老板要盯的那个方向静默地继续漏，日志里看不出任何异样。
+    """
+    return (
+        validate_rule_list(BONUS_RULES, "BONUS_RULES")
+        + validate_rule_list(EXCLUDE_RULES, "EXCLUDE_RULES")
+        + validate_rule_list(KEEP_RULES, "KEEP_RULES")
     )
 
 
@@ -464,7 +537,8 @@ TOPICS: dict[str, str] = {}
 #                       旧记录留在旧分区里不再生效。想改名又不想重跑，把 key 填成旧 name。
 #   bonuses      选填。**只对这个主题生效**的内容加分（写法同上面的 BONUS_RULES）。
 #   exclude      选填。**只对这个主题生效**的剔除规则（写法同上面的 EXCLUDE_RULES）。
-#                    全局的 BONUS_RULES / EXCLUDE_RULES 仍然照常生效，这里是叠加。
+#   keep         选填。**只对这个主题生效**的硬保底规则（写法同上面的 KEEP_RULES）。
+#                    全局的 BONUS_RULES / EXCLUDE_RULES / KEEP_RULES 仍然照常生效，这里是叠加。
 #
 # 当前启用：两个方向（想回到单方向就把 RESEARCH_TOPICS 改回 []）
 #
@@ -579,6 +653,8 @@ RESEARCH_TOPICS: list[dict] = [
             "只看钠离子电池**正极**材料：层状过渡金属氧化物（P2/O3 型）、"
             "普鲁士蓝类似物、聚阴离子化合物。关注相变与循环稳定性、空气/水分稳定性、"
             "阴离子氧化还原、Na+ 扩散动力学。不含硬碳等负极、不含电解液与隔膜工作。"
+            "**例外：涉及无负极构型（anode-free）的钠电论文一律保留并给高分，"
+            "即使它做的是电解液工程**。"
         ),
         # 层状钠离子正极是本主题的重点方向，额外加分
         "bonuses": [
@@ -621,6 +697,8 @@ class ResearchTopic:
     #: 只对本主题生效的内容加分 / 剔除规则（全局的 BONUS_RULES / EXCLUDE_RULES 照常叠加）。
     bonuses: list[dict] = field(default_factory=list)
     exclude: list[dict] = field(default_factory=list)
+    #: 只对本主题生效的硬保底规则（全局的 KEEP_RULES 照常叠加）。
+    keep: list[dict] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.name = (self.name or "").strip()
@@ -686,6 +764,7 @@ def active_research_topics() -> list[ResearchTopic]:
             key=str(item.get("key") or ""),
             bonuses=[rule for rule in (item.get("bonuses") or []) if isinstance(rule, dict)],
             exclude=[rule for rule in (item.get("exclude") or []) if isinstance(rule, dict)],
+            keep=[rule for rule in (item.get("keep") or []) if isinstance(rule, dict)],
         )
         if not candidate.name:
             raise RuntimeError(f'RESEARCH_TOPICS 第 {index} 项缺少 "name"（主题显示名）')
@@ -1077,6 +1156,7 @@ def _topic_warnings(mode: str, view: ResearchTopic) -> list[str]:
         )
     problems.extend(validate_rule_list(view.bonuses, f"主题「{view.name}」的 bonuses"))
     problems.extend(validate_rule_list(view.exclude, f"主题「{view.name}」的 exclude"))
+    problems.extend(validate_rule_list(view.keep, f"主题「{view.name}」的 keep"))
     return problems
 
 

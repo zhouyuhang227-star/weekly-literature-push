@@ -1,4 +1,4 @@
-"""内容规则：按论文**内容**加分 / 剔除（与 ``ranking.py`` 的期刊档次加成并列）。
+"""内容规则：按论文**内容**加分 / 剔除 / 保底（与 ``ranking.py`` 的期刊档次加成并列）。
 
 排序公式因此变成::
 
@@ -8,16 +8,30 @@
 ``AI_THRESHOLD``。这样"蹭到热词"或"发在顶刊"的论文不会被硬塞进邮件，
 只是在同样相关时排得更靠前。
 
-两个方向
+**唯一能改变"入选"的是保底规则**（``config.KEEP_RULES`` + 主题自己的 ``keep``），
+见下面第三个方向。
+
+三个方向
 --------
 * **加分**（``config.BONUS_RULES`` + 主题自己的 ``bonuses``）
-  命中就加分，如「固态电池 +1」「无负极 +3」。默认在 **标题 + 摘要** 上匹配
+  命中就加分，如「固态电池 +1」「无负极 +10」。默认在 **标题 + 摘要** 上匹配
   （摘要里提到同样算数，宁滥勿缺 —— 反正只是排序）。
 * **剔除**（``config.EXCLUDE_RULES`` + 主题自己的 ``exclude``）
   命中就直接丢出链路，**不进 AI 打分**（省钱），也不进邮件。
   默认**只看标题**：摘要是浓缩文本，"electrolyte additive" 这种词在**相关论文**里
   也常作为对比组出现，按摘要剔除会误杀；而漏掉的无关论文本来就会被 AI 打低分。
   确实想看摘要，在规则里显式写 ``"scope": "all"``。
+* **硬保底**（``config.KEEP_RULES`` + 主题自己的 ``keep``）
+  命中就**强制进邮件**，且**免于上面所有剔除规则**。
+
+为什么需要保底这一层
+--------------------
+有些方向是"无论怎么判都要看"的（例如老板指定要盯的无负极构型）。
+而这类论文常常正好撞在剔除规则上 —— 例如《Anode-free sodium metal batteries
+enabled by electrolyte engineering》命中「电解液工程」，在**还没进 AI 打分**时
+就被丢掉了，加分规则根本来不及生效。只在 ``unless`` 里打补丁也不够：
+那只能免掉**一条**剔除规则，而且免完仍要过 ``AI_THRESHOLD``，
+而 AI 恰恰被告知"不看电解液工程"。所以单开这一层。
 
 匹配细节
 --------
@@ -48,6 +62,13 @@ EXCLUDE_SCOPE = "title"
 
 #: 加分规则的默认匹配范围（标题 + 摘要）
 BONUS_SCOPE = "all"
+
+#: 保底规则的默认匹配范围。
+#: 用 "all"（标题+摘要）而不是排除规则的 "title"，因为判断的是**要不要留**：
+#: 只在摘要里提到无负极的论文同样属于这个方向，漏掉比多留一篇严重得多。
+#: 代价是可能把"摘要里拿无负极当对照组"的论文也强推进邮件，想收紧就在规则里写
+#: "scope": "title"。
+KEEP_SCOPE = "all"
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +169,18 @@ def exclusion_rules(topic=None) -> list[dict]:
     return rules
 
 
+def keep_rules(topic=None) -> list[dict]:
+    """本轮生效的硬保底规则：全局的 + 该主题自己的。
+
+    与 ``bonus_rules`` 不同，这里**不过滤 score**：保底规则本来就
+    不靠分数起作用（它是入选开关，不是排序权重）。
+    """
+    rules = [rule for rule in (config.KEEP_RULES or []) if isinstance(rule, dict)]
+    if topic is not None:
+        rules += [rule for rule in (getattr(topic, "keep", None) or []) if isinstance(rule, dict)]
+    return rules
+
+
 def _score_of(rule: dict) -> int:
     try:
         return int(rule.get("score") or 0)
@@ -176,18 +209,67 @@ def bonus_score(work: dict, topic=None) -> int:
 
 
 def exclusion_hit(work: dict, topic=None) -> str | None:
-    """命中剔除规则时返回命中的规则名（多个用「、」连接），否则 ``None``。"""
+    """命中剔除规则时返回命中的规则名（多个用「、」连接），否则 ``None``。
+
+    ⚠️ **命中保底规则的论文一律返回 ``None``**（即"不剔除"）。
+    免剔除是写在这里而不是写在调用方，是为了让所有调用点（``partition_excluded``、
+    日志、将来的新流程）都不可能绕过去 —— 保底一旦能被绕过就等于没有。
+    """
+    if keep_hit(work, topic):
+        return None
     hits = _matching_rules(work, exclusion_rules(topic), EXCLUDE_SCOPE)
     if not hits:
         return None
     return "、".join(_label_of(rule) for rule in hits)
 
 
+def keep_matched(work: dict, topic=None) -> list[dict]:
+    """返回命中的保底规则（可能有多条）。"""
+    return _matching_rules(work, keep_rules(topic), KEEP_SCOPE)
+
+
+def keep_hit(work: dict, topic=None) -> str | None:
+    """命中保底规则时返回规则名（多个用「、」连接），否则 ``None``。"""
+    hits = keep_matched(work, topic)
+    if not hits:
+        return None
+    return "、".join(_label_of(rule) for rule in hits)
+
+
+def is_kept(work: dict, topic=None) -> bool:
+    """该篇是否被保底（命中保底规则）。"""
+    return bool(keep_matched(work, topic))
+
+
+def mark_kept(works: list[dict], topic=None) -> list[dict]:
+    """就地给命中保底的论文写上 ``keep_reason``，并返回命中保底的那些。
+
+    ``keep_reason`` 会被邮件渲染成标签、也会进日志，所以这里就写好，
+    免得下游各自重复匹配一遍（规则匹配走的是缓存正则，但仍不必白跑）。
+    """
+    kept: list[dict] = []
+    for work in works:
+        reason = keep_hit(work, topic)
+        if reason:
+            work["keep_reason"] = reason
+            kept.append(work)
+    return kept
+
+
 def partition_excluded(works: list[dict], topic=None) -> tuple[list[dict], list[dict]]:
-    """按剔除规则把候选拆成 ``(保留, 剔除)``，被剔除的会写上 ``exclude_reason``。"""
+    """按剔除规则把候选拆成 ``(保留, 剔除)``，被剔除的会写上 ``exclude_reason``。
+
+    命中**保底规则**的论文永远不会出现在``剔除``这一侧（见 :func:`exclusion_hit`），
+    同时会被写上 ``keep_reason``。
+    """
     kept: list[dict] = []
     dropped: list[dict] = []
     for work in works:
+        reason = keep_hit(work, topic)
+        if reason:
+            work["keep_reason"] = reason
+            kept.append(work)
+            continue
         reason = exclusion_hit(work, topic)
         if reason:
             work["exclude_reason"] = reason
@@ -202,10 +284,22 @@ def log_excluded(dropped: list[dict], topic=None, prefix: str = "") -> None:
     if not dropped:
         return
     scope = f"主题「{topic.name}」" if topic is not None else "本轮"
-    log.info("%s规则剔除 %s 篇（%s不看：电解液工程 / 隔膜改性）", prefix, len(dropped), scope)
+    log.info("%s规则剔除 %s 篇（%s不看：%s）", prefix, len(dropped), scope, describe_excludes(topic))
     for work in dropped:
         log.debug(
             "%s  [剔除·%s] %s", prefix, work.get("exclude_reason"), work.get("title")
+        )
+
+
+def log_kept(kept: list[dict], prefix: str = "") -> None:
+    """把保底命中的论文打进日志。**用 INFO 级**：这是"老板要盯的方向"，
+    得能在 Actions 日志里一眼看到，而不是埋在 DEBUG 里。"""
+    if not kept:
+        return
+    log.info("%s规则保底 %s 篇（命中即强制进邮件，AI 分再低也不丢）：", prefix, len(kept))
+    for work in kept:
+        log.info(
+            "%s  [保底·%s] %s", prefix, work.get("keep_reason"), work.get("title")
         )
 
 
@@ -225,10 +319,23 @@ def describe_excludes(topic=None) -> str:
     return " ｜ ".join(_label_of(rule) for rule in rules)
 
 
+def describe_keeps(topic=None) -> str:
+    """一行文字列出生效的硬保底规则（带命中的短语，方便核对词表）。"""
+    rules = keep_rules(topic)
+    if not rules:
+        return "（未配置任何保底规则）"
+    parts: list[str] = []
+    for rule in rules:
+        terms = "、".join(str(p) for p in (rule.get("any") or [])[:3])
+        more = " 等" if len(rule.get("any") or []) > 3 else ""
+        parts.append(f"{_label_of(rule)}（命中：{terms}{more}）")
+    return " ｜ ".join(parts)
+
+
 def summary(topic=None) -> str:
     """一句话说明内容规则，用于日志。"""
     return (
         f"内容加分 {describe_bonuses(topic)}；"
-        f"剔除规则 {describe_excludes(topic)}"
-        "（剔除只看标题，宁漏勿误杀）"
+        f"剔除规则 {describe_excludes(topic)}（剔除只看标题，宁漏勿误杀）；"
+        f"硬保底 {describe_keeps(topic)}（免剔免阈值，强制进邮件）"
     )

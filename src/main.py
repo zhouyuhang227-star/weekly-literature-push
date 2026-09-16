@@ -298,6 +298,7 @@ def show_config(args: argparse.Namespace) -> int:
         print(f"     补充说明    {topic.description.strip() or '（未设置）'}")
         print(f"     主题加分    {content_rules.describe_bonuses(topic)}")
         print(f"     主题剔除    {content_rules.describe_excludes(topic)}")
+        print(f"     主题保底    {content_rules.describe_keeps(topic)}")
         print(f"     去重分区键  {topic.key}")
     print(f"  期刊            {len(ISSN_FILTER.split('|'))} 本")
     try:
@@ -322,6 +323,10 @@ def show_config(args: argparse.Namespace) -> int:
     )
     print(f"  内容加分（全局）{content_rules.describe_bonuses()}")
     print(f"  剔除规则（全局）{content_rules.describe_excludes()}（只看标题）")
+    print(
+        f"  硬保底（全局）  {content_rules.describe_keeps()}"
+        "\n                  ← 命中即强制进邮件：免剔除规则、免 AI 入选线，且排到最前"
+    )
     print(f"  本轮检索模式    {mode}")
     print("-" * 68)
     for index, topic in enumerate(topics, start=1):
@@ -346,6 +351,7 @@ def show_config(args: argparse.Namespace) -> int:
     print("  想换「搜到的里面留下什么」 → 改 RESEARCH_TOPICS[].keywords / description")
     print("  想换「期刊权重」          → 改 JOURNAL_TIERS（顺序即权重顺序）")
     print("  想换「内容加权 / 不看什么」→ 改 BONUS_RULES / EXCLUDE_RULES，或主题的 bonuses / exclude")
+    print("  想换「无论如何都要留」    → 改 KEEP_RULES，或主题的 keep（命中即强制进邮件 + 置顶）")
     print("  想换「有哪些主题」        → 改 RESEARCH_TOPICS（空 = 回到单方向模式）")
     print("  真正解析出的主题 id 要看联网日志：python -m src.main --dry-run -v")
     print()
@@ -540,10 +546,12 @@ def run_topic(
 
     # ---- 5.5 内容规则剔除（不看电解液工程 / 隔膜改性）----
     # 放在 AI 之前：被剔除的文献不进 AI 打分（省钱），也不进邮件。
+    # 命中 KEEP_RULES 的会在这里被放行（并打上 keep_reason），后面还会免掉 AI 入选线。
     excluded: list[dict] = []
     if fresh:
         fresh, excluded = content_rules.partition_excluded(fresh, topic)
         content_rules.log_excluded(excluded, topic, prefix=prefix)
+        content_rules.log_kept(content_rules.mark_kept(fresh, topic), prefix=prefix)
 
     # ---- 6. AI 打分（第 2 层筛选：语义相关性）----
     ai_failed: list[dict] = []

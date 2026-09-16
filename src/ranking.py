@@ -1,12 +1,15 @@
 """加权排序：期刊档次加成 **+** 内容规则加成。
 
-规则的数字都在 ``config.py`` 里（``JOURNAL_TIERS`` / ``BONUS_RULES``）：
+规则的数字都在 ``config.py`` 里（``JOURNAL_TIERS`` / ``BONUS_RULES`` / ``KEEP_RULES``）：
 
     最终分 = AI 相关性分（0-100） + 期刊档次加成 + 内容规则加成
 
 两种加成**都只影响排序，不影响入选** —— 是否进邮件仍然只看 AI 分是否过
 ``AI_THRESHOLD``。这样"顶刊的低相关论文"和"蹭到热词的论文"都不会挤掉
 "普通刊的高相关论文"，只是同样相关时排得更靠前。
+
+（唯一能改变"入选"的是 ``config.KEEP_RULES``，那一条不在本模块，
+而在 :mod:`src.ai_matcher` 里生效 —— 本模块只负责把它置顶。）
 
 两类加成的分工：
 * **期刊档次加成**（``JOURNAL_TIERS``）：这篇发在哪本刊。
@@ -72,7 +75,7 @@ def content_items(work: dict) -> list[tuple[str, int]]:
 
 
 def content_parts(work: dict) -> list[str]:
-    """内容加分的明细文字，如 ``["固态电池 1", "无负极 3"]``。"""
+    """内容加分的明细文字，如 ``["固态电池 1", "无负极 10"]``。"""
     return [f"{label} {score}" for label, score in content_items(work)]
 
 
@@ -80,7 +83,7 @@ def annotate(works: list[dict], topic=None) -> list[dict]:
     """就地写入加权字段并算出 ``final_score``。
 
     写入的字段：``journal_tier`` / ``journal_bonus`` /
-    ``content_bonus`` / ``content_bonus_detail`` / ``final_score``。
+    ``content_bonus`` / ``content_bonus_detail`` / ``final_score`` / ``force_keep``。
     """
     for work in works:
         tier, journal_bonus = journal_tier(work)
@@ -91,16 +94,31 @@ def annotate(works: list[dict], topic=None) -> list[dict]:
         work["content_bonus"] = content_bonus
         work["content_bonus_detail"] = [[label, score] for label, score in hits]
         work["final_score"] = int(work.get("ai_score") or 0) + journal_bonus + content_bonus
+        # 硬保底：命中 KEEP_RULES 的论文置顶（排序里再抬一手，保证不仅"留下"
+        # 而且第一眼就看得见）。邮件卡片上会打一个绿色保底标签解释为什么它在最上面，
+        # 否则"AI 55 分排在 AI 98 分前面"看起来就像个 bug。
+        #
+        # 顺手把 keep_reason 也写上：主流程里 content_rules 早就写过了，
+        # 但只调 ranking.rank() 时（测试、将来可能的单独重排）没有，
+        # 而邮件/PDF 标签要显示这个规则名，缺了就只能显示一句无信息量的兜底文案。
+        keep_reason = content_rules.keep_hit(work, topic)
+        if keep_reason:
+            work["keep_reason"] = keep_reason
+        work["force_keep"] = bool(keep_reason)
     return works
 
 
-def sort_key(work: dict) -> tuple[int, int, str]:
-    """排序键：最终分 → AI 分 → 发表日期。
+def sort_key(work: dict) -> tuple[int, int, int, str]:
+    """排序键：硬保底 → 最终分 → AI 分 → 发表日期。
 
-    带上 AI 分是为了"加成追平"时仍按真实相关性分先后；
+    保底位放在最前面是有意的：老板要盯的方向可能 AI 打分并不高（判据里本来就写了
+    "不看电解液工程"），只靠内容加分不足以保证它挤进正文前 20 篇而不会掉进附件。
+
+    后面两项：带上 AI 分是为了"加成追平"时仍按真实相关性分先后；
     带上日期是为了完全同分时结果稳定（不会每次运行顺序都变）。
     """
     return (
+        1 if work.get("force_keep") else 0,
         int(work.get("final_score") or 0),
         int(work.get("ai_score") or 0),
         str(work.get("pub_date") or ""),
@@ -136,6 +154,11 @@ def tiers() -> list[tuple[str, int]]:
     return [(tier, bonus) for tier, (bonus, _names) in config.JOURNAL_TIERS.items()]
 
 
+def forced_count(works: list[dict]) -> int:
+    """其中有几篇是硬保底（邮件页头要拿它决定要不要加提示）。"""
+    return sum(1 for work in works if work.get("force_keep"))
+
+
 def describe() -> str:
     """一行文字说明排序规则，用于启动日志与 ``--show-config``。
 
@@ -146,5 +169,5 @@ def describe() -> str:
     parts.append(f"{UNRANKED_TIER} +{UNRANKED_BONUS}")
     return (
         "最终分 = AI 相关性分 + 期刊加成 + 内容加分，按最终分降序"
-        "（期刊：" + " > ".join(parts) + "）"
+        "（期刊：" + " > ".join(parts) + "）；命中保底规则的论文无条件置顶"
     )

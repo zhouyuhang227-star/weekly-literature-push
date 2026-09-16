@@ -295,6 +295,11 @@ def evaluate_works(
     之所以要把"低于阈值"单独返回：候选量有近 200 篇而邮件只发 20 篇，
     若不记录这些已判定过的文献，下周它们会被原封不动地重新打分一遍。
 
+    **硬保底**：命中 ``config.KEEP_RULES``（或主题自己的 ``keep``）的论文无论分数
+    多低都进"入选"，**并且**即使 AI 调用失败也照样入"入选"（分数记 0）——
+    这是"老板要盯的方向不能丢"的最后一层保险，代价最大可以接受。
+    判断逻辑在 :func:`_partition_forced`。
+
     :param keywords: 打分判据；``None`` 表示用 ``topic``（或 config）的研究方向描述。
     :param topic: ``config.ResearchTopic``；多主题调研时每个主题各用各的判据。
     """
@@ -315,16 +320,71 @@ def evaluate_works(
             if index % 10 == 0 or index == len(works):
                 log.info(" AI 进度 %s/%s", index, len(works))
 
-    failed = [w for w in scored if w.get("ai_error")]
-    passed = [w for w in scored if not w.get("ai_error") and w.get("ai_score", 0) >= threshold]
-    rejected = [w for w in scored if not w.get("ai_error") and w.get("ai_score", 0) < threshold]
+    passed, failed, rejected = _partition_forced(scored, threshold, topic)
     passed.sort(key=lambda w: (w.get("ai_score") or 0, w.get("pub_date") or ""), reverse=True)
 
     log.info(
-        "AI 打分完成：%s 篇通过阈值（>=%s），%s 篇低于阈值，%s 篇调用失败",
+        "AI 打分完成：%s 篇通过阈值（>=%s），%s 篇低于阈值，%s 篇调用失败%s",
         len(passed),
         threshold,
         len(rejected),
         len(failed),
+        _forced_note(passed),
     )
+    return passed, failed, rejected
+
+
+def _forced_note(passed: list[dict]) -> str:
+    """日志尾巴：本轮有几篇是被保底规则硬留下的（0 篇就不提）。"""
+    forced = [w for w in passed if w.get("keep_reason")]
+    if not forced:
+        return ""
+    return f"（其中 {len(forced)} 篇由保底规则强制保留）"
+
+
+def _partition_forced(
+    scored: list[dict], threshold: int, topic=None
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """三堆的划分规则，单独拎出来是因为逻辑不直观。
+
+    保底命中的论文**先被摘出去**，再划分剩下的。顺序反了就会出错：
+    "分数 >= threshold 入选 / 否则低于阈值"这套条件对一篇 55 分的无负极论文
+    会得出"低于阈值"，于是它被回写已读标记、**永远不出现在邮件里** ——
+    保底就白配了。先摘出去则它无条件进"入选"。同理，AI 失败的那堆也
+    只在**非保底**的论文里挑，否则保底论文会因为 AI 挂了而进"失败"堆，
+    同样进不了邮件（而且"失败"堆不写已读标记，下周还会重跑一遍）。
+
+    ⚠️ 这里用的是**函数内**导入 ``content_rules``：模块顶层导入会绕成
+    ``ai_matcher → content_rules → config``，而 ``content_rules`` 本身是干净的，
+    问题在于 ``ai_matcher`` 被 ``main`` 和 ``content_rules`` 间接引用，
+    顶层导入迟早踩到循环导入。函数内导入只多花一次 ``sys.modules`` 查表。
+    """
+    from . import content_rules
+
+    passed: list[dict] = []
+    failed: list[dict] = []
+    rejected: list[dict] = []
+    forced_count = 0
+    for work in scored:
+        reason = content_rules.keep_hit(work, topic)
+        if reason:
+            work["keep_reason"] = reason
+            forced_count += 1
+            if work.get("ai_error"):
+                # AI 挂了也要发出去：不给分数，但给出足够判断的信息。
+                work["ai_score"] = 0
+                work["ai_reason"] = (
+                    f"AI 打分失败（{work.get('ai_reason') or '原因不明'}）；"
+                    f"本篇命中保底规则「{reason}」，仅凭标题/摘要判断"
+                )
+            passed.append(work)
+            continue
+        if work.get("ai_error"):
+            failed.append(work)
+        elif (work.get("ai_score") or 0) >= threshold:
+            passed.append(work)
+        else:
+            rejected.append(work)
+    if forced_count:
+        log.info("保底规则强制保留 %s 篇（免剔除、免 AI 阈值）", forced_count)
     return passed, failed, rejected

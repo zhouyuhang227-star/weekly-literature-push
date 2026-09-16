@@ -315,6 +315,14 @@ def _item_blocks(work: dict, index: int) -> list[tuple[str, object]]:
         ("item_meta", f"{index}. {journal} · {pub_date} · 最终 {final} 分（{detail}）"),
         ("title", work.get("title") or "(无标题)"),
     ]
+    # 保底标签：附件里也可能出现被保底的论文（本周无负极论文特别多时），
+    # 得能一眼看出它为什么排在前面。
+    # 不用 🎯 之类的 emoji：PDF 用的是 Adobe-GB1 字符集，emoji 编不进去，
+    # gbk_safe() 会把它们悄悄丢掉（不报错，只是没了）。
+    if work.get("force_keep") or str(work.get("keep_reason") or "").strip():
+        blocks.append(
+            ("item_meta", f"【硬保底】{str(work.get('keep_reason') or '命中保底规则').strip()}")
+        )
     line = authors.author_line(work)
     if line:
         blocks.append(("author", f"作者：{line}"))
