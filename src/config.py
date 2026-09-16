@@ -118,6 +118,168 @@ def journal_tiers_not_in_journals() -> list[str]:
                 missing.append(name)
     return missing
 
+
+# ===========================================================================
+# ★ 内容规则：按论文**内容**加分 / 剔除（与期刊档次加成并列）
+# ===========================================================================
+# 完整的排序公式：
+#
+#     最终分 = AI 相关性分 + 期刊档次加成 + 内容规则加成
+#
+# ⚠️ 两种加成**都只管排序，不管入选**。能不能进邮件仍然只看 AI 分是否过 AI_THRESHOLD。
+#    好处：不会因为"顶刊"或"蹭到热词"就把一篇不相关的论文塞进邮件。
+#
+# 规则是一个字典，字段说明（写规则的地方就是这里和每个主题自己的 bonuses）：
+#   label   必填。显示名，会出现在邮件的加分明细里（如「固态电池 +1」）。
+#   score   必填。加几分。排除规则写 0（反正它只看"有没有命中"）。
+#   any     必填。命中其中**任意一个**短语就算命中。
+#   all     选填。必须**全部**命中才算命中（用来给规则加前提，例如"必须同时是钠电"）。
+#   unless  选填。只要命中其中任意一个就**不算命中**（用来挡掉误伤）。
+#   scope   选填。"all"（默认，标题+摘要）或 "title"（只看标题）。
+#           排除规则**默认只看标题**，见下面 EXCLUDE_RULES 的说明。
+#
+# 匹配方式：先把文本归一化（转小写、标点与连字符换成空格、压缩空格），
+#   再按「词首对齐」匹配短语。所以
+#     "Solid-state" / "solid state" / "solid—state" 都能被 "solid state" 命中，
+#     "solid state batter" 也能命中 "solid-state batteries"。
+#   ⚠️ 短语别写太短（< 4 个字符），否则容易误伤（例如 "na" 会命中 "nanowire"）。
+
+#: 所有主题共用的内容加分。
+BONUS_RULES: list[dict] = [
+    {
+        # 电池体系只要是固态路线就 +1
+        "label": "固态电池",
+        "score": 1,
+        "any": [
+            "solid state batter",
+            "solid state lithium",
+            "all solid state",
+            "solid state electrolyte",
+            "solid electrolyte",
+            "inorganic solid electrolyte",
+            "sulfide solid electrolyte",
+            "garnet electrolyte",
+            "llzo",
+            "argyrodite",
+            "nasicon",
+        ],
+    },
+    {
+        # 在"固态"基础上再 +1（累计 +2）→ 用 all 保证真的同时是固态 + 聚合物
+        "label": "固态聚合物电解质",
+        "score": 1,
+        "any": [
+            "solid polymer electrolyte",
+            "polymer solid electrolyte",
+            "solid state polymer electrolyte",
+            "polymer electrolyte",
+            "poly ethylene oxide",
+            "peo based",
+        ],
+        "all": ["solid"],
+        "unless": ["gel polymer", "gel electrolyte", "gelatin"],
+    },
+    {
+        # 无负极构型（含锂/钠，不限体系）
+        "label": "无负极",
+        "score": 3,
+        "any": ["anode free", "anodeless", "anode less", "zero excess", "hostless", "lithium free anode"],
+    },
+]
+
+#: 命中即**直接剔除**（不进 AI 打分、不进邮件）的规则。
+#:
+#: ⚠️ 排除规则默认**只看标题**（``scope`` 的默认值对排除规则是 ``"title"``）。
+#:    原因：摘要是 AI 生成的浓缩文本，"electrolyte additive" 这类词在**相关论文**里
+#:    也经常作为对比组出现，按摘要剔除会误杀。而这样的"漏网之鱼"本来就会被 AI 打低分，
+#:    所以宁可漏掉也不误杀。确实想看摘要就显式写 ``"scope": "all"``。
+EXCLUDE_RULES: list[dict] = [
+    {
+        "label": "电解液工程",
+        "score": 0,
+        "any": [
+            "electrolyte additive",
+            "electrolyte additives",
+            "electrolyte formulation",
+            "electrolyte engineering",
+            "electrolyte optimization",
+            "electrolyte design",
+            "solvation structure",
+            "solvent molecule",
+            "high concentration electrolyte",
+            "localized high concentration",
+            "electrolyte solvent",
+        ],
+        # 固态体系不误伤：命中这些词就放行
+        "unless": [
+            "solid state",
+            "all solid state",
+            "solid electrolyte",
+            "inorganic electrolyte",
+            "polymer electrolyte",
+        ],
+    },
+    {
+        "label": "隔膜改性",
+        "score": 0,
+        "any": [
+            "separator modification",
+            "modified separator",
+            "separator coating",
+            "coated separator",
+            "functional separator",
+            "separator design",
+            "separator engineering",
+            "ceramic coated separator",
+            "separator for",
+        ],
+    },
+]
+
+#: 全局排除说明。会拼进**每个主题**给 AI 看的描述里，让 AI 也避开这些方向。
+#: （与上面的 EXCLUDE_RULES 互补：那一条管"硬剔除"，这一句管"AI 打分时别给高分"。）
+GLOBAL_EXCLUDE_NOTE = (
+    "不看电解液工程（液态电解液添加剂 / 溶剂化结构 / 配方优化）与隔膜改性；"
+    "不计入凝胶电解质。"
+)
+
+
+def validate_rule_list(rules: object, group_name: str) -> list[str]:
+    """检查一组内容规则有没有写错（写错只会静默失效，比报错更难发现）。"""
+    problems: list[str] = []
+    if not isinstance(rules, list):
+        problems.append(f"{group_name} 必须是列表，现在是 {type(rules).__name__}")
+        return problems
+    for index, rule in enumerate(rules, start=1):
+        where = f"{group_name} 第 {index} 条"
+        if not isinstance(rule, dict):
+            problems.append(f"{where}必须是字典，现在是 {type(rule).__name__}")
+            continue
+        label = str(rule.get("label") or "").strip()
+        if not label:
+            problems.append(f'{where}缺少 "label"（显示名）')
+            label = where
+        patterns = [str(p).strip() for p in (rule.get("any") or []) if str(p).strip()]
+        if not patterns:
+            problems.append(f'「{label}」缺少非空的 "any"（命中列表）→ 这条规则永远不会生效')
+        for key in ("all", "unless"):
+            value = rule.get(key)
+            if value is not None and not isinstance(value, (list, tuple)):
+                problems.append(f'「{label}」的 "{key}" 必须是列表')
+        try:
+            int(rule.get("score") or 0)
+        except (TypeError, ValueError):
+            problems.append(f'「{label}」的 "score" 不是整数')
+    return problems
+
+
+def validate_content_rules() -> list[str]:
+    """检查全局的 ``BONUS_RULES`` / ``EXCLUDE_RULES``。"""
+    return validate_rule_list(BONUS_RULES, "BONUS_RULES") + validate_rule_list(
+        EXCLUDE_RULES, "EXCLUDE_RULES"
+    )
+
+
 # ===========================================================================
 # ★★★ 研究方向：换课题只需要改这一段 ★★★
 # ===========================================================================
@@ -234,6 +396,9 @@ TOPICS: dict[str, str] = {}
 #   key         选填。状态文件里的分区键，默认等于 name。
 #                    ⚠️ **改了 name 就会换一个新分区** → 该主题会被当成首次运行（30 天预热），
 #                       旧记录留在旧分区里不再生效。想改名又不想重跑，把 key 填成旧 name。
+#   bonuses     选填。**只对这个主题生效**的内容加分（写法同上面的 BONUS_RULES）。
+#   exclude     选填。**只对这个主题生效**的剔除规则（写法同上面的 EXCLUDE_RULES）。
+#                    全局的 BONUS_RULES / EXCLUDE_RULES 仍然照常生效，这里是叠加。
 #
 # 当前启用：两个方向（想回到单方向就把 RESEARCH_TOPICS 改回 []）
 RESEARCH_TOPICS: list[dict] = [
@@ -241,22 +406,74 @@ RESEARCH_TOPICS: list[dict] = [
         "name": "富锂锰正极",
         "topic_query": "lithium-rich manganese-based cathode",
         "keywords": [
+            # —— 材料本体 ——
+            "lithium-rich layered oxide (LRLO / LMR)",
             "Li-rich Mn-based cathode",
-            "lithium-rich layered oxide",
-            "voltage decay",
-            "anionic redox",
+            "Li1.2Mn0.54Ni0.13Co0.13O2 / Li2MnO3-LiMO2 composite",
+            "Mn-based layered oxide",
+            # —— 核心机理问题 ——
+            "anionic redox / oxygen redox",
+            "voltage decay / voltage hysteresis",
+            "cation disorder / Li-Ni mixing",
+            "lattice oxygen release / oxygen stability",
+            "surface reconstruction / layered-to-spinel phase transition",
+            # —— 改性手段 ——
+            "surface coating / doping of Li-rich cathode",
+            "electrode-electrolyte interphase on Li-rich cathode",
+            # —— 体系加成相关（AI 只当加分线索，真正的硬加分见 BONUS_RULES）——
+            "solid-state battery with Li-rich cathode",
         ],
+        "description": (
+            "只看富锂锰基层状氧化物正极（Li-rich / LRLO / LMR，含 Li2MnO3 组分）。"
+            "关注电压衰减、阴离子氧化还原、氧释放、表面重构等机理问题。"
+            "不含磷酸铁锂 / 三元 NCM / 富镍等其它正极体系。"
+        ),
     },
     {
-        "name": "无负极钠离子电池",
-        "topic_query": "anode-free sodium metal battery",
+        "name": "钠离子正极",
+        "topic_query": "sodium-ion battery cathode material",
         "keywords": [
-            "anode-free",
-            "sodium metal anode",
-            "sodium plating",
-            "sodiophilic",
+            # —— 材料体系（层状是重点，另有普鲁士蓝 / 聚阴离子）——
+            "sodium-ion battery cathode",
+            "layered sodium transition metal oxide (NaTMO2)",
+            "P2-type / O3-type layered oxide",
+            "Na0.67MnO2 / NaNi1/3Fe1/3Mn1/3O2 / NaNi0.5Mn0.5O2",
+            "Mn-based / Fe-Mn layered sodium cathode",
+            "Prussian blue analogue cathode",
+            "polyanion / NASICON cathode (Na3V2(PO4)3)",
+            # —— 关键问题 ——
+            "phase transition (P2-O2 / O3-P3) and cycling stability",
+            "air / moisture stability of sodium cathode",
+            "anionic redox in sodium layered oxide",
+            "Na-ion storage mechanism / Na+ diffusion kinetics",
+            # —— 改性手段 ——
+            "doping / surface coating of sodium cathode",
         ],
-        "description": "只关心无负极（anode-free）构型，不含常规硬碳负极体系",
+        "description": (
+            "只看钠离子电池**正极**材料：层状过渡金属氧化物（P2/O3 型）、"
+            "普鲁士蓝类似物、聚阴离子化合物。关注相变与循环稳定性、空气/水分稳定性、"
+            "阴离子氧化还原、Na+ 扩散动力学。不含硬碳等负极、不含电解液与隔膜工作。"
+        ),
+        # 层状钠离子正极是本主题的重点方向，额外加分
+        "bonuses": [
+            {
+                "label": "层状钠离子正极",
+                "score": 2,
+                "any": [
+                    "layered oxide cathode",
+                    "layered cathode",
+                    "layered transition metal oxide",
+                    "layered sodium",
+                    "layered na",
+                    "p2 type",
+                    "o3 type",
+                    "p3 type",
+                    "p2 o2",
+                    "o3 p3",
+                ],
+                "all": ["sodium"],
+            },
+        ],
     },
 ]
 
@@ -273,6 +490,9 @@ class ResearchTopic:
     title: str = ""
     #: 去重状态文件里的分区键。默认等于 name，改了 name 又想沿用旧记录时手工指定。
     key: str = ""
+    #: 只对本主题生效的内容加分 / 剔除规则（全局的 BONUS_RULES / EXCLUDE_RULES 照常叠加）。
+    bonuses: list[dict] = field(default_factory=list)
+    exclude: list[dict] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.name = (self.name or "").strip()
@@ -291,6 +511,10 @@ class ResearchTopic:
             lines.append(self.description.strip())
         if self.keywords:
             lines.append("关注关键词：" + "、".join(self.keywords))
+        # 全局排除说明（在文件顶部配置）——让 AI 打分时也避开这些方向
+        note = (GLOBAL_EXCLUDE_NOTE or "").strip()
+        if note:
+            lines.append(note)
         return "\n".join(lines)
 
 
@@ -329,6 +553,8 @@ def active_research_topics() -> list[ResearchTopic]:
             topics=dict(item.get("topics") or {}),
             title=str(item.get("title") or ""),
             key=str(item.get("key") or ""),
+            bonuses=[rule for rule in (item.get("bonuses") or []) if isinstance(rule, dict)],
+            exclude=[rule for rule in (item.get("exclude") or []) if isinstance(rule, dict)],
         )
         if not candidate.name:
             raise RuntimeError(f'RESEARCH_TOPICS 第 {index} 项缺少 "name"（主题显示名）')
@@ -484,7 +710,7 @@ def relevance_plan(mode: str = RETRIEVAL_MODE, topic: ResearchTopic | None = Non
     scoring = (
         f"AI 0-100 分、入选线 ≥ {AI_THRESHOLD} —— 尺子 = 「{view.name}」 + {keywords_desc}"
         + (" + 补充说明" if view.description.strip() else "")
-        + "；排序 = 最终分（AI 分 + 期刊档次加成）降序"
+        + "；排序 = 最终分（AI 分 + 期刊档次加成 + 内容加分）降序"
     )
     if topic is not None:
         # 多主题模式下，「改哪里」要落到这个主题自己的字典字段上，不然会去改全局常数
@@ -518,6 +744,7 @@ def _global_warnings(mode: str) -> list[str]:
             f"JOURNAL_TIERS 里的「{name}」没有写进 JOURNALS：这本刊永远不会被检索到，"
             "它的档次加成也就形同虚设"
         )
+    problems.extend(validate_content_rules())
     return problems
 
 
@@ -534,6 +761,8 @@ def _topic_warnings(mode: str, view: ResearchTopic) -> list[str]:
             f"topic 模式但 TOPIC_QUERY 为空且 TOPICS 未手工指定（主题「{view.name}」）："
             "解析不到主题 id，该主题会退化成无主题过滤（召回到全刊所有论文）"
         )
+    problems.extend(validate_rule_list(view.bonuses, f"主题「{view.name}」的 bonuses"))
+    problems.extend(validate_rule_list(view.exclude, f"主题「{view.name}」的 exclude"))
     return problems
 
 

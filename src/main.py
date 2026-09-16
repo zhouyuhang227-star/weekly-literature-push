@@ -44,7 +44,16 @@ import logging
 import sys
 import traceback
 
-from . import abstract_source, ai_matcher, config, dedup, mailer, openalex_client, ranking
+from . import (
+    abstract_source,
+    ai_matcher,
+    config,
+    content_rules,
+    dedup,
+    mailer,
+    openalex_client,
+    ranking,
+)
 from .config import (
     AI_THRESHOLD,
     ISSN_FILTER,
@@ -253,6 +262,8 @@ def show_config(args: argparse.Namespace) -> int:
         print(f"     TOPICS      {topic.topics or '（空 → 按 TOPIC_QUERY 自动解析）'}")
         print(f"     USER_KEYWORDS {list(topic.keywords) or '（空）'}")
         print(f"     补充说明    {topic.description.strip() or '（未设置）'}")
+        print(f"     主题加分    {content_rules.describe_bonuses(topic)}")
+        print(f"     主题剔除    {content_rules.describe_excludes(topic)}")
         print(f"     去重分区键  {topic.key}")
     print(f"  期刊            {len(ISSN_FILTER.split('|'))} 本")
     print(
@@ -266,6 +277,8 @@ def show_config(args: argparse.Namespace) -> int:
         + " ｜ ".join(f"{tier} +{bonus}" for tier, bonus in ranking.tiers())
         + " ｜ 其它 +0"
     )
+    print(f"  内容加分（全局）{content_rules.describe_bonuses()}")
+    print(f"  剔除规则（全局）{content_rules.describe_excludes()}（只看标题）")
     print(f"  本轮检索模式    {mode}")
     print("-" * 68)
     for index, topic in enumerate(topics, start=1):
@@ -288,6 +301,7 @@ def show_config(args: argparse.Namespace) -> int:
     print("  想换「能搜到什么」        → 改 RETRIEVAL_MODE / RESEARCH_TOPICS[].topic_query")
     print("  想换「搜到的里面留下什么」 → 改 RESEARCH_TOPICS[].keywords / description")
     print("  想换「期刊权重」          → 改 JOURNAL_TIERS（顺序即权重顺序）")
+    print("  想换「内容加权 / 不看什么」→ 改 BONUS_RULES / EXCLUDE_RULES，或主题的 bonuses / exclude")
     print("  想换「有哪些主题」        → 改 RESEARCH_TOPICS（空 = 回到单方向模式）")
     print("  真正解析出的主题 id 要看联网日志：python -m src.main --dry-run -v")
     print()
@@ -350,6 +364,7 @@ def run(args: argparse.Namespace) -> int:
         log.info("【主题 %s/%s】%s（邮件标题：%s）", index, len(topics), topic.name, topic.email_title)
         for label, detail in relevance_plan(mode, topic):
             log.info("  【%s】%s", label, detail)
+        log.info("  【内容】%s", content_rules.summary(topic))
     log.info("【排序】%s", ranking.describe())
     if keywords:
         if len(topics) > 1:
@@ -454,6 +469,13 @@ def run_topic(
     if fresh:
         fresh = abstract_source.enrich_abstracts(fresh)
 
+    # ---- 5.5 内容规则剔除（不看电解液工程 / 隔膜改性）----
+    # 放在 AI 之前：被剔除的文献不进 AI 打分（省钱），也不进邮件。
+    excluded: list[dict] = []
+    if fresh:
+        fresh, excluded = content_rules.partition_excluded(fresh, topic)
+        content_rules.log_excluded(excluded, topic, prefix=prefix)
+
     # ---- 6. AI 打分（第 2 层筛选：语义相关性）----
     ai_failed: list[dict] = []
     rejected: list[dict] = []
@@ -469,8 +491,8 @@ def run_topic(
             fresh, keywords=keywords, threshold=args.threshold, topic=topic
         )
 
-    # ---- 6.5 期刊档次加权排序：最终分 = AI 分 + 期刊加成 ----
-    selected = ranking.rank(selected)
+    # ---- 6.5 加权排序：最终分 = AI 分 + 期刊档次加成 + 内容规则加成 ----
+    selected = ranking.rank(selected, topic)
     if selected:
         top = selected[0]
         log.info(
@@ -488,6 +510,7 @@ def run_topic(
         first_run=first_run,
         total_candidates=total_candidates,
         after_dedup=after_dedup,
+        excluded=len(excluded),
         ai_failed=len(ai_failed),
         title=topic.email_title,
         max_items=args.max_items,
@@ -498,6 +521,7 @@ def run_topic(
         "name": topic.name,
         "candidates": total_candidates,
         "after_dedup": after_dedup,
+        "excluded": len(excluded),
         "selected": len(selected),
         "shown": min(len(selected), args.max_items),
         "mailed": 0,
@@ -509,7 +533,13 @@ def run_topic(
         path = mailer.save_preview(html_body, run_date, OUTBOX_DIR, suffix=suffix)
         log.info("%s[dry-run] 未发送邮件、未修改去重状态；预览文件：%s", prefix, path)
         _log_summary(
-            topic.name, total_candidates, after_dedup, len(selected), len(ai_failed), dry_run=True
+            topic.name,
+            total_candidates,
+            after_dedup,
+            len(selected),
+            len(ai_failed),
+            dry_run=True,
+            excluded=len(excluded),
         )
         return stats
 
@@ -552,7 +582,13 @@ def run_topic(
         max(0, len(selected) - len(shown)),
     )
     _log_summary(
-        topic.name, total_candidates, after_dedup, len(shown), len(ai_failed), dry_run=False
+        topic.name,
+        total_candidates,
+        after_dedup,
+        len(shown),
+        len(ai_failed),
+        dry_run=False,
+        excluded=len(excluded),
     )
     return stats
 
@@ -564,13 +600,15 @@ def _log_summary(
     selected: int,
     ai_failed: int,
     dry_run: bool,
+    excluded: int = 0,
 ) -> None:
     log.info("-" * 68)
     log.info(
-        "运行摘要（%s）：候选 %s 篇 → 去重后 %s 篇 → 入选 %s 篇%s%s",
+        "运行摘要（%s）：候选 %s 篇 → 去重后 %s 篇%s → 入选 %s 篇%s%s",
         topic_name,
         candidates,
         after_dedup,
+        f"（规则剔除 {excluded} 篇）" if excluded else "",
         selected,
         f"（AI 失败 {ai_failed} 篇）" if ai_failed else "",
         "（dry-run，未发送）" if dry_run else "",
@@ -583,10 +621,11 @@ def _log_overall(stats: list[dict], failures: list[str], total_topics: int, dry_
     log.info("=" * 68)
     for item in stats:
         log.info(
-            "【%s】候选 %s → 去重后 %s → 入选 %s%s",
+            "【%s】候选 %s → 去重后 %s%s → 入选 %s%s",
             item["name"],
             item["candidates"],
             item["after_dedup"],
+            f"（规则剔除 {item['excluded']} 篇）" if item.get("excluded") else "",
             item["selected"],
             "" if dry_run else f" → 已发邮件 {item['mailed']} 封",
         )
@@ -600,10 +639,26 @@ def _log_overall(stats: list[dict], failures: list[str], total_topics: int, dry_
     log.info("=" * 68)
 
 
+def _force_utf8_streams() -> None:
+    """把 stdout/stderr 切到 UTF-8。
+
+    只在**本地把输出重定向到文件**时才有影响：Windows 控制台默认 GBK，
+    而 ``--show-config`` 会打印 ℹ️ ⚠️ 这类符号，重定向后 ``print`` 会直接
+    ``UnicodeEncodeError`` 崩掉（GitHub Actions 上是 UTF-8，不受影响）。
+    拿不到 ``reconfigure``（例如测试里的 ``io.StringIO``）就安静跳过。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+        except (AttributeError, ValueError):  # pragma: no cover - 环境相关
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    _force_utf8_streams()
     setup_logging(verbose=args.verbose)
 
     try:

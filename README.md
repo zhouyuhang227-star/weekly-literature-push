@@ -10,7 +10,7 @@
 > `RESEARCH_FIELD` / `RESEARCH_DESCRIPTION` / `USER_KEYWORDS` / `TOPIC_QUERY`），代码不用动。
 > 详见 [如何换研究方向](#如何换研究方向)。
 
-> **当前已开启多主题**：同时跟了两个方向 —— 「富锂锰正极」+「无负极钠离子电池」，
+> **当前已开启多主题**：同时跟了两个方向 —— 「富锂锰正极」+「钠离子正极」，
 > **每个主题各检索、各打分、各发一封邮件、各记各的已推送记录**。
 > 详见 [多主题调研](#多主题调研)。
 
@@ -23,8 +23,14 @@
 
 > AI **不负责关键词匹配**。它拿到的是第 1 层已经筛过的候选集，再做一轮语义相关性打分。
 
-入选后的**排序**会按期刊档次加权：`最终分 = AI 相关性分 + 期刊加成`
-（正刊 +12 > 大子刊 +9 > Joule +7 > 小子刊 +5 > JACS +4 > Angew +3 > AM +2 > 其他 +0）。
+入选后的**排序**叠两层加成：`最终分 = AI 相关性分 + 期刊档次加成 + 内容规则加成`
+
+- **期刊档次加成**：正刊 +12 > 大子刊 +9 > Joule +7 > 小子刊 +5 > JACS +4 > Angew +3 > AM +2 > 其他 +0
+- **内容规则加成**（按关键词命中，只看标题+摘要）：固态电池 +1 ｜ 固态聚合物电解质 +1 ｜
+  无负极 +3 ｜ 层状钠离子正极 +2（仅「钠离子正极」主题）
+
+> 两种加成**只管排序，不管入选** —— 是否进邮件依旧只看 AI 分数是否过 `AI_THRESHOLD`。
+> 详见 [内容加权](#内容加权bonus_rules--exclude_rules)。
 
 - 检索：**OpenAlex**（无需 API Key，免费）
 - 筛选：任意 **OpenAI 兼容** 的 AI 接口（默认 DeepSeek `deepseek-chat`）
@@ -44,11 +50,12 @@
 │   ├── openalex_client.py              # 第 1 层检索：拼查询 + 分页 + 解析 + 主题自动解析
 │   ├── abstract_source.py              # 摘要三级回退：OpenAlex → Crossref → S2
 │   ├── ai_matcher.py                   # 第 2 层：AI 并发打分 + 稳健 JSON 解析
-│   ├── ranking.py                      # 期刊档次加权 + 最终分排序
+│   ├── content_rules.py                # 内容加分 / 剔除规则（固态、无负极、层状钠…）
+│   ├── ranking.py                      # 期刊档次 + 内容加分 → 最终分排序
 │   ├── dedup.py                        # DOI 去重 + 运行状态持久化（按主题分区）
 │   ├── mailer.py                       # HTML 渲染 + SMTP 发送
 │   └── main.py                         # 主流程编排（多主题循环）+ 命令行
-├── tests/test_core.py                  # 98 个单元测试（锁定高风险修复）
+├── tests/test_core.py                  # 135 个单元测试（锁定高风险修复）
 ├── data/
 │   ├── pushed_dois.json                # 去重状态（唯一需要提交的文件）
 │   ├── topics_cache.json               # 语义主题解析缓存（已 gitignore，自动重建）
@@ -278,7 +285,7 @@ python -m src.main [选项]
 | `--lookback-days N` | 临时覆盖时间窗天数，如 `--lookback-days 90` 回补三个月 |
 | `--max-items N` | 单封邮件最多展示篇数（默认 20） |
 | `--max-fetch N` | 最多拉取候选文献数（默认 300） |
-| `--topic NAME` | 只跑指定主题（可重复，如 `--topic 富锂锰正极 --topic 无负极钠离子电池`），匹配主题的 `name` 或 `key`；省略则跑全部 |
+| `--topic NAME` | 只跑指定主题（可重复，如 `--topic 富锂锰正极 --topic 钠离子正极`），匹配主题的 `name` 或 `key`；省略则跑全部 |
 | `--threshold N` | AI 相关性阈值，低于此值不展示（默认 60） |
 | `--keywords "a;b"` | 临时覆盖研究方向（`topic` 模式下用作 **AI 打分标准**，不参与检索） |
 | `--show-config` | 只打印「靠什么召回 / 靠什么打分」然后退出，**纯离线、不联网、不跑主流程**。改完配置拿不准改动落在哪一层时先跑它 |
@@ -452,9 +459,9 @@ AI 打分失败时卡片会打 `AI 打分失败` 标签，且该文献仍会展�
 
 ```
 ┌──────────────────────────────────────────────┐
-│ Joule · 2026-09-10              最终 77 分    │
-│ Joule +7（AI 70）                            │
-│ 依据：标题（摘要缺失）                        │
+│ Joule · 2026-09-10              最终 82 分    │
+│ Joule +7（AI 70）  固态电池 +1  无负极 +3     │
+│ 依据：标题 + 摘要                             │
 │ 全固态电池界面阻抗的定量表征                  │
 │ ├ 一句话结论：用原位 EIS 量化了界面阻抗主导因素 │
 │ └ 判断理由：直接研究固态电池界面，方法与结论均相关 │
@@ -463,12 +470,14 @@ AI 打分失败时卡片会打 `AI 打分失败` 标签，且该文献仍会展�
 ```
 
 - 邮件主题：多主题下**每个主题一封**，形如 `富锂锰正极顶刊周报 · 2026-09-16 · 8 篇`、
-  `无负极钠离子电池顶刊周报 · 2026-09-16 · 3 篇`（前缀由主题的 `title` 或 `<name>顶刊周报` 决定；
+  `钠离子正极顶刊周报 · 2026-09-16 · 3 篇`（前缀由主题的 `title` 或 `<name>顶刊周报` 决定；
   单方向时用 `EMAIL_TITLE`，即 `固态电池顶刊周报 · …`）
 - 单封最多 20 篇，候选多于 20 篇时按**最终分降序**取舍，超出部分显示「另有 N 篇…」，
   避免 Gmail 102KB 截断
-- 有期刊加成的论文：右上角显示 `最终 77 分`（而不是 `AI 70 分`），
-  并多一个 `Joule +7（AI 70）` 标签，让你一眼看出它排在前面的原因
+- 有加成的论文：右上角显示 `最终 82 分`（而不是 `AI 70 分`），
+  并多出浅色标签 `Joule +7（AI 70）`、`固态电池 +1`、`无负极 +3`，让你一眼看出它排在前面的原因
+- 被剔除规则（见下）丢掉的论文**不会进邮件**，但在页头会显示 `规则剔除 N 篇`，
+  不至于让你以为漏了东西
 - **0 篇结果时也会发一封"心跳邮件"**（主题为 `… · 本周无新文献`），让你知道任务还活着，而不是静默失败
 - 所有插入到 HTML 的字段都经过转义（标题里的 `<script>` 不会被执行）
 - 同时生成纯文本副本，兼容不显示 HTML 的客户端
@@ -509,7 +518,7 @@ AI 打分失败时卡片会打 `AI 打分失败` 标签，且该文献仍会展�
 >
 > ```
 > 【召回层】topic（语义主题）—— 由 TOPIC_QUERY='lithium-rich manganese-based cathode' 解析出的 topics.id 决定，USER_KEYWORDS 不参与
-> 【打分层】AI 0-100 分、入选线 ≥ 60 —— 尺子 = 「富锂锰正极」 + 关注关键词 4 个；排序 = 最终分（AI 分 + 期刊档次加成）降序
+> 【打分层】AI 0-100 分、入选线 ≥ 60 —— 尺子 = 「富锂锰正极」 + 关注关键词 12 个 + 补充说明；排序 = 最终分（AI 分 + 期刊档次加成 + 内容加分）降序
 > 【提示】topic 模式下改 USER_KEYWORDS 不会改变候选量，它只当 AI 的打分尺子。……（多主题模式：改 RESEARCH_TOPICS 里「富锂锰正极」的 topic_query / keywords）
 > ```
 >
@@ -529,6 +538,7 @@ AI 打分失败时卡片会打 `AI 打分失败` 标签，且该文献仍会展�
 | **同时跑几个方向** | **`RESEARCH_TOPICS`** | — |
 | **期刊** | **`JOURNALS`** | — |
 | **期刊权重**（顶刊加多少分） | **`JOURNAL_TIERS`** | — |
+| **内容加分 / 不看什么** | **`BONUS_RULES`** / **`EXCLUDE_RULES`**（或主题的 `bonuses` / `exclude`） | — |
 | 评分阈值 / 并发 / 时间窗 | `AI_THRESHOLD` / `AI_MAX_WORKERS` / `LOOKBACK_DAYS` | — |
 | 密钥、AI 供应商、收件人 | **GitHub Secrets**，改完即生效，**不用改代码也不用 push** | — |
 
@@ -549,7 +559,7 @@ python -m src.main --dry-run --no-ai --verbose
 `push.cmd`（实际逻辑在 `push.ps1`）会依次做 5 件事：
 
 1. 检查待提交文件，**拦住 `.env` 等敏感文件**（推上去就泄露了，而且删掉也仍留在 git 历史里）
-2. 跑全部单元测试（当前 98 个），**不通过就中止**（配置改错了根本推不上去）
+2. 跑全部单元测试（当前 135 个），**不通过就中止**（配置改错了根本推不上去）
 3. `fetch` + `rebase` ← **关键，见下方说明**
 4. `push`，失败自动重试 4 次（`github.com` 在国内时通时不通）
 5. 校验远程 commit 和本地是否一致
@@ -706,12 +716,12 @@ ISSN 可在 [OpenAlex Sources](https://openalex.org/sources) 或期刊官网查�
 
 <a id="多主题调研" name="多主题调研"></a>
 
-想同时跟两个以上方向（例如「富锂锰正极」+「无负极钠离子电池」），
+想同时跟两个以上方向（例如「富锂锰正极」+「钠离子正极」），
 就在 `src/config.py` 里的 `RESEARCH_TOPICS` 里填 —— **每个主题各检索、各打分、各发一封邮件**。
 
 > **当前已启用两个主题**：「富锂锰正极」（分区键 `富锂锰正极`）和
-> 「无负极钠离子电池」（分区键 `无负极钠离子电池`）。
-> 旧的 161 条记录（固态电池方向）已被保留在 `固态电池` 分区里，**不再参与去重**，
+> 「钠离子正极」（分区键 `钠离子正极`）。
+> 旧的 161 条记录（旧「固态电池」方向）已被保留在 `固态电池` 分区里，**不再参与去重**，
 > 这两个新主题因此都会被当成首次运行 —— **第一封邮件覆盖 30 天**，之后回到 14 天。
 > 运行日志里的「使用 30 天窗口」就是这个原因，不是配置错了。
 
@@ -721,12 +731,18 @@ RESEARCH_TOPICS: list[dict] = [
         "name": "富锂锰正极",
         "topic_query": "lithium-rich manganese-based cathode",   # 第 1 层召回
         "keywords": ["Li-rich Mn-based cathode", "voltage decay", "anionic redox"],
+        "description": "只看富锂锰基层状氧化物正极（LRLO / LMR），不含磷酸铁锂 / 三元 NCM",
     },
     {
-        "name": "无负极钠离子电池",
-        "topic_query": "anode-free sodium metal battery",
-        "keywords": ["anode-free", "sodium metal anode", "sodiophilic"],
-        "description": "只关心无负极（anode-free）构型，不含常规硬碳负极体系",
+        "name": "钠离子正极",
+        "topic_query": "sodium-ion battery cathode material",
+        "keywords": ["layered sodium transition metal oxide", "P2-type", "O3-type", "NASICON"],
+        "description": "只看钠离子正极（层状 / 普鲁士蓝 / 聚阴离子），不含硬碳等负极",
+        # ↓ 只对这一个主题生效的加分：层状钠离子正极 +2
+        "bonuses": [
+            {"label": "层状钠离子正极", "score": 2,
+             "any": ["layered oxide cathode", "p2 type", "o3 type"], "all": ["sodium"]},
+        ],
     },
 ]
 ```
@@ -737,6 +753,8 @@ RESEARCH_TOPICS: list[dict] = [
 | `topic_query` | ✅ | 第 1 层召回用的语义主题短语（= 单方向模式里的 `TOPIC_QUERY`） |
 | `keywords` | ✅ | 第 2 层 AI 的打分尺（= 单方向模式里的 `USER_KEYWORDS`） |
 | `description` | — | 补充「要什么 / 不要什么」，AI 判不准时最有效的一招 |
+| `bonuses` | — | **只对本主题生效**的加分规则，写法同全局 `BONUS_RULES`（见 [内容加权](#内容加权bonus_rules--exclude_rules)） |
+| `exclude` | — | **只对本主题生效**的剔除规则，写法同全局 `EXCLUDE_RULES` |
 | `title` | — | 邮件标题前缀，默认是「`<name>`顶刊周报」 |
 | `topics` | — | 手工锁定主题 id，格式同 `TOPICS`；留空则按 `topic_query` 自动解析 |
 | `key` | — | 状态文件里的分区键，默认等于 `name`（下面「改名字」一段有说明） |
@@ -746,7 +764,8 @@ RESEARCH_TOPICS: list[dict] = [
 | 现象 | 说明 |
 |---|---|
 | 填了 `RESEARCH_TOPICS` 后，`RESEARCH_FIELD` / `USER_KEYWORDS` / `TOPIC_QUERY` / `TOPICS` / `RESEARCH_DESCRIPTION` 不再生效 | 每个主题改用自己字典里的字段。程序会在日志里以 `配置说明：` 提示（INFO 级，不是报错） |
-| **同一篇论文可能同时出现在两个主题的邮件里** | 去重是**按主题分区**的：`data/pushed_dois.json` 里每个主题各一份已推 DOI 列表。两个方向的交叉论文（比如同时讲钠电与无负极）都该看到 |
+| **同一篇论文可能同时出现在两个主题的邮件里** | 去重是**按主题分区**的：`data/pushed_dois.json` 里每个主题各一份已推 DOI 列表。两个方向的交叉论文（比如同时讲钠电与层状氧化物）都该看到 |
+| 主题跨领域时期刊也不同 | 期刊列表 `JOURNALS` 是**全局共用**的；现在两个主题都属电池方向，所以一张表就够了 |
 | `name` 改了，该主题突然又推了 30 天的旧文章 | 分区键默认是 `name`，改名 = 换了一个新分区 → 被视为首次运行（30 天预热）。想改名又不重推，把 `key` 填成旧 `name` |
 | 某个主题挂掉，其它主题照常发信 | 单个主题异常不会连累其余主题；但最终 Actions 仍会变红，避免静默漏推 |
 | 想看每个主题各自的分区情况 | 每次运行开头会打印 `【状态】去重库分区 {...}` |
@@ -755,7 +774,7 @@ RESEARCH_TOPICS: list[dict] = [
 
 ```bash
 python -m src.main --dry-run --topic 富锂锰正极
-python -m src.main --topic 富锂锰正极 --topic 无负极钠离子电池
+python -m src.main --topic 富锂锰正极 --topic 钠离子正极
 ```
 
 > `--topic` 匹配 `name` 或 `key`，传错会直接报错并列出可用主题，不会默默跑全部。
@@ -774,7 +793,7 @@ python -m src.main --topic 富锂锰正极 --topic 无负极钠离子电池
   "schema_version": 2,
   "topics": {
     "富锂锰正极": ["10.1016/j.joule.2026.102680"],
-    "无负极钠离子电池": ["10.1016/j.joule.2026.102680"]
+    "钠离子正极": ["10.1016/j.joule.2026.102680"]
   },
   "last_run": "2026-09-16"
 }
@@ -794,7 +813,7 @@ python -m src.main --topic 富锂锰正极 --topic 无负极钠离子电池
 
 ### 期刊权重（`JOURNAL_TIERS`）
 
-入选后按**最终分**降序排列：`最终分 = AI 相关性分 + 期刊档次加成`。
+入选后按**最终分**降序排列：`最终分 = AI 相关性分 + 期刊档次加成 + 内容规则加成`。
 
 | 档次 | 加成 | 期刊 |
 |---|---|---|
@@ -816,6 +835,68 @@ python -m src.main --topic 富锂锰正极 --topic 无负极钠离子电池
 - 改权重就改 `JOURNAL_TIERS` 里的数字，**字典书写顺序就是高低顺序**。
 - 增删档次里的期刊时，**务必同步改 `JOURNALS`** —— 不在 `JOURNALS` 里的刊根本不会被检索到，
   档次写在那里也白写（程序会在 `--show-config` 里提醒）。
+
+### 内容加权（`BONUS_RULES` / `EXCLUDE_RULES`）
+
+<a id="内容加权bonus_rules--exclude_rules" name="内容加权bonus_rules--exclude_rules"></a>
+
+这是叠在期刊档次之上的**第二层加成**，也是「不看什么」的开关。都在 `src/config.py`：
+
+| 变量 | 作用 | 当前配置 |
+|---|---|---|
+| `BONUS_RULES` | 命中关键词就**加分**（全局，对所有主题生效） | 固态电池 **+1** ｜ 固态聚合物电解质 **+1** ｜ 无负极 **+3** |
+| `EXCLUDE_RULES` | 命中关键词就**直接从候选里剔掉**（默认只看标题） | 电解液工程 ｜ 隔膜改性 |
+| `GLOBAL_EXCLUDE_NOTE` | 一段中文说明，拼进**每个主题的 AI 打分尺** | 「不看电解液工程…与隔膜改性；不计入凝胶电解质。」 |
+| 主题里的 `bonuses` / `exclude` | 只对那一个主题生效，与全局规则**叠加** | 「钠离子正极」额外有 层状钠离子正极 **+2** |
+
+**规则怎么写**（一个规则就是一个字典）：
+
+```python
+{
+    "label": "固态电池",              # ← 邮件标签上显示的名字
+    "score": 1,                       # ← 加多少分；剔除规则里 score 不生效（可省略）
+    "any":  ["solid state batter", "llzo", "argyrodite"],  # 命中任意一个
+    "all":  ["sodium"],               # 必须同时命中（可选）
+    "unless": ["gel polymer"],        # 命中这些就撤销（可选）
+    "scope": "all",                   # "all" = 标题+摘要（默认）；"title" = 只看标题
+}
+```
+
+匹配细节（都有回归测试盯着）：
+
+- **忽略大小写与标点**：`Solid-State Battery`、`solid_state_battery` 都算中 `solid state batter`
+- **自动加词边界**：写 `p2 type` 不会误命中 `sp2 typewriter`
+- ⚠️ **短语别短于 4 个字符** —— 写 `na` 会命中 `nanowire`。程序会在 `--show-config` 里对过短的
+  pattern 报警（这也是「层状钠离子正极」要额外加 `all: ["sodium"]` 的原因）
+
+**两个刻意设计，别当成 bug：**
+
+1. **加成只管排序，不管入选。** 是否进邮件依旧只看 AI 分是否过 `AI_THRESHOLD`；
+   真正不想要的内容用 `EXCLUDE_RULES` 剔掉，而不是靠给低分。
+2. **剔除规则默认只看标题（`scope: "title"`）。** 因为一篇**相关**的论文在摘要里
+   常常把 `electrolyte additive` 当对照写进去，只看全文会把好文章误杀；
+   只看标题只会漏网几个，而漏网的 AI 分数不高，本来也进不了邮件。
+3. **加分可以叠加。** `固态电池 +1` 与 `固态聚合物电解质 +1` 可同时命中 → 一共 +2 分。
+   所以「固态聚合物电解质」在配置里只需写 `all: ["solid"]`，不用重复列所有写法。
+4. **凝胶电解质不算固态。** 两个规则都挂了 `unless: ["gel polymer", "gel electrolyte", "gelatin"]`，
+   避免把凝胶/半固态当成全固态抬分。
+
+**什么时候该动它**：
+
+| 你的想法 | 改哪里 |
+|---|---|
+| 「固态电池的文献请往前排」 | `BONUS_RULES` 里的 `score` |
+| 「无负极不属于我方向，别加分了」 | 删掉 `BONUS_RULES` 里那一条 |
+| 「只看层状钠离子正极」 | 改「钠离子正极」主题的 `description` + 给其它类型更低分 |
+| 「电解液工程、隔膜改性的文章直接别给我」 | `EXCLUDE_RULES`（同时在 `GLOBAL_EXCLUDE_NOTE` 里说一句给 AI） |
+| 「剔除规则误杀了」 | 给那条规则加 `"scope": "title"`（默认就是）或写 `unless` 白名单 |
+
+> 改完跑 `python -m src.main --show-config`，能直接看到
+> `内容加分（全局）…`、`剔除规则（全局）…（只看标题）` 与每个主题的 `主题加分 / 主题剔除`。
+> 规则写错了（比如 `any` 是空的、缺 `label`）会在这一屏里报 ⚠️，不会默默不生效。
+
+> 被剔除的论文数量会写进邮件页头（`规则剔除 N 篇`）与运行日志，所以「候选有 200 篇但只推了 8 篇」
+> 能分清是 AI 刷掉的还是规则剔掉的。
 
 ### 改检索模式（第 1 层 = 旋钮 A）
 
@@ -929,7 +1010,7 @@ on:
 ## 本地开发
 
 ```bash
-# 跑测试（98 个）
+# 跑测试（135 个）
 python -m unittest discover -s tests -v
 
 # 语法检查
@@ -956,6 +1037,9 @@ python -m src.main --to your@email.com --lookback-days 7
 - AI 返回的字符串分数必须转成 `int`（回归测试）
 - HTML 转义（`<script>` 必须变成 `&lt;script&gt;`）
 - **期刊加成只能影响排序，不能影响入选**；同分时先看 AI 真实分（回归测试）
+- **内容加分 / 剔除规则**：固态 +1、固态聚合物电解质再 +1（可叠加）、无负极 +3、
+  凝胶不算固态；剔除规则只看标题、不误杀「全固态电池里的电解液添加剂」（回归测试）
+- 规则写错（空 `any` / 缺 `label` / 分数非法）必须能在 `--show-config` 里报出来（回归测试）
 - **期刊档次必须能通过 ISSN 命中**：OpenAlex 返回的刊名与配置写法不同
   （`Angewandte Chemie International Edition` vs `Angewandte Chemie Int. Ed.`），
   且 `Advanced Functional Materials` 不得被当成 `Advanced Materials`（回归测试）

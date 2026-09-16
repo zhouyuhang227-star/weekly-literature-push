@@ -21,7 +21,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src import abstract_source, ai_matcher, config, dedup, mailer  # noqa: E402
+from src import abstract_source, ai_matcher, config, content_rules, dedup, mailer  # noqa: E402
 from src import main as main_module  # noqa: E402
 from src import openalex_client, ranking  # noqa: E402
 from src.openalex_client import (  # noqa: E402
@@ -145,7 +145,14 @@ class TestResearchDirectionIsConfigurable(unittest.TestCase):
     def setUp(self):
         self._saved = {
             name: getattr(config, name)
-            for name in ("RESEARCH_FIELD", "RESEARCH_DESCRIPTION", "USER_KEYWORDS")
+            for name in (
+                "RESEARCH_FIELD",
+                "RESEARCH_DESCRIPTION",
+                "USER_KEYWORDS",
+                # 全局排除说明是**用户配置**（会拼进 prompt），不算模板里写死的学科词，
+                # 所以这里要保存/恢复，下面的"无写死示例"测试会把它清空。
+                "GLOBAL_EXCLUDE_NOTE",
+            )
         }
 
     def tearDown(self):
@@ -170,11 +177,24 @@ class TestResearchDirectionIsConfigurable(unittest.TestCase):
         self.assertIn("perovskite solar cell", prompt)
 
     def test_user_prompt_has_no_hardcoded_score_examples(self):
-        """评分档位里的"固态电解质、锂金属负极"这类示例必须已经清除。"""
+        """评分档位里的"固态电解质、锂金属负极"这类示例必须已经清除。
+
+        注意：这里也要把 ``GLOBAL_EXCLUDE_NOTE`` 清空 —— 那是用户能在 config 里改的
+        配置文本（会拼进 prompt），不是模板里写死的学科词。
+        """
         config.USER_KEYWORDS = ["perovskite solar cell"]
+        config.GLOBAL_EXCLUDE_NOTE = ""
         prompt = ai_matcher.build_prompt({"title": "T"}, None)
         for stale in ("固态电解质", "锂金属负极", "液态电解液", "钠离子电池"):
             self.assertNotIn(stale, prompt)
+
+    def test_global_exclude_note_reaches_the_prompt(self):
+        """全局排除说明要真的进到 AI 的尺子里（不然 AI 不知道你要避开什么）。"""
+        config.USER_KEYWORDS = ["x"]
+        config.RESEARCH_DESCRIPTION = ""
+        config.GLOBAL_EXCLUDE_NOTE = "不看隔膜改性"
+        prompt = ai_matcher.build_prompt({"title": "T"}, None)
+        self.assertIn("不看隔膜改性", prompt)
 
     def test_explicit_keywords_override_config_brief(self):
         config.RESEARCH_DESCRIPTION = "不应出现在这里"
@@ -1172,6 +1192,64 @@ class TestMultiTopicOrchestration(unittest.TestCase):
         self.assertIn("最终 77 分", html_body)  # 70（AI）+ 7（Joule）
         self.assertIn("Joule +7（AI 70）", html_body)
 
+    def test_rule_excluded_work_never_reaches_the_email(self):
+        """被内容规则剔除的文献：不进 AI、不进邮件、不进去重库。"""
+
+        def fetch(keywords, lookback_days, max_works=None, mode=None, topic=None, **_kw):
+            self.fetched.append(topic.name)
+            return [
+                dict(self.WORKS[0]),
+                {
+                    "doi": "10.1/sep",
+                    "openalex_id": "W2",
+                    "title": "Separator modification for lithium-sulfur batteries",
+                    "journal": "Joule",
+                    "issn": "2542-4351",
+                    "pub_date": "2026-09-02",
+                    "abstract": "abstract text",
+                    "doi_url": "https://doi.org/10.1/sep",
+                },
+            ]
+
+        args = main_module.build_parser().parse_args(["--topic", "富锂锰正极"])
+        with patch.object(main_module, "validate_env", lambda **_kw: None), patch.object(
+            main_module.openalex_client, "fetch_works", side_effect=fetch
+        ), patch.object(
+            main_module.abstract_source, "enrich_abstracts", side_effect=lambda works: works
+        ), patch.object(
+            main_module.ai_matcher, "evaluate_works", side_effect=self._fake_eval
+        ), patch.object(
+            main_module.mailer,
+            "send_mail",
+            side_effect=lambda subject, html_body, plain_body, recipients=None: self.sent.append(
+                (subject, html_body)
+            ),
+        ):
+            self.assertEqual(main_module.run(args), 0)
+
+        _, html_body = self.sent[0]
+        self.assertIn("10.1/shared", html_body)
+        self.assertNotIn("10.1/sep", html_body)
+        self.assertIn("规则剔除 1 篇", html_body)
+        self.assertEqual(dedup.load_pushed("富锂锰正极"), {"10.1/shared"})
+
+    def test_show_config_lists_content_rules(self):
+        from src import main as main_module
+
+        args = main_module.build_parser().parse_args(["--show-config"])
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            main_module.show_config(args)
+
+        text = buffer.getvalue()
+        # 「靠什么排序 / 靠什么剔除」也要能离线看到，不然改规则全靠猜
+        self.assertIn("内容加分（全局）", text)
+        self.assertIn("固态电池 +1", text)
+        self.assertIn("无负极 +3", text)
+        self.assertIn("剔除规则（全局）", text)
+        self.assertIn("电解液工程", text)
+        self.assertIn("隔膜改性", text)
+
     def test_show_config_lists_every_topic(self):
         from src import main as main_module
 
@@ -1189,6 +1267,249 @@ class TestMultiTopicOrchestration(unittest.TestCase):
         # 多主题下那五项常数已不生效：只给 INFO 说明，不再对它们报警
         self.assertIn("已配置 RESEARCH_TOPICS", text)
         self.assertNotIn("USER_KEYWORDS 为空", text)
+
+
+class TestContentBonusRules(unittest.TestCase):
+    """内容加分：固态电池 +1、固态聚合物电解质再 +1、无负极 +3。
+
+    规则本身写在 ``config.BONUS_RULES`` 里，这里锁的是**行为**：
+    归一化怎么写、能不能叠加、凝胶电解质会不会被误判。
+    """
+
+    def test_normalize_flattens_case_and_punctuation(self):
+        self.assertEqual(
+            content_rules.normalize("All-Solid-State—Battery!"), "all solid state battery"
+        )
+        self.assertEqual(content_rules.normalize("P2-type  cathode"), "p2 type cathode")
+        self.assertEqual(content_rules.normalize(None), "")
+
+    def test_solid_state_paper_gets_one_point(self):
+        work = {"title": "All-solid-state lithium batteries with a sulfide electrolyte"}
+        self.assertEqual(content_rules.bonus_score(work), 1)
+        self.assertEqual([label for label, _ in content_rules.matched_bonuses(work)], ["固态电池"])
+
+    def test_solid_polymer_electrolyte_stacks_on_solid_state(self):
+        work = {"title": "Solid polymer electrolyte for solid-state lithium batteries"}
+        labels = [label for label, _ in content_rules.matched_bonuses(work)]
+        self.assertEqual(labels, ["固态电池", "固态聚合物电解质"])
+        self.assertEqual(content_rules.bonus_score(work), 2)
+
+    def test_gel_electrolyte_is_not_a_solid_polymer_electrolyte(self):
+        work = {"title": "Gel polymer electrolyte enables a high-voltage cathode"}
+        self.assertEqual(content_rules.bonus_score(work), 0)
+
+    def test_anode_free_gets_three_points(self):
+        work = {"title": "Anode-free sodium metal batteries"}
+        self.assertEqual(content_rules.bonus_score(work), 3)
+
+    def test_bonus_can_be_triggered_by_the_abstract(self):
+        """加分是"排序依据"，宁滥勿缺：摘要里提到也算。"""
+        work = {"title": "A new cathode design", "abstract": "assembled in an anode-free cell"}
+        self.assertEqual(content_rules.bonus_score(work), 3)
+
+    def test_unrelated_paper_gets_nothing(self):
+        work = {"title": "Anionic redox in Li-rich layered oxides", "abstract": "voltage decay"}
+        self.assertEqual(content_rules.bonus_score(work), 0)
+
+    def test_layered_sodium_cathode_earns_the_topic_bonus(self):
+        sodium = next(t for t in config.active_research_topics() if t.name == "钠离子正极")
+        work = {"title": "Air-stable O3-type layered oxide cathode for sodium-ion batteries"}
+        self.assertEqual(content_rules.bonus_score(work, sodium), 2)
+
+    def test_layered_lithium_cathode_does_not_earn_the_sodium_bonus(self):
+        """层状 ≠ 钠电：必须同时是钠离子体系（规则的 all 字段）。"""
+        sodium = next(t for t in config.active_research_topics() if t.name == "钠离子正极")
+        work = {"title": "P2-type layered oxide cathode for lithium-ion batteries"}
+        self.assertEqual(content_rules.bonus_score(work, sodium), 0)
+
+    def test_topic_bonus_is_invisible_to_other_topics(self):
+        lithium = next(t for t in config.active_research_topics() if t.name == "富锂锰正极")
+        work = {"title": "Layered oxide cathode for sodium-ion batteries"}
+        self.assertEqual(content_rules.bonus_score(work, lithium), 0)
+
+    def test_rule_matching_supports_unless_and_all(self):
+        rule = {"any": ["layered"], "all": ["sodium"], "unless": ["prussian blue"]}
+        self.assertTrue(content_rules.rule_matches(rule, content_rules.normalize("sodium layered oxide")))
+        self.assertFalse(content_rules.rule_matches(rule, content_rules.normalize("lithium layered oxide")))
+        self.assertFalse(
+            content_rules.rule_matches(rule, content_rules.normalize("sodium layered prussian blue"))
+        )
+
+
+class TestContentExclusions(unittest.TestCase):
+    """剔除规则：不看电解液工程、不看隔膜改性。"""
+
+    def test_electrolyte_additive_paper_is_dropped(self):
+        work = {"title": "Electrolyte additives for high-voltage lithium batteries"}
+        self.assertEqual(content_rules.exclusion_hit(work), "电解液工程")
+
+    def test_separator_paper_is_dropped(self):
+        work = {"title": "Functional separator design for lithium-sulfur batteries"}
+        self.assertEqual(content_rules.exclusion_hit(work), "隔膜改性")
+
+    def test_solid_state_work_is_not_mistaken_for_electrolyte_engineering(self):
+        """固态体系不该被"电解液"三个字误伤（规则里的 unless 兜底）。"""
+        work = {"title": "Electrolyte additives for all-solid-state batteries"}
+        self.assertIsNone(content_rules.exclusion_hit(work))
+
+    def test_exclusion_looks_at_the_title_only(self):
+        """按摘要剔除会误杀 —— 相关论文也常把电解液添加剂当对比组。"""
+        work = {"title": "A high-capacity Li-rich cathode", "abstract": "compared to electrolyte additives"}
+        self.assertIsNone(content_rules.exclusion_hit(work))
+
+    def test_relevant_cathode_paper_passes(self):
+        work = {"title": "Anionic redox in Li-rich layered oxides"}
+        self.assertIsNone(content_rules.exclusion_hit(work))
+
+    def test_partition_marks_the_reason(self):
+        works = [{"title": "Separator modification for Li-S"}, {"title": "keep me"}]
+        kept, dropped = content_rules.partition_excluded(works)
+        self.assertEqual([w["title"] for w in kept], ["keep me"])
+        self.assertEqual(dropped[0]["exclude_reason"], "隔膜改性")
+
+    def test_topic_specific_exclusion_is_scoped(self):
+        """主题自己的 exclude 只对该主题生效。"""
+        scoped = config.ResearchTopic(
+            name="A", keywords=["x"], exclude=[{"label": "本主题不看", "any": ["prussian blue"]}]
+        )
+        work = {"title": "Prussian blue analogue cathode"}
+        self.assertEqual(content_rules.exclusion_hit(work, scoped), "本主题不看")
+        self.assertIsNone(content_rules.exclusion_hit(work))
+
+
+class TestContentRuleValidation(unittest.TestCase):
+    """规则写错只会静默失效，所以必须有地方报出来。"""
+
+    def test_live_config_rules_are_healthy(self):
+        self.assertEqual(config.validate_content_rules(), [])
+
+    def test_empty_any_is_reported(self):
+        with patch.object(config, "BONUS_RULES", [{"label": "坏的", "score": 1, "any": []}]):
+            problems = config.validate_content_rules()
+        self.assertTrue(any("永远不会生效" in p for p in problems), problems)
+
+    def test_missing_label_and_bad_score_are_reported(self):
+        with patch.object(config, "EXCLUDE_RULES", [{"score": "多", "any": ["x"]}]):
+            problems = config.validate_content_rules()
+        self.assertTrue(any('"label"' in p for p in problems), problems)
+        self.assertTrue(any('"score"' in p for p in problems), problems)
+
+    def test_rule_problems_surface_as_config_warnings(self):
+        with patch.object(config, "BONUS_RULES", [{"label": "坏的", "score": 1}]):
+            problems = config.config_warnings("topic")
+        self.assertTrue(any("永远不会生效" in p for p in problems), problems)
+
+
+class TestContentBonusAffectsRanking(unittest.TestCase):
+    """最终分 = AI 分 + 期刊档次加成 + 内容规则加成。"""
+
+    def test_final_score_adds_up_all_three_layers(self):
+        work = {
+            "ai_score": 70,
+            "issn": "2058-7546",  # Nature Energy → 大子刊 +9
+            "title": "Anode-free solid-state lithium batteries",
+        }
+        ranking.annotate([work])
+        self.assertEqual(work["journal_bonus"], 9)
+        self.assertEqual(work["content_bonus"], 4)  # 固态 1 + 无负极 3
+        self.assertEqual(work["final_score"], 83)
+        self.assertEqual(work["ai_score"], 70)  # AI 分本身不动
+
+    def test_content_bonus_does_not_lower_the_threshold(self):
+        """加分只改排序：低分论文不会被"抬"过入选线（入选在 AI 打分那一步就定了）。"""
+        work = {"ai_score": 10, "title": "Anode-free solid-state battery", "issn": "1476-4687"}
+        ranking.annotate([work])
+        self.assertEqual(work["ai_score"], 10)
+        self.assertLess(work["ai_score"], config.AI_THRESHOLD)
+
+    def test_breakdown_lists_content_items(self):
+        work = {
+            "ai_score": 70,
+            "journal_tier": "其他",
+            "journal_bonus": 0,
+            "content_bonus": 4,
+            "content_bonus_detail": [["固态电池", 1], ["无负极", 3]],
+            "final_score": 74,
+        }
+        self.assertEqual(ranking.breakdown(work), "AI 70 + 固态电池 1 + 无负极 3 = 74")
+
+    def test_content_bonus_can_overtake_a_higher_ai_score(self):
+        plain = {"doi": "a", "ai_score": 72, "issn": "2542-4351", "title": "plain cathode work"}
+        boosted = {"doi": "b", "ai_score": 70, "issn": "2542-4351", "title": "Anode-free battery"}
+        self.assertEqual([w["doi"] for w in ranking.rank([plain, boosted])], ["b", "a"])
+
+    def test_rank_accepts_a_topic(self):
+        sodium = next(t for t in config.active_research_topics() if t.name == "钠离子正极")
+        work = {
+            "doi": "x",
+            "ai_score": 60,
+            "issn": "2041-1723",  # Nature Communications → 小子刊 +5
+            "title": "O3-type layered oxide cathode for sodium-ion batteries",
+        }
+        ranking.rank([work], sodium)
+        self.assertEqual(work["content_bonus"], 2)
+        self.assertEqual(work["final_score"], 67)
+
+
+class TestMailerContentTags(unittest.TestCase):
+    """邮件卡片要把内容加分显示出来，否则"为什么它排前面"看不出来。"""
+
+    def test_card_shows_content_tags_and_final_score(self):
+        work = {
+            "doi": "10.1/x",
+            "title": "Anode-free solid-state battery with a polymer electrolyte",
+            "journal": "Joule",
+            "issn": "2542-4351",
+            "pub_date": "2026-09-01",
+            "abstract": "abstract text",
+            "ai_score": 70,
+            "ai_takeaway": "解读",
+            "ai_reason": "理由",
+        }
+        html_body, plain = mailer.build_html(
+            ranking.rank([work]), "2026-09-01", lookback_days=14, first_run=False, excluded=3
+        )
+        # 70（AI）+ 7（Joule）+ 1（固态）+ 3（无负极）+ 1（固态聚合物电解质）
+        self.assertIn("最终 82 分", html_body)
+        self.assertIn("Joule +7（AI 70）", html_body)
+        self.assertIn("固态电池 +1", html_body)
+        self.assertIn("无负极 +3", html_body)
+        self.assertIn("规则剔除 3 篇", html_body)
+        self.assertIn("固态电池 1", plain)
+
+
+class TestLiveResearchConfig(unittest.TestCase):
+    """把"用户当前想要的课题"钉进测试，防止后续改动悄悄回退。"""
+
+    def test_live_topics_are_lithium_rich_and_sodium_cathode(self):
+        self.assertEqual(
+            [topic.name for topic in config.active_research_topics()], ["富锂锰正极", "钠离子正极"]
+        )
+
+    def test_bonus_scores_match_the_request(self):
+        scores = {rule["label"]: rule["score"] for rule in config.BONUS_RULES}
+        self.assertEqual(scores["固态电池"], 1)
+        self.assertEqual(scores["固态聚合物电解质"], 1)  # 在"固态"之上再加 1
+        self.assertEqual(scores["无负极"], 3)
+
+    def test_exclusions_are_electrolyte_engineering_and_separator(self):
+        self.assertEqual(
+            [rule["label"] for rule in config.EXCLUDE_RULES], ["电解液工程", "隔膜改性"]
+        )
+
+    def test_sodium_topic_carries_the_layered_bonus(self):
+        sodium = next(t for t in config.active_research_topics() if t.name == "钠离子正极")
+        self.assertIn("层状钠离子正极", [rule["label"] for rule in sodium.bonuses])
+
+    def test_every_topic_has_keywords_and_a_description(self):
+        for topic in config.active_research_topics():
+            self.assertTrue(topic.keywords, topic.name)
+            self.assertTrue(topic.description.strip(), topic.name)
+
+    def test_global_exclude_note_is_fed_to_the_ai(self):
+        self.assertTrue(config.GLOBAL_EXCLUDE_NOTE.strip())
+        for topic in config.active_research_topics():
+            self.assertIn(config.GLOBAL_EXCLUDE_NOTE.split("；")[0], topic.brief())
 
 
 if __name__ == "__main__":

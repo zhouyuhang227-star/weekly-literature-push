@@ -1,11 +1,18 @@
-"""期刊档次加权排序。
+"""加权排序：期刊档次加成 **+** 内容规则加成。
 
-规则（可在 ``config.JOURNAL_TIERS`` 里改数字）：
+规则的数字都在 ``config.py`` 里（``JOURNAL_TIERS`` / ``BONUS_RULES``）：
 
-    最终分 = AI 相关性分（0-100） + 期刊档次加成
+    最终分 = AI 相关性分（0-100） + 期刊档次加成 + 内容规则加成
 
-加成**只影响排序，不影响入选** —— 是否进邮件仍然只看 AI 分是否过 ``AI_THRESHOLD``。
-这样"顶刊的低相关论文"不会挤掉"普通刊的高相关论文"，只是同样相关时顶刊排前面。
+两种加成**都只影响排序，不影响入选** —— 是否进邮件仍然只看 AI 分是否过
+``AI_THRESHOLD``。这样"顶刊的低相关论文"和"蹭到热词的论文"都不会挤掉
+"普通刊的高相关论文"，只是同样相关时排得更靠前。
+
+两类加成的分工：
+* **期刊档次加成**（``JOURNAL_TIERS``）：这篇发在哪本刊。
+* **内容规则加成**（``config.BONUS_RULES`` + 主题的 ``bonuses``）：这篇写了什么，
+  由 :mod:`src.content_rules` 按关键词规则判定，可命中多条累加（如
+  「固态电池 +1」+「固态聚合物电解质 +1」）。
 
 为什么按 ISSN 查而不是按期刊名查：OpenAlex 返回的 ``display_name`` 常与
 配置里的写法不同（"Angewandte Chemie International Edition" vs
@@ -17,7 +24,7 @@ from __future__ import annotations
 
 import logging
 
-from . import config
+from . import config, content_rules
 
 log = logging.getLogger(__name__)
 
@@ -42,20 +49,55 @@ def journal_tier(work: dict) -> tuple[str, int]:
     return UNRANKED_TIER, UNRANKED_BONUS
 
 
-def annotate(works: list[dict]) -> list[dict]:
-    """就地写入 ``journal_tier`` / ``journal_bonus`` / ``final_score`` 三个字段。"""
+def content_items(work: dict) -> list[tuple[str, int]]:
+    """内容加分明细 ``[(label, score), ...]``。
+
+    优先用 :func:`annotate` 写好的 ``content_bonus_detail``；只手工给了
+    ``content_bonus`` 时退化成一项 ``("内容", N)``。
+    """
+    items: list[tuple[str, int]] = []
+    for item in work.get("content_bonus_detail") or []:
+        try:
+            label, score = item
+        except (TypeError, ValueError):
+            continue
+        label = str(label).strip()
+        if label:
+            items.append((label, int(score)))
+    if not items:
+        bonus = int(work.get("content_bonus") or 0)
+        if bonus > 0:
+            items.append(("内容", bonus))
+    return items
+
+
+def content_parts(work: dict) -> list[str]:
+    """内容加分的明细文字，如 ``["固态电池 1", "无负极 3"]``。"""
+    return [f"{label} {score}" for label, score in content_items(work)]
+
+
+def annotate(works: list[dict], topic=None) -> list[dict]:
+    """就地写入加权字段并算出 ``final_score``。
+
+    写入的字段：``journal_tier`` / ``journal_bonus`` /
+    ``content_bonus`` / ``content_bonus_detail`` / ``final_score``。
+    """
     for work in works:
-        tier, bonus = journal_tier(work)
+        tier, journal_bonus = journal_tier(work)
+        hits = content_rules.matched_bonuses(work, topic)
+        content_bonus = sum(score for _label, score in hits)
         work["journal_tier"] = tier
-        work["journal_bonus"] = bonus
-        work["final_score"] = int(work.get("ai_score") or 0) + bonus
+        work["journal_bonus"] = journal_bonus
+        work["content_bonus"] = content_bonus
+        work["content_bonus_detail"] = [[label, score] for label, score in hits]
+        work["final_score"] = int(work.get("ai_score") or 0) + journal_bonus + content_bonus
     return works
 
 
 def sort_key(work: dict) -> tuple[int, int, str]:
     """排序键：最终分 → AI 分 → 发表日期。
 
-    带上 AI 分是为了"期刊加成追平"时仍按真实相关性分先后；
+    带上 AI 分是为了"加成追平"时仍按真实相关性分先后；
     带上日期是为了完全同分时结果稳定（不会每次运行顺序都变）。
     """
     return (
@@ -65,20 +107,28 @@ def sort_key(work: dict) -> tuple[int, int, str]:
     )
 
 
-def rank(works: list[dict]) -> list[dict]:
+def rank(works: list[dict], topic=None) -> list[dict]:
     """标注加成分并按最终分降序排列（返回新列表，原列表内容不变）。"""
-    annotate(works)
+    annotate(works, topic)
     return sorted(works, key=sort_key, reverse=True)
 
 
 def breakdown(work: dict) -> str:
-    """一行加分明细，用于邮件与日志。"""
+    """一行加分明细，用于邮件与日志，如 ``AI 62 + 大子刊 9 + 固态电池 1 = 72``。"""
     ai = int(work.get("ai_score") or 0)
-    bonus = int(work.get("journal_bonus") or 0)
-    tier = work.get("journal_tier") or UNRANKED_TIER
-    if bonus > 0:
-        return f"AI {ai} + {tier} {bonus} = {int(work.get('final_score') or ai + bonus)}"
-    return f"AI {ai}"
+    journal_bonus = int(work.get("journal_bonus") or 0)
+    parts = [f"AI {ai}"]
+    if journal_bonus > 0:
+        parts.append(f"{work.get('journal_tier') or UNRANKED_TIER} {journal_bonus}")
+    parts.extend(content_parts(work))
+    if len(parts) == 1:
+        return f"AI {ai}"
+    stored = work.get("final_score")
+    if stored is not None:
+        total = int(stored)
+    else:
+        total = ai + journal_bonus + int(work.get("content_bonus") or 0)
+    return " + ".join(parts) + f" = {total}"
 
 
 def tiers() -> list[tuple[str, int]]:
@@ -87,7 +137,14 @@ def tiers() -> list[tuple[str, int]]:
 
 
 def describe() -> str:
-    """一行文字说明排序规则，用于启动日志与 ``--show-config``。"""
+    """一行文字说明排序规则，用于启动日志与 ``--show-config``。
+
+    内容加分的明细由 :func:`content_rules.describe_bonuses` 单独打印
+    （有全局的也有每个主题自己的，混在一行说不清）。
+    """
     parts = [f"{tier} +{bonus}" for tier, bonus in tiers()]
     parts.append(f"{UNRANKED_TIER} +{UNRANKED_BONUS}")
-    return "最终分 = AI 相关性分 + 期刊加成，按最终分降序（" + " > ".join(parts) + "）"
+    return (
+        "最终分 = AI 相关性分 + 期刊加成 + 内容加分，按最终分降序"
+        "（期刊：" + " > ".join(parts) + "）"
+    )

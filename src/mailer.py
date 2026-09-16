@@ -65,6 +65,8 @@ _STYLE = {
     "link": "color:#2563eb;text-decoration:none;",
     "tag": "display:inline-block;padding:1px 7px;border-radius:4px;background:#fef3c7;"
     "color:#92400e;font-size:11px;margin-right:6px;",
+    "tag_content": "display:inline-block;padding:1px 7px;border-radius:4px;background:#e0e7ff;"
+    "color:#3730a3;font-size:11px;margin-right:6px;",
     "empty": "background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;"
     "padding:32px 24px;text-align:center;color:#6b7280;font-size:14px;line-height:1.8;",
     "notice": "background:#fffbeb;border:1px solid #fde68a;color:#92400e;border-radius:8px;"
@@ -81,9 +83,13 @@ def _render_card(work: dict) -> str:
     doi = work.get("doi") or ""
     doi_url = work.get("doi_url") or (f"https://doi.org/{doi}" if doi else "")
 
-    # 最终分 = AI 相关性分 + 期刊档次加成（缺失排序字段时退化成 AI 分，测试友好）
+    # 最终分 = AI 相关性分 + 期刊档次加成 + 内容规则加成
+    # （缺失排序字段时退化成 AI 分，测试友好）
     ai_score = work.get("ai_score")
-    bonus = int(work.get("journal_bonus") or 0)
+    journal_bonus = int(work.get("journal_bonus") or 0)
+    content_items = ranking.content_items(work)
+    content_bonus = sum(score for _label, score in content_items)
+    bonus = journal_bonus + content_bonus
     tier = str(work.get("journal_tier") or "").strip()
     if work.get("final_score") is None:
         final_score = int(ai_score or 0) + bonus
@@ -91,10 +97,14 @@ def _render_card(work: dict) -> str:
         final_score = int(work["final_score"])
 
     tags: list[str] = []
-    if bonus > 0:
+    if journal_bonus > 0:
         tags.append(
-            f'<span style="{_STYLE["tag"]}">{_esc(tier)} +{bonus}'
+            f'<span style="{_STYLE["tag"]}">{_esc(tier)} +{journal_bonus}'
             f'（AI {_esc(ai_score)}）</span>'
+        )
+    for label, score in content_items:
+        tags.append(
+            f'<span style="{_STYLE["tag_content"]}">{_esc(label)} +{score}</span>'
         )
     if not (work.get("abstract") or "").strip():
         tags.append(f'<span style="{_STYLE["tag"]}">依据：标题（摘要缺失）</span>')
@@ -136,6 +146,7 @@ def build_html(
     first_run: bool,
     total_candidates: int = 0,
     after_dedup: int = 0,
+    excluded: int = 0,
     ai_failed: int = 0,
     title: str | None = None,
     extra_meta: str = "",
@@ -145,6 +156,7 @@ def build_html(
 
     :param title: 邮件标题前缀；为空时用 ``config.EMAIL_TITLE``
                   （多主题调研时每个主题传自己的标题）。
+    :param excluded: 被内容规则（不看电解液工程 / 隔膜改性）剔除的篇数。
     :param extra_meta: 追加到头部元信息行末尾的说明（已转义前的纯文本）。
     :param max_items: 单封最多展示篇数；默认 ``config.MAX_EMAIL_ITEMS``。
     :return: ``(html, 纯文本备选)``
@@ -156,6 +168,8 @@ def build_html(
         f"检索窗口：近 {lookback_days} 天（{scope}） &nbsp;·&nbsp; "
         f"候选 {total_candidates} 篇 &nbsp;·&nbsp; 去重后 {after_dedup} 篇"
     )
+    if excluded:
+        meta_line = f"{meta_line} &nbsp;·&nbsp; 规则剔除 {int(excluded)} 篇"
     if extra_meta:
         meta_line = f"{meta_line} &nbsp;·&nbsp; {_esc(extra_meta)}"
 
@@ -184,7 +198,7 @@ def build_html(
     if overflow > 0:
         notices.append(
             f"另有 <b>{overflow}</b> 篇相关文献因单封邮件上限（{limit} 篇）未在此展示，"
-            "已按<b>最终分（AI 相关性分 + 期刊档次加成）</b>降序截断。"
+            "已按<b>最终分（AI 相关性分 + 期刊档次加成 + 内容加分）</b>降序截断。"
         )
     if ai_failed:
         notices.append(f"有 <b>{ai_failed}</b> 篇文献 AI 打分失败，本次未纳入统计（详见运行日志）。")
@@ -209,7 +223,10 @@ def build_html(
             plain_lines.append(f"   理由：{work['ai_reason']}")
         plain_lines.append(f"   DOI：https://doi.org/{work.get('doi')}")
         plain_lines.append("")
-    plain_lines += [f"检索窗口：近 {lookback_days} 天（{scope}），候选 {total_candidates} 篇。"]
+    plain_lines += [
+        f"检索窗口：近 {lookback_days} 天（{scope}），候选 {total_candidates} 篇，"
+        f"去重后 {after_dedup} 篇，规则剔除 {int(excluded)} 篇。"
+    ]
     plain = "\n".join(plain_lines)
 
     return _wrap(body, run_date, meta_line, email_title), plain
@@ -228,8 +245,8 @@ def _wrap(body: str, run_date: str, meta_line: str, title: str | None = None) ->
     </div>
     {body}
     <p style="{_STYLE['footer']}">
-      本邮件由 GitHub Actions 自动生成。期刊范围与关键词可在仓库 <code>src/config.py</code> 中调整。<br>
-      排序规则：最终分 = AI 相关性分 + 期刊档次加成（正刊/大子刊/Joule/小子刊/JACS/Angew/AM）。<br>
+      本邮件由 GitHub Actions 自动生成。期刊范围、关键词与评分规则可在仓库 <code>src/config.py</code> 中调整。<br>
+      排序规则：最终分 = AI 相关性分 + 期刊档次加成（正刊/大子刊/Joule/小子刊/JACS/Angew/AM）+ 内容加分；加成只影响排序，不改变入选线。<br>
       邮件正文中所有字段均已做 HTML 转义，DOI 链接指向 doi.org 官方解析。
     </p>
   </div>
