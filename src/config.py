@@ -322,14 +322,19 @@ RESEARCH_FIELD = "固态电池"
 #    不算聚合物电解质"）。留空则只用下面的 USER_KEYWORDS。
 RESEARCH_DESCRIPTION = ""
 
-# 3) 判断相关性的关键词 —— 属于【旋钮 B】。作用取决于 RETRIEVAL_MODE：
-#    * "topic"（默认）：**只**作为 AI 的打分标准，**不参与召回**。
-#                       改这里不会让候选量变化，改的是"什么样的论文算相关"。
-#    * "keyword" / "both"：既参与 OpenAlex 召回，也作为 AI 的打分标准。
-#    多词短语会自动加引号，OpenAlex 会做词干化匹配（battery ↔ batteries）。
+# 3) 判断相关性的关键词 —— 属于【旋钮 B】。主要作为 AI 的打分标准。
+#    多词短语会自动加引号，AI 侧不要求逐字命中，可以写得又细又长。
+#
+#    它**是否参与召回**取决于 RETRIEVAL_MODE：
+#      * "keyword" / "both"：会（单方向模式没有单独的 search_terms，
+#        于是这里的词**兼任召回词**）→ 改动会同时改变候选量与 AI 尺子；
+#      * "topic"：不会，只当打分尺子。
+#    多主题模式下每个主题有独立的 search_terms 当召回词，本项不参与召回。
 #
 #    ⚠️ 想加"排除项"（例如"不要聚合物电解质"）请写进 RESEARCH_DESCRIPTION，
 #       因为关键词是 OR 并联的，写在这里只会让召回更多。
+#    ⚠️ 关键词为空且 keyword 模式下没有任何 search_terms → 程序**直接报错**
+#       （不再退化成"全库检索"），以免静默推一堆无关文献。
 #    ⚠️ 关键词为空时 AI 只剩 RESEARCH_FIELD 一句话可依靠，判准率会明显下降。
 #    ⚠️ 仅在「单方向」模式下生效。当前 RESEARCH_TOPICS 非空（多主题），
 #       每个主题用自己的 keywords，这里的 5 个词暂时不起作用。
@@ -396,17 +401,21 @@ TOPICS: dict[str, str] = {}
 #        去重也是**按主题各记各的** → 同一篇论文可能同时出现在两封邮件里。
 #
 # 每个主题是一个字典，字段说明：
-#   name        必填。主题显示名，用于日志、预览文件名、状态文件的分区键。
-#   topic_query 必填。第 1 层召回用的语义主题短语（= 单方向模式里的 TOPIC_QUERY）。
-#   keywords    必填。第 2 层 AI 的打分尺（= USER_KEYWORDS）。
-#   description 选填。补充"要什么/不要什么"，AI 判不准时最有效的一招。
-#   title       选填。邮件标题前缀，默认是「<name>顶刊周报」。
-#   topics      选填。手工锁定主题 id，格式同上面的 TOPICS；留空则按 topic_query 自动解析。
-#   key         选填。状态文件里的分区键，默认等于 name。
+#   name         必填。主题显示名，用于日志、预览文件名、状态文件的分区键。
+#   search_terms 第 1 层召回词（keyword 模式下**真正决定候选量**的就是它）。
+#                多条之间 OR 并联，必须是「能在真实标题/摘要里逐字出现」的短词。
+#                留空则退化成用 keywords 召回；两者都空 → keyword 模式下**直接报错**。
+#   keywords     必填。第 2 层 AI 的打分尺（= USER_KEYWORDS），不参与召回。
+#   description  选填。补充"要什么/不要什么"，AI 判不准时最有效的一招。
+#   topic_query  仅 topic / both 模式需要。第 1 层语义主题短语（= TOPIC_QUERY）；
+#                keyword 模式下留空即可。
+#   title        选填。邮件标题前缀，默认是「<name>顶刊周报」。
+#   topics       选填。手工锁定主题 id，格式同上面的 TOPICS；留空则按 topic_query 自动解析。
+#   key          选填。状态文件里的分区键，默认等于 name。
 #                    ⚠️ **改了 name 就会换一个新分区** → 该主题会被当成首次运行（30 天预热），
 #                       旧记录留在旧分区里不再生效。想改名又不想重跑，把 key 填成旧 name。
-#   bonuses     选填。**只对这个主题生效**的内容加分（写法同上面的 BONUS_RULES）。
-#   exclude     选填。**只对这个主题生效**的剔除规则（写法同上面的 EXCLUDE_RULES）。
+#   bonuses      选填。**只对这个主题生效**的内容加分（写法同上面的 BONUS_RULES）。
+#   exclude      选填。**只对这个主题生效**的剔除规则（写法同上面的 EXCLUDE_RULES）。
 #                    全局的 BONUS_RULES / EXCLUDE_RULES 仍然照常生效，这里是叠加。
 #
 # 当前启用：两个方向（想回到单方向就把 RESEARCH_TOPICS 改回 []）
@@ -703,6 +712,15 @@ MAIL_TO = os.getenv("MAIL_TO") or ""
 # OpenAlex 礼貌池（faster pool）。留空则不带 mailto，仍可用但速率更低。
 OPENALEX_MAILTO = os.getenv("OPENALEX_MAILTO") or SMTP_USER or ""
 
+# OpenAlex API key（**可选**）。
+#
+# 2026 年起 OpenAlex 改成「额度/积分」计费：匿名请求每天 1000 积分、
+# 每次查询约 10 积分（≈100 次），用完返回 HTTP 429 + "Insufficient budget"，
+# 并且要等到次日 UTC 0 点才恢复 —— 重试完全没用。
+# 填了 key 就走独立额度；不填则保持原样（绝大多数场景一周几次请求完全够用，
+# 只有本地反复调试才会把当天额度打光）。
+OPENALEX_API_KEY = (os.getenv("OPENALEX_API_KEY") or "").strip()
+
 MAX_EMAIL_ITEMS = 20  # 单封邮件最多展示篇数，规避 Gmail 102KB 截断并控制可读性
 
 # ---------------------------------------------------------------------------
@@ -749,9 +767,10 @@ def relevance_plan(mode: str = RETRIEVAL_MODE, topic: ResearchTopic | None = Non
             f"USER_KEYWORDS 不参与"
         )
         hint = (
-            "topic 模式下改 USER_KEYWORDS 不会改变候选量，它只当 AI 的打分尺子。"
-            '想让关键词也参与召回 → RETRIEVAL_MODE = "both"；'
-            "想换召回方向 → 改 TOPIC_QUERY。详见 src/config.py 顶部「两把旋钮」说明。"
+            "topic 模式下 search_terms / USER_KEYWORDS 都不参与召回，它们只当 AI 的打分尺子。"
+            '想让它们也参与召回 → RETRIEVAL_MODE = "both"（并集，召回最高）；'
+            '想要更细的粒度 → RETRIEVAL_MODE = "keyword"（推荐，当前离线实测评测过）。'
+            "想换召回主题 → 改 TOPIC_QUERY，且必须能解析到 id。详见 src/config.py 顶部说明。"
         )
     elif mode == "keyword":
         if terms:
@@ -768,8 +787,10 @@ def relevance_plan(mode: str = RETRIEVAL_MODE, topic: ResearchTopic | None = Non
             '想让 OpenAlex 主题分类也参与 → RETRIEVAL_MODE = "both"（前提是 topic_query 能解析到主题）。'
         )
     elif mode == "both":
-        recall = f"both（并集）—— topics.id（TOPIC_QUERY={query!r}） ∪ 字面关键词 {keywords}"
-        hint = "both 模式召回最高；改 TOPIC_QUERY 和 USER_KEYWORDS 都会影响候选量。"
+        recall = (
+            f"both（并集）—— topics.id（TOPIC_QUERY={query!r}） ∪ 字面词组（search_terms）"
+        )
+        hint = "both 模式召回最高，但请求数也翻倍；改 search_terms 与 TOPIC_QUERY 都会影响候选量。"
     else:
         recall = f"未知模式 {mode!r}"
         hint = "RETRIEVAL_MODE 只接受 'topic' / 'keyword' / 'both'。"
@@ -782,7 +803,18 @@ def relevance_plan(mode: str = RETRIEVAL_MODE, topic: ResearchTopic | None = Non
     )
     if topic is not None:
         # 多主题模式下，「改哪里」要落到这个主题自己的字典字段上，不然会去改全局常数
-        hint += f"（多主题模式：改 RESEARCH_TOPICS 里「{view.name}」的 topic_query / keywords）"
+        if mode == "keyword":
+            hint += (
+                f"（多主题模式：改 RESEARCH_TOPICS 里「{view.name}」的 search_terms 换召回词、"
+                "keywords / description 换打分尺）"
+            )
+        elif mode == "both":
+            hint += (
+                f"（多主题模式：改 RESEARCH_TOPICS 里「{view.name}」的 search_terms / topic_query 换召回词、"
+                "keywords / description 换打分尺）"
+            )
+        else:
+            hint += f"（多主题模式：改 RESEARCH_TOPICS 里「{view.name}」的 topic_query / keywords）"
     return [(LAYER_RECALL, recall), (LAYER_SCORING, scoring), (LAYER_HINT, hint)]
 
 

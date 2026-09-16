@@ -231,6 +231,93 @@ class TestRecallTermsAreShortAndLiteral(unittest.TestCase):
             self.assertEqual(problems, [], f"主题「{topic.name}」的 search_terms 有问题：{problems}")
 
 
+class TestOpenAlexQuotaErrors(unittest.TestCase):
+    """OpenAlex 2026 起按积分计费：额度耗尽的 429 必须与突发限流区分开。
+
+    区别很实际：突发限流退避几秒就好；额度耗尽要等次日 UTC 零点，
+    重试纯属白等，而且日志里只留一句「HTTP 429」时会让人以为是网络抽风。
+    """
+
+    class _Resp:
+        def __init__(self, status_code, body=None, headers=None):
+            self.status_code = status_code
+            self._body = {} if body is None else body
+            self.headers = headers or {}
+            self.text = json.dumps(self._body, ensure_ascii=False)
+
+        def json(self):
+            return self._body
+
+    def test_budget_exhaustion_is_recognised_from_the_message(self):
+        resp = self._Resp(429, {"error": "Rate limit exceeded", "message": "Insufficient budget."})
+        self.assertTrue(openalex_client._is_budget_exhausted(resp))
+
+    def test_burst_429_is_not_mistaken_for_budget_exhaustion(self):
+        resp = self._Resp(429, {"error": "Too many requests"}, {"Retry-After": "3"})
+        self.assertFalse(openalex_client._is_budget_exhausted(resp))
+
+    def test_budget_message_says_why_and_how_to_fix(self):
+        resp = self._Resp(
+            429,
+            {"message": "Insufficient budget."},
+            {"Retry-After": "77000", "X-RateLimit-Limit": "1000"},
+        )
+        text = openalex_client._budget_message(resp)
+        self.assertIn("今日额度已用完", text)
+        self.assertIn("小时", text)
+        self.assertIn("OPENALEX_API_KEY", text)
+
+    def test_request_page_gives_up_immediately_when_quota_is_gone(self):
+        calls: list[int] = []
+        resp = self._Resp(
+            429, {"message": "Insufficient budget."}, {"X-RateLimit-Remaining": "0"}
+        )
+        with patch.object(
+            openalex_client.requests, "get", side_effect=lambda *a, **k: calls.append(1) or resp
+        ), patch.object(openalex_client.time, "sleep", lambda _s: None):
+            with self.assertRaises(RuntimeError) as ctx:
+                openalex_client._request_page({"filter": "x"}, attempt=3)
+        self.assertEqual(len(calls), 1)  # 不做无意义的重试
+        self.assertIn("额度", str(ctx.exception))
+
+    def test_request_page_does_not_retry_malformed_queries(self):
+        calls: list[int] = []
+        resp = self._Resp(400, {"error": "Bad filter"})
+        with patch.object(
+            openalex_client.requests, "get", side_effect=lambda *a, **k: calls.append(1) or resp
+        ), patch.object(openalex_client.time, "sleep", lambda _s: None):
+            with self.assertRaises(RuntimeError) as ctx:
+                openalex_client._request_page({"filter": "bad"}, attempt=3)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("filter=bad", str(ctx.exception))
+
+    def test_request_page_still_retries_a_transient_429(self):
+        ok = self._Resp(200, {"meta": {"count": 1}, "results": []})
+        queue = [self._Resp(429, {"error": "Too many requests"}, {"Retry-After": "2"}), ok]
+        calls: list[int] = []
+
+        def fake_get(*_args, **_kwargs):
+            calls.append(1)
+            return queue.pop(0)
+
+        with patch.object(openalex_client.requests, "get", side_effect=fake_get), patch.object(
+            openalex_client.time, "sleep", lambda _s: None
+        ):
+            payload = openalex_client._request_page({"filter": "x"}, attempt=3)
+        self.assertEqual(payload["meta"]["count"], 1)
+        self.assertEqual(len(calls), 2)
+
+    def test_api_key_is_attached_only_when_configured(self):
+        saved = config.OPENALEX_API_KEY
+        try:
+            config.OPENALEX_API_KEY = ""
+            self.assertEqual(openalex_client._with_auth({"filter": "x"}), {"filter": "x"})
+            config.OPENALEX_API_KEY = "k-123"
+            self.assertEqual(openalex_client._with_auth({"filter": "x"})["api_key"], "k-123")
+        finally:
+            config.OPENALEX_API_KEY = saved
+
+
 class TestResearchDirectionIsConfigurable(unittest.TestCase):
     """换研究方向必须只改 config，且不能留下静默用错方向的空间。
 
@@ -347,6 +434,7 @@ class TestRelevanceLayersAreExplained(unittest.TestCase):
         # 光说"不生效"不够，必须直接给出"想让它生效该改哪里"
         hint = self._detail(plan, config.LAYER_HINT)
         self.assertIn('RETRIEVAL_MODE = "both"', hint)
+        self.assertIn("search_terms", hint)
         self.assertIn("TOPIC_QUERY", hint)
 
     def test_keyword_mode_says_keywords_do_drive_recall(self):

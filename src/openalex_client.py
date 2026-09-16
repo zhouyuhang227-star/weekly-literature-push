@@ -3,21 +3,29 @@
 职责边界：给一组关键词 + 时间窗，返回结构化文献列表。不做 AI、不做去重。
 
 **召回率由 RETRIEVAL_MODE 决定**（这是整条链路里最影响效果的一个开关）：
-默认走 ``topics.id`` 语义主题分类，而不是字面关键词。以「固态电池」方向实测
-（11 本顶刊 / 近 30 天）：字面关键词只能召回 36 篇，主题分类能召回 194 篇，
-而全量是 2069 篇。字面匹配会漏掉「不含关键词原文但确实相关」的论文
-（例如 ``Interfacial resistance in garnet-type Li7La3Zr2O12``）。
 
-主题 id **不需要手改**：``config.TOPIC_QUERY`` 是唯一入口，
-``resolve_topics()`` 会调 ``/topics`` 接口把它解析成 id 并缓存。
-若允许二者脱钩（改了关键词却没改 id），检索会**静默地继续用旧方向**
-且不报错 —— 这正是下面 ``active_topics()`` 要消灭的坑。
+* ``keyword``（**默认**）—— 用主题自己的 ``search_terms`` 走
+  ``title_and_abstract.search`` 字面召回。实测：「富锂锰正极」用 7 个短词
+  OR 并联能召回 18 篇/30 天，「钠离子正极」43 篇/30 天。
+* ``topic`` —— OpenAlex 的语义主题分类（``topics.id``）。
+  ⚠️ **粒度很粗，别用来做细分方向**：实测 ``"sodium-ion battery"``、
+  ``"lithium-rich"`` 这类短语在 ``/topics`` 里一律返回 0 条（根本没有这样的主题），
+  只有 ``"solid-state battery"`` 这种大方向才解析得到。
+  一旦解析为 0，``build_filter`` 会**直接报错**（见下）。
+* ``both`` —— 两者并集。
+
+⚠️ **静默退化是这条链路上最贵的 bug**：早期版本在解析不到主题 id 时只记一条
+WARNING 就去掉 ``topics.id`` 条件，查询于是退化成「14 本刊近 30 天」共 3772 篇，
+被 ``MAX_WORKS_FETCH`` 截断后两个主题拿到**同一批** 275 篇无关论文
+（AI 几乎全部拒绝 → 一个主题报 0 篇、一个报 4 篇，还看起来像「规则太严」）。
+现在 ``build_filter`` 在召回条件缺失时抛 ``RuntimeError``：宁可贵主题失败，
+也不要「绿着跑错」。
 
 相比最初骨架修正的关键点
 ------------------------
 1. **检索字段**：原骨架用的 URL 参数 ``search=`` 实测等价于 ``fulltext`` 全文检索
    （OQL: ``fulltext has (...)``），会把 News & Views、评论等捞进来。
-   若使用关键词模式，必须写 ``title_and_abstract.search`` 且放进 ``filter=``
+   用关键词模式时必须写 ``title_and_abstract.search`` 且放进 ``filter=``
    （作为 URL query 参数会 400）。
 2. **时间窗**：新增 ``from_publication_date``，否则首次运行会把历史文献全部当新文献群发。
 3. **分页**：新增 cursor 分页。原骨架 ``PER_PAGE=50`` 且无翻页，
@@ -27,6 +35,9 @@
 5. **retracted / paratext 过滤**：排除撤稿与前后缀内容。
 6. **DOI 规范化**：OpenAlex 返回 ``https://doi.org/10.xxxx/yyy``，需剥前缀 + 转小写。
 7. **无 DOI 的文献**：不再静默丢弃，而是记录 WARNING 日志。
+8. **额度耗尽**：2026 年起 OpenAlex 按积分收费（匿名 1000 积分/天、
+   约 10 积分/次），用完返回 429 ``Insufficient budget`` 且当天不再恢复 ——
+   这种 429 会被识别出来并直接给出可操作的解释，不做无意义的重试。
 """
 
 from __future__ import annotations
@@ -223,7 +234,9 @@ def resolve_topics(query: str, limit: int | None = None) -> dict[str, str]:
         params["mailto"] = OPENALEX_MAILTO
 
     try:
-        resp = requests.get(OPENALEX_TOPICS_API, params=params, timeout=HTTP_TIMEOUT)
+        resp = requests.get(
+            OPENALEX_TOPICS_API, params=_with_auth(params), timeout=HTTP_TIMEOUT
+        )
         resp.raise_for_status()
         results = resp.json().get("results") or []
     except (requests.RequestException, ValueError) as exc:
@@ -399,22 +412,100 @@ def _describe_filter(mode: str, keywords: list[str] | None, topic=None) -> str:
     return f"未知模式 {mode!r}"
 
 
+def _with_auth(params: dict) -> dict:
+    """带上可选的 API key。
+
+    2026 年起 OpenAlex 改成「额度/积分」计费：匿名请求每天 1000 积分、
+    每次查询约 10 积分（≈100 次），用完就一直是 429 + ``Insufficient budget``，
+    要等到次日 UTC 0 点才恢复。配了 ``OPENALEX_API_KEY`` 就走独立额度，
+    **不配则行为与以前完全一样**（一周几次运行的量绰绰有余）。
+    """
+    if config.OPENALEX_API_KEY:
+        return {**params, "api_key": config.OPENALEX_API_KEY}
+    return params
+
+
+def _short_body(resp) -> str:
+    """出错响应的人类可读摘要（OpenAlex 的 429 正文是个 JSON）。"""
+    try:
+        payload = resp.json()
+    except ValueError:
+        return (resp.text or "").strip()[:200]
+    if isinstance(payload, dict):
+        return str(payload.get("message") or payload.get("error") or "")[:300]
+    return str(payload)[:200]
+
+
+def _retry_after_seconds(resp) -> int | None:
+    raw = (resp.headers.get("Retry-After") or "").strip()
+    return int(raw) if raw.isdigit() else None
+
+
+def _is_budget_exhausted(resp) -> bool:
+    """区分「突发限流（等几秒就好）」与「当日额度用完（等也没用）」。"""
+    if (resp.headers.get("X-RateLimit-Remaining") or "").strip() == "0":
+        return True
+    return "budget" in _short_body(resp).lower()
+
+
+def _budget_message(resp) -> str:
+    """429 + 额度耗尽时说清楚原因 —— 否则很容易被当成「网络抽风」反复重试。"""
+    seconds = _retry_after_seconds(resp)
+    wait = (
+        f"约 {seconds / 3600:.1f} 小时后（UTC 零点）" if seconds and seconds > 300 else "稍后"
+    )
+    quota = resp.headers.get("X-RateLimit-Limit") or "?"
+    return (
+        f"OpenAlex 今日额度已用完（HTTP 429：{_short_body(resp) or 'Insufficient budget'}）。\n"
+        f"  匿名配额 {quota} 积分/天、每次查询约 10 积分，用完后要等{wait}才恢复。\n"
+        "  这不是配置错误也不是网络问题，重试没有意义，所以直接停在这里。\n"
+        "  彻底解决：注册 OpenAlex 账号，把 key 配成 secret OPENALEX_API_KEY"
+        "（本地则设同名环境变量），即可切到独立额度。\n"
+        "  临时办法：换个时间再跑 —— GitHub Actions 走的是另一套出口 IP，"
+        "一般不受你本机当天额度的拖累。"
+    )
+
+
 def _request_page(params: dict, attempt: int) -> dict:
-    """带指数退避的单页请求。"""
+    """带指数退避的单页请求。
+
+    429 要分两种对待：
+      * 突发限流（几秒到一分钟）→ 指数退避重试是有用的；
+      * 当日额度用完（``Insufficient budget``，Retry-After 上刀秒）→ 重试毫无意义，
+        直接报错并说清原因，免得日志里只留一句干巴巴的 ``HTTP 429``。
+    4xx（除 429）通常是查询写错了，重试也没用，同样直接报。
+    """
+    auth_params = _with_auth(params)
     last_exc: Exception | None = None
     for tries in range(1, attempt + 1):
         try:
-            resp = requests.get(OPENALEX_BASE, params=params, timeout=HTTP_TIMEOUT)
-            if resp.status_code in _RETRY_STATUS:
-                raise requests.HTTPError(f"HTTP {resp.status_code}")
-            resp.raise_for_status()
-            return resp.json()
-        except (requests.RequestException, ValueError) as exc:
+            resp = requests.get(OPENALEX_BASE, params=auth_params, timeout=HTTP_TIMEOUT)
+        except requests.RequestException as exc:
             last_exc = exc
-            if tries < attempt:
-                backoff = 2**tries
-                log.warning("OpenAlex 请求失败（%s），%s 秒后重试 %s/%s", exc, backoff, tries, attempt)
-                time.sleep(backoff)
+        else:
+            if resp.status_code == 200:
+                try:
+                    return resp.json()
+                except ValueError as exc:  # 正文不是 JSON，当临时故障重试
+                    last_exc = exc
+            elif resp.status_code == 429:
+                if _is_budget_exhausted(resp):
+                    raise RuntimeError(_budget_message(resp))
+                last_exc = requests.HTTPError(f"HTTP 429 {_short_body(resp)}")
+            elif resp.status_code in _RETRY_STATUS:
+                last_exc = requests.HTTPError(f"HTTP {resp.status_code} {_short_body(resp)}")
+            elif 400 <= resp.status_code < 500:
+                raise RuntimeError(
+                    f"OpenAlex 拒绝了查询（HTTP {resp.status_code} {_short_body(resp)}）："
+                    "检索条件写错了，重试也不会变好，请检查 filter 里的字段名与语法。\n"
+                    f"  filter={params.get('filter')}"
+                )
+            else:
+                last_exc = requests.HTTPError(f"HTTP {resp.status_code}")
+        if tries < attempt:
+            backoff = 2**tries
+            log.warning("OpenAlex 请求失败（%s），%s 秒后重试 %s/%s", last_exc, backoff, tries, attempt)
+            time.sleep(backoff)
     raise RuntimeError(f"OpenAlex 请求最终失败: {last_exc}")
 
 

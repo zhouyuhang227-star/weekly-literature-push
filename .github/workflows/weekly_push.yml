@@ -76,6 +76,11 @@ jobs:
         env:
           # OpenAlex 礼貌池（建议填你的邮箱）；不填也能跑，但速率更低
           OPENALEX_MAILTO: ${{ secrets.OPENALEX_MAILTO }}
+          # OpenAlex API key（**可选**）。2026 年起 OpenAlex 按「额度/积分」计费，
+          # 匿名请求约 100 次/天；一周跑一两次完全够用，只有反复调试才会打光，
+          # 用完会返回 HTTP 429 + "Insufficient budget" 并要等次日 UTC 0 点恢复。
+          # 想在 Actions 里也吃到独立额度，就把这个 secret 配上（不配=空=原来的行为）。
+          OPENALEX_API_KEY: ${{ secrets.OPENALEX_API_KEY }}
           # AI（任何 OpenAI 兼容端点，默认 DeepSeek）
           AI_BASE_URL: ${{ secrets.AI_BASE_URL }}
           AI_API_KEY: ${{ secrets.AI_API_KEY }}

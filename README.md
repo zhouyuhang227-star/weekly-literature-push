@@ -18,8 +18,12 @@
 
 | 层级 | 手段 | 作用 | 实测候选量 |
 |---|---|---|---|
-| 第 1 层 | OpenAlex 的**语义主题** `topics.id` | 按研究方向捞出**可能相关**的全部论文 | ~194 篇 / 30 天 |
+| 第 1 层 | OpenAlex 的**字面短词召回**（`title_and_abstract.search`） | 按研究方向捞出**可能相关**的全部论文 | ~18 / ~43 篇 / 30 天（两个主题） |
 | 第 2 层 | AI 逐篇打分（0–100），低于阈值丢弃 | 按**你的具体兴趣**做精读判断 | ~20 篇入选 |
+
+> 第 1 层也可以用 OpenAlex 的**语义主题** `topics.id`（`--retrieval-mode topic`），
+> 但实测它的粒度太粗：细分方向（`sodium-ion battery`、`lithium-rich`）在 OpenAlex 里
+> **根本不存在对应主题**，解析结果直接是 0 条。所以默认走字面短词。
 
 > AI **不负责关键词匹配**。它拿到的是第 1 层已经筛过的候选集，再做一轮语义相关性打分。
 
@@ -32,7 +36,7 @@
 > 两种加成**只管排序，不管入选** —— 是否进邮件依旧只看 AI 分数是否过 `AI_THRESHOLD`。
 > 详见 [内容加权](#内容加权bonus_rules--exclude_rules)。
 
-- 检索：**OpenAlex**（无需 API Key，免费）
+- 检索：**OpenAlex**（免费；填 `OPENALEX_MAILTO` 进礼貌池更快，可选填 `OPENALEX_API_KEY` 换独立额度）
 - 筛选：任意 **OpenAI 兼容** 的 AI 接口（默认 DeepSeek `deepseek-chat`）
 - 邮件：SMTP（QQ / Gmail / 163 / Outlook…）
 - 调度：**GitHub Actions**（仓库自带 workflow，无需服务器）
@@ -47,7 +51,7 @@
 ├── src/
 │   ├── config.py                       # ★所有"可能要改"的参数（研究方向、期刊、阈值）
 │   ├── logger.py                       # 日志初始化（时区正确、幂等）
-│   ├── openalex_client.py              # 第 1 层检索：拼查询 + 分页 + 解析 + 主题自动解析
+│   ├── openalex_client.py              # 第 1 层召回：拼查询 + 分页 + 解析 + 主题解析
 │   ├── abstract_source.py              # 摘要三级回退：OpenAlex → Crossref → S2
 │   ├── ai_matcher.py                   # 第 2 层：AI 并发打分 + 稳健 JSON 解析
 │   ├── content_rules.py                # 内容加分 / 剔除规则（固态、无负极、层状钠…）
@@ -55,7 +59,7 @@
 │   ├── dedup.py                        # DOI 去重 + 运行状态持久化（按主题分区）
 │   ├── mailer.py                       # HTML 渲染 + SMTP 发送
 │   └── main.py                         # 主流程编排（多主题循环）+ 命令行
-├── tests/test_core.py                  # 135 个单元测试（锁定高风险修复）
+├── tests/test_core.py                  # 150 个单元测试（锁定高风险修复）
 ├── data/
 │   ├── pushed_dois.json                # 去重状态（唯一需要提交的文件）
 │   ├── topics_cache.json               # 语义主题解析缓存（已 gitignore，自动重建）
@@ -191,11 +195,12 @@ git push -u origin main
 ### 第 4 步：配置 Secrets
 
 打开仓库页 **Settings → Secrets and variables → Actions → New repository secret**，
-依次添加下面 9 个（本地调试时可改成环境变量）：
+依次添加下面 9 个必填 / 建议填的（本地调试时可改成环境变量）：
 
 | Secret | 必填 | 说明 | 示例 |
 |---|---|---|---|
 | `OPENALEX_MAILTO` | 建议 | 你的邮箱，OpenAlex 会把你放进**礼貌池**（更快、更稳）。留空则复用 `SMTP_USER` | `you@example.com` |
+| `OPENALEX_API_KEY` | 可选 | 只有碰到「当日额度用完（429）」才需要。在 openalex.org 免费注册后可拿到；不填也完全能跑 | `xxxxxxxx` |
 | `AI_BASE_URL` | ✅ | OpenAI 兼容端点 | `https://api.deepseek.com/v1` |
 | `AI_API_KEY` | ✅ | AI 平台的 API Key | `sk-xxxxxxxx` |
 | `AI_MODEL` | ✅ | 模型名 | `deepseek-chat` |
@@ -263,7 +268,9 @@ on:
 | 每周都跑但状态文件没更新 | 正常。`data/pushed_dois.json` 无变化时脚本会主动跳过 commit |
 | `push.cmd` 一直提示连不上，最后报 `Failed to connect to github.com:443` | **不是你的 git 配错了，是网络**。国内 `github.com` 常常时通时不通（典型表现：`api.github.com` 能访问、`github.com` 超时 21 秒）。挂上代理后让 git 也走代理：`git config --global http.proxy http://127.0.0.1:7890`（端口换成你代理软件的）。取消：`git config --global --unset http.proxy` |
 | 黄色警告 `Node.js 20 is deprecated` | **任务仍然会成功，但要修**。三个官方 action 的旧大版本内部声明的是 Node 20，而 Node 20 已于 **2026-09-23 从 runner 上彻底移除**。本项目已升级到 `checkout@v7` / `setup-python@v7` / `upload-artifact@v7`（内部为 `node24`）。以后凡是「绿色 ✔ + 黄条警告」，八成都是这类依赖过时，去对应 action 的 releases 页取最新大版本号即可 |
-| **改了 `USER_KEYWORDS`，候选量一点没变** | **不是 bug**，是默认 `topic` 模式的正常行为：此模式下关键词不参与召回，只当 AI 的打分尺（见 [两把旋钮](#two-knobs)）。想让它影响召回 → `RETRIEVAL_MODE = "both"` 或改 `TOPIC_QUERY`。拿不准就跑 `python -m src.main --show-config` |
+| **改了 `keywords`，候选量一点没变** | **不是 bug**：`keywords` 是给 AI 的打分尺，召回去看 `search_terms`（见 [两把旋钮](#two-knobs)）。拿不准就跑 `python -m src.main --show-config` |
+| **两个主题的候选数一模一样 / 都不像自己方向 / 少到发慌** | 这是曾经真实发生过的事故：主题短语解析为 0 时旧版本会**静默丢掉主题条件**，退化成「14 本刊近 30 天」全库检索，两个主题拿到同一批无关论文。现已改成**直接报错**（`RuntimeError` + 退出码非 0 + Actions 变红）。看到红色 ≠ 坏了，而是它在告诉你“召回条件没生效” |
+| 报 `OpenAlex 今日额度已用完（HTTP 429）` | 2026 年起 OpenAlex 按请求计费（匿名 1000 积分/天）。当天调试次数太多就会耗尽，**要等次日 UTC 零点**，重试无用。临时办法：触发 GitHub Actions（走另一套出口 IP）；彻底解决：配 `OPENALEX_API_KEY` |
 
 > **想让定时任务更准时**：GitHub 官方文档明确说明**整点（minute = 0）是负载高峰**，
 > 任务可能被延迟几分钟甚至几十分钟，所以本项目已经把 cron 设成了非整点的
@@ -280,14 +287,14 @@ python -m src.main [选项]
 | 选项 | 作用 |
 |---|---|
 | `--dry-run` | 只把邮件 HTML 写到 `data/outbox/`，不发信、不写状态 |
-| `--retrieval-mode X` | 第 1 层检索方式：`topic`（默认，语义主题）/ `keyword`（字面关键词）/ `both`（并集） |
+| `--retrieval-mode X` | 第 1 层召回方式：`keyword`（**默认**，主题 `search_terms` 字面短词，粒度准）/ `topic`（OpenAlex 语义主题，粒度粗）/ `both`（并集） |
 | `--force-first-run` | 强制按首次运行处理（用 30 天预热窗） |
 | `--lookback-days N` | 临时覆盖时间窗天数，如 `--lookback-days 90` 回补三个月 |
 | `--max-items N` | 单封邮件最多展示篇数（默认 20） |
 | `--max-fetch N` | 最多拉取候选文献数（默认 300） |
 | `--topic NAME` | 只跑指定主题（可重复，如 `--topic 富锂锰正极 --topic 钠离子正极`），匹配主题的 `name` 或 `key`；省略则跑全部 |
 | `--threshold N` | AI 相关性阈值，低于此值不展示（默认 60） |
-| `--keywords "a;b"` | 临时覆盖研究方向（`topic` 模式下用作 **AI 打分标准**，不参与检索） |
+| `--keywords "a;b"` | 临时覆盖研究方向（`keyword` 模式下会**作为召回条件**；`topic` 模式下只当 **AI 打分标准**，不参与检索） |
 | `--show-config` | 只打印「靠什么召回 / 靠什么打分」然后退出，**纯离线、不联网、不跑主流程**。改完配置拿不准改动落在哪一层时先跑它 |
 | `--find-topic [QUERY]` | 只查询 OpenAlex 语义主题、打印候选 id/名称，**不跑主流程**（省略 QUERY 则用 `config.TOPIC_QUERY`） |
 | `--to addr` | 临时覆盖收件人（多个用逗号分隔） |
@@ -310,8 +317,8 @@ python -m src.main --dry-run --lookback-days 90 --max-items 50
 # 只验证检索和邮件是否通
 python -m src.main --no-ai --to me@example.com --dry-run
 
-# 对比字面关键词检索（召回更低但更精确）
-python -m src.main --dry-run --no-ai --retrieval-mode keyword
+# 对比语义主题检索（召回量随方向变化，细分方向往往是 0）
+python -m src.main --dry-run --no-ai --retrieval-mode topic
 
 # 两种检索取并集（召回最高）
 python -m src.main --dry-run --retrieval-mode both
@@ -344,7 +351,7 @@ python -m src.main --dry-run --topic 富锂锰正极
 ```mermaid
 flowchart LR
     A[校验配置] --> B[判定时间窗]
-    B --> C["第 1 层：OpenAlex 检索<br/>14 期刊 × 语义主题"]
+    B --> C["第 1 层：OpenAlex 召回<br/>14 期刊 × 主题 search_terms"]
     C --> D[DOI 去重]
     D --> E[摘要三级回退]
     E --> F["第 2 层：AI 并发相关性打分"]
@@ -359,29 +366,72 @@ flowchart LR
 > 多主题时上面这段链路**每个主题各跑一遍**（各自去重、各自排序、各自一封邮件），
 > 任一主题失败不影响其余主题，但最终仍会让 Actions 变红，避免静默漏推。
 
+> **第 1 层与第 2 层的职责必须分清**：第 1 层只管「尽可能别漏」，第 2 层只管「判得准」。
+> 因此第 1 层宁可用宽一点的短词并联（多推几十篇给 AI 看的成本极低），
+> 也绝不能出现「明明有配置却什么都没搜」的情况。
+
 **关键安全约定：只有邮件发送成功才回写状态。** 否则一旦 SMTP 挂了，
 文献会被标记成"已推送"而永久丢失。
 
-### 第 1 层：为什么用「语义主题」而不是「关键词」
+### 第 1 层：为什么默认用「字面短词」而不是「语义主题」
 
-用 11 本期刊 / 30 天做对照实测（2026-09 校验，当时的期刊清单为 11 本；
-以 `TOPIC_QUERY = "solid-state battery"` 为例；换方向后数字会变，但结论一致）：
+> 这一节的结论改过一次。最初（11 本刊 / 30 天 / 方向为「固态电池」）实测
+> 语义主题召回 194 篇、字面关键词只有 36 篇，于是默认走了 `topics.id`。
+> 换成更细的方向后**这个结论失效了**，原因见下面的实测表。
 
-| 检索方式 | 候选量 | 问题 |
-|---|---|---|
-| 不加任何筛选（全量） | **2069 篇** | 噪音太大，绝大多数与电池无关 |
-| `title_and_abstract.search` 字面关键词（5 个） | **36 篇** | **召回严重不足**：写「sulfide electrolyte」的固态电解质论文完全捞不到 |
-| `topics.id:T10281` 语义主题 | **194 篇** | 召回足够，噪音交给第 2 层 AI 处理 ✅ |
+#### 为什么换方向后失效：OpenAlex 的主题粒度太粗
 
-**为什么 36 篇不够**：字面关键词只能匹配"你恰好想到的措辞"。
-OpenAlex 的 `topics` 是它对每篇论文做的主题分类（T10281 = *Advanced Battery Materials and Technologies*），
-能召回换用其他表述的同类工作。召回不足是**无法补救**的——
-漏掉的论文根本进不了第 2 层，AI 再聪明也看不到；而第 2 层多筛几十篇的成本极低。
+OpenAlex 的 `topics` 是它对每篇论文做的粗分类（几千个主题），**大方向有、细分方向没有**。
+用 `/topics?search=` 逐个短语实测（2026-09）：
 
-主题 id 不需要手抄，程序会自动查（见 [主题 id 不需要手填](#主题-id-不需要手填而且这是为了防坑)）：
+| 短语 | 解析到的主题 |
+|---|---|
+| `solid-state battery` | ✅ `T10281`（78980 篇） |
+| `sodium-ion battery` | ❌ **0 条** |
+| `sodium battery` | ⚠️ `T12875` Thermal Expansion（错了，不是钠电） |
+| `lithium-rich` / `lithium-rich cathode` | ❌ **0 条** |
+| `layered oxide` | ⚠️ `T10472` / `T13249`（与层状钠正极无关） |
+
+也就是说「钠离子正极」「富锂锰正极」这类**你真正关心的细分方向，OpenAlex 根本没有对应主题**。
+
+#### ★ 事故复盘：静默退化比报错危险得多
+
+早期版本在 `topic_query` 解析为 0 条时，**只记一条 WARNING 就去掉了 `topics.id` 条件**，查询于是退化成
+「14 本刊 × 30 天」的全库检索（实测 3772 篇），被 `MAX_WORKS_FETCH=300` 截断后，
+**两个主题拿到的是同一批 300 篇无关论文**（去掉无 DOI 的剩 275 篇）。
+AI 几乎全部拒绝 → 「富锂锰正极」0 篇、「钠离子正极」4 篇，
+表面看像是「规则太严」「摘要没抓到」，实际是召回条件整个丢了。
+
+> 两个独立分区的命中数**完全相同**（275 / 275），是「候选池没被区分开」的强信号。
+
+现在改为**直接报错**：召回条件缺失时抛 `RuntimeError`，该主题本轮失败、进程退出码非 0、
+Actions 变红。宁可贵主题失败，也不要「绿着跑错」。
+
+#### 短词 OR 并联 vs 长短语：实测差距 18 倍
+
+`search_terms` 是**逐字**在标题/摘要里匹配的，所以「越像论文里真会写的短词越好」。
+以「富锂锰正极」为例，30 天 / 14 本刊实测：
+
+| 写法 | 召回 |
+|---|---|
+| 12 条学术长短语（含 `Li2MnO3`、`LRLO`、带括号/斜杠的写法） | **1 篇** |
+| 7 条短词 OR 并联（`li-rich`、`oxygen redox`、`anionic redox`、`voltage decay`…） | **18 篇** |
+
+单看每条词的贡献（篇 / 30 天）：`li-rich` 8、`oxygen redox` 7、`anionic redox` 5、
+`voltage decay` 4、`lithium-rich` 2、`lithium rich` 2、`voltage hysteresis` 1；
+而 `li2mno3` / `lrlo` / `lmr` 这类缩写实际是 **0**（论文里不这么写）。
+「钠离子正极」同理：`sodium-ion` 34、`sodium ion` 34、`na-ion` 8、`prussian blue` 5。
+
+两条经验：
+1. **别用缩写、别带 `/` `(` `)`** —— OpenAlex 字面检索下命中数几乎必然为 0（`config.py` 会在
+   `--show-config` 里直接警告你）。
+2. **词组别超 4 个词** —— 越长越搜不到，用 OR 并联几个短词比写一条长的好得多。
+
+字面召回的代价是「换表述的论文会漏」。这里选择接受它，因为**漏一篇比推一堆无关的代价低**：
+漏掉的文献下周如果被引/被指数化收录仍有机会补上，而每周往邮箱塞 20 篇不相关的东西会让人直接不看了。
 
 ```bash
-python -m src.main --find-topic                  # 查 TOPIC_QUERY 解析成什么
+python -m src.main --find-topic                  # 查 topic_query 解析成什么
 python -m src.main --find-topic "perovskite"     # 查任意短语的候选主题
 ```
 
@@ -391,16 +441,16 @@ OpenAlex 的 URL 参数 `search=` 等价于**全文检索**（OQL 解析为 `ful
 会把"News & Views"、评论文章、甚至参考文献里顺带提到关键词的内容全捞进来。
 关键词必须放进 `filter=`（`topic` 模式下则完全不需要关键词）。
 
-`--retrieval-mode keyword` 时生成的 `filter=` 形如：
+`--retrieval-mode keyword`（**默认**）时生成的 `filter=` 形如：
 
 ```
 filter=primary_location.source.issn:1476-4687|1095-9203|...,
        from_publication_date:2026-08-16,
        type:article,is_retracted:false,is_paratext:false,
-       title_and_abstract.search:"solid-state battery" OR "lithium dendrite"
+       title_and_abstract.search:"li-rich" OR "oxygen redox" OR "anionic redox"
 ```
 
-`--retrieval-mode topic`（默认）时：
+`--retrieval-mode topic` 时（把 `topics.id` 换进来）：
 
 ```
 filter=primary_location.source.issn:1476-4687|1095-9203|...,
@@ -408,6 +458,14 @@ filter=primary_location.source.issn:1476-4687|1095-9203|...,
        type:article,is_retracted:false,is_paratext:false,
        topics.id:T10281
 ```
+
+⚠️ 两种模式在**召回条件缺失时都会直接报错**（而不是把条件悄悄丢掉）：
+
+| 模式 | 缺什么 | 行为 |
+|---|---|---|
+| `keyword` | `search_terms` 和 `keywords` 都是空 | `RuntimeError`，该主题本轮失败 |
+| `topic` | `topic_query` 解析为 0 个主题 | `RuntimeError`，该主题本轮失败 |
+| `both` | 只有一种缺失 | 记 WARNING，用剩下的那一种继续跑 |
 
 ### 第 2 层：AI 拿到候选集后做什么
 
@@ -495,20 +553,26 @@ AI 打分失败时卡片会打 `AI 打分失败` 标签，且该文献仍会展�
 | | 旋钮 A：**召回** | 旋钮 B：**打分** |
 |---|---|---|
 | 决定什么 | **哪些论文能进候选池** | 进了池子的论文，**AI 给谁高分** |
-| 对应变量 | `RETRIEVAL_MODE` + `TOPIC_QUERY` | `RESEARCH_FIELD` + `RESEARCH_DESCRIPTION` + `USER_KEYWORDS` |
+| 对应变量 | **`search_terms`**（多主题：主题里的 `search_terms`；单方向：`USER_KEYWORDS`） + `RETRIEVAL_MODE` | `RESEARCH_FIELD` + `RESEARCH_DESCRIPTION` + `keywords` |
 | 改了会怎样 | **候选量会变** | **候选量一点不变**，变的只是 AI 那把打分尺 |
-| 怎么确认改对了 | 日志里的「候选 N 篇」 | 邮件里的 AI 分数 / 理由有没有变准 |
+| 怎么确认改对了 | 日志里的「OpenAlex 命中总数 N」 | 邮件里的 AI 分数 / 理由有没有变准 |
+
+> ⚠️ **召回词和打分词是两套东西，别搞混**：`search_terms` 是给 OpenAlex 的
+> （要求能在标题/摘要里**逐字**出现，所以必须短），`keywords` 是给 AI 的
+> （不要求逐字命中，可以写得又细又长）。想把「电压衰减」这个兴趣变成召回词，
+> 得在 `search_terms` 里加 `voltage decay`；写在 `keywords` 里只影响打分。
 
 > ⚠️ **当前已经开启多主题**（`RESEARCH_TOPICS` 非空），所以上面表里的 5 个变量
-> **全部不再生效**，每个主题改用自己字典里的 `topic_query` / `keywords` / `description`。
+> **全部不再生效**，每个主题改用自己字典里的 `search_terms` / `keywords` / `description`。
 > 这张表依然要看，因为它说的「两把旋钮」在多主题下同样成立，只是旋钮换成了
-> 「主题的 `topic_query`」和「主题的 `keywords`」。
+> 「主题的 `search_terms`」和「主题的 `keywords`」。
 >
 > 想回到单方向模式：把 `RESEARCH_TOPICS` 改回 `[]`。
 
-> ⚠️ **默认 `RETRIEVAL_MODE = "topic"`，此时 `USER_KEYWORDS` 不参与召回。**
-> 所以「我改了关键词，跑一遍候选量纹丝不动」是**正常现象，不是 bug**。
-> 想让关键词真正参与召回 → 把 `RETRIEVAL_MODE` 改成 `"both"`。
+> ⚠️ **默认 `RETRIEVAL_MODE = "keyword"`，此时 `keywords` 不参与召回。**
+> 真正的召回词是主题里的 **`search_terms`**（见下一节）。
+> 所以「我改了 `keywords`，跑一遍候选量纹丝不动」是**正常现象，不是 bug** ——
+> `keywords` 是给 AI 看的语义线索，不拿去检索。
 >
 > 拿不准自己的改动落在哪一层，跑这一条 —— **纯离线、秒出、不联网、不发邮件**：
 >
@@ -517,9 +581,9 @@ AI 打分失败时卡片会打 `AI 打分失败` 标签，且该文献仍会展�
 > ```
 >
 > ```
-> 【召回层】topic（语义主题）—— 由 TOPIC_QUERY='lithium-rich manganese-based cathode' 解析出的 topics.id 决定，USER_KEYWORDS 不参与
+> 【召回层】keyword（字面短词）—— search_terms 7 个词的 OR 并联：li-rich、lithium-rich、oxygen redox、…（keyword 模式下 keywords 不参与检索）
 > 【打分层】AI 0-100 分、入选线 ≥ 60 —— 尺子 = 「富锂锰正极」 + 关注关键词 12 个 + 补充说明；排序 = 最终分（AI 分 + 期刊档次加成 + 内容加分）降序
-> 【提示】topic 模式下改 USER_KEYWORDS 不会改变候选量，它只当 AI 的打分尺子。……（多主题模式：改 RESEARCH_TOPICS 里「富锂锰正极」的 topic_query / keywords）
+> 【提示】keyword 模式下改 keywords 不会改变候选量，要改的是 search_terms。……（多主题模式：改 RESEARCH_TOPICS 里「富锂锰正极」的 search_terms / keywords）
 > ```
 >
 > 这两组三行在**每个主题、每次正常运行**时也会打进日志开头，所以每周 Actions 的日志里都留着
@@ -531,8 +595,9 @@ AI 打分失败时卡片会打 `AI 打分失败` 标签，且该文献仍会展�
 
 | 想改什么 | 改哪个变量 | 属于 |
 |---|---|---|
-| **能搜到什么**（召回方向） | **`TOPIC_QUERY`** | 旋钮 A |
-| 召回策略（主题 / 关键词 / 并集） | `RETRIEVAL_MODE` | 旋钮 A |
+| **能搜到什么**（召回词） | **主题的 `search_terms`** | 旋钮 A |
+| 召回策略（字面 / 主题 / 并集） | `RETRIEVAL_MODE` | 旋钮 A |
+| 语义主题短语（仅 topic 模式用） | `topic_query`（单方向时是 `TOPIC_QUERY`） | 旋钮 A |
 | **搜到的里面留下什么**（AI 的打分尺） | **`USER_KEYWORDS`** + `RESEARCH_DESCRIPTION` | 旋钮 B |
 | 方向名（邮件标题也用它） | `RESEARCH_FIELD` | 旋钮 B |
 | **同时跑几个方向** | **`RESEARCH_TOPICS`** | — |
@@ -549,8 +614,9 @@ AI 打分失败时卡片会打 `AI 打分失败` 标签，且该文献仍会展�
 python -m src.main --show-config
 
 # ② 再看真实检索结果对不对，别白等一周
-python -m src.main --find-topic "lithium-rich manganese-based cathode"  # 确认主题短语解析到正确方向
-python -m src.main --dry-run --no-ai --verbose
+python -m src.main --show-config                       # 先看召回词有没有写错（离线）
+python -m src.main --dry-run --no-ai --verbose          # 看日志里的「OpenAlex 命中总数」
+python -m src.main --find-topic "solid-state battery"   # 只有 topic 模式下才需要查主题
 
 # ③ 同步到 GitHub
 .\push.cmd                                # 或者在资源管理器里双击 push.cmd
@@ -559,7 +625,7 @@ python -m src.main --dry-run --no-ai --verbose
 `push.cmd`（实际逻辑在 `push.ps1`）会依次做 5 件事：
 
 1. 检查待提交文件，**拦住 `.env` 等敏感文件**（推上去就泄露了，而且删掉也仍留在 git 历史里）
-2. 跑全部单元测试（当前 135 个），**不通过就中止**（配置改错了根本推不上去）
+2. 跑全部单元测试（当前 150 个），**不通过就中止**（配置改错了根本推不上去）
 3. `fetch` + `rebase` ← **关键，见下方说明**
 4. `push`，失败自动重试 4 次（`github.com` 在国内时通时不通）
 5. 校验远程 commit 和本地是否一致
@@ -589,9 +655,10 @@ python -m src.main --dry-run --no-ai --verbose
 >
 > 两种方式混着用容易忘了同步 —— **习惯用哪种就一直用哪种**。
 
-> ⚠️ **改完一定要确认检索量没变成 0**。期刊 ISSN 写错、或关键词与本方向完全不搭，
-> 都可能让候选集变成空集 —— 而程序不会报错，你只会收到一封「本周无新文献」的心跳邮件。
-> 用 `python -m src.main --dry-run --no-ai --verbose` 看一眼「候选 N 篇」就放心了。
+> ⚠️ **改完一定要确认检索量没变成 0**。期刊 ISSN 写错、或召回词与本方向完全不搭，
+> 都可能让候选集变成空集 —— 此时程序**不会报错**，你只会收到一封「本周无新文献」的心跳邮件。
+> 用 `python -m src.main --dry-run --no-ai --verbose` 看一眼日志里的「OpenAlex 命中总数」就放心了。
+> （召回词本身写得不巧 —— 带括号、词组太长、用了缩写 —— 会写进 `--show-config` 的警告里。）
 
 ### 如何换研究方向
 
@@ -602,10 +669,11 @@ AI 提示词、检索条件、邮件标题全部由这几个变量派生：
 > [多主题调研](#多主题调研)），下面这段「单方向」常数虽然还在文件里，但**暂时不起作用**。
 > 想回到单方向：把 `RESEARCH_TOPICS` 改回 `[]`，下面这几个变量立刻恢复生效。
 
-> ⚠️ 前提是**四个变量一起改**。只改关键词而忘了 `TOPIC_QUERY`，
-> 程序会**静默地继续用旧方向检索**（不报错、日志也看不出来）。
-> 改完先跑 `python -m src.main --show-config` 复查一遍，再看配置块末尾的
-> `TOPIC_QUERY` 说明。
+> ⚠️ 前提是**三个变量一起改**（`RESEARCH_FIELD` / `USER_KEYWORDS` / `TOPIC_QUERY`）。
+> 单方向模式下没有单独的 `search_terms`，所以 `USER_KEYWORDS` 会**兼任召回词**：
+> 在 `keyword` 模式下它决定候选量，在 `topic` 模式下 `TOPIC_QUERY` 决定候选量。
+> 改完先跑 `python -m src.main --show-config` 复查 ——
+> 它会直接告诉你「本轮靠什么召回、靠什么打分」，不用猜。
 
 ```python
 # ===== ★★★ 研究方向：换课题只需要改这一段 ★★★ =====
@@ -617,7 +685,7 @@ RESEARCH_FIELD = "固态电池"
 #    留空则只用下面的关键词。
 RESEARCH_DESCRIPTION = ""
 
-# 3) 判断相关性的关键词（AI 的打分标准；keyword 模式下也是检索条件）
+# 3) 判断相关性的关键词（AI 的打分标准；keyword 模式下也兼任召回词）
 USER_KEYWORDS: list[str] = [
     "solid-state battery",
     "solid-state electrolyte",
@@ -626,15 +694,16 @@ USER_KEYWORDS: list[str] = [
     "lithium dendrite",
 ]
 
-# 4) 第 1 层检索用哪条短语去查语义主题
+# 4) 仅 topic 模式用：拿哪条短语去查 OpenAlex 语义主题
 TOPIC_QUERY = "solid-state battery"
 ```
 
 改完直接跑一次预览就行：
 
 ```bash
+python -m src.main --show-config         # 离线确认"靠什么召回/靠什么打分"，秒出
 python -m src.main --dry-run --no-ai     # 只看检索到什么，不打分
-python -m src.main --find-topic          # 看看 TOPIC_QUERY 解析成了哪个主题
+python -m src.main --find-topic          # 仅 topic 模式：看 TOPIC_QUERY 解析成了哪个主题
 ```
 
 #### 主题 id 不需要手填（而且这是为了防坑）
@@ -648,10 +717,17 @@ python -m src.main --find-topic          # 看看 TOPIC_QUERY 解析成了哪个
   （其余候选，如需手工锁定请用 --find-topic：T12646=Inorganic Fluorides and Related Compounds）
 ```
 
-**为什么不让手填**：如果主题 id 和关键词脱钩（改了关键词却忘了改 id），
+**为什么不让手填**：如果主题 id 和短语脱钩（改了短语却忘了改 id），
 检索会**静默地继续用旧方向** —— 不报错、日志也看不出来，
 你会收到一整周完全不相干的文献推送。自动解析让"改一处即生效"成为默认行为。
 
+> ⚠️ **本段只适用于 `topic` / `both` 模式。** 默认的 `keyword` 模式根本不查主题
+> （`topic_query` 留空即可），召回完全由 `search_terms` 决定。
+>
+> ⚠️ 解析不到时现在**会直接报错中断该主题**（错误日志里会给出「改用短语」与
+> 「改走 keyword 模式」两条修法），不会再静默退化成全库检索 —— 详见
+> [事故复盘](#-事故复盘静默退化比报错危险得多)。
+>
 > 解析**保留 OpenAlex 的相关性顺序**，不按文献量重排。
 > 这一点踩过坑：按 `works_count` 降序的话，`"solid-state battery"` 会选中
 > `T12646`（Inorganic Fluorides，11 万篇的泛主题）而不是 `T10281`，只能召回 8 篇无关论文。
@@ -707,7 +783,7 @@ JOURNALS: dict[str, str] = {
 ISSN 可在 [OpenAlex Sources](https://openalex.org/sources) 或期刊官网查询。
 
 > ⚠️ **ISSN 写错不会报错，只会返回 0 篇**，表现是收到一封「本周无新文献」的心跳邮件。
-> 改完务必跑一次 `python -m src.main --dry-run --no-ai` 确认「候选 N 篇」不是 0。
+> 改完务必跑一次 `python -m src.main --dry-run --no-ai` 确认「OpenAlex 命中总数」不是 0。
 >
 > ⚠️ **跨学科换向必须同时换期刊**。当前这 14 本是材料 / 能源 / 化学类，
 > 如果你想换成计算机、医学等方向，光改研究方向会让候选集几乎为空（同样不报错）。
@@ -721,21 +797,24 @@ ISSN 可在 [OpenAlex Sources](https://openalex.org/sources) 或期刊官网查�
 
 > **当前已启用两个主题**：「富锂锰正极」（分区键 `富锂锰正极`）和
 > 「钠离子正极」（分区键 `钠离子正极`）。
-> 旧的 161 条记录（旧「固态电池」方向）已被保留在 `固态电池` 分区里，**不再参与去重**，
-> 这两个新主题因此都会被当成首次运行 —— **第一封邮件覆盖 30 天**，之后回到 14 天。
+> 这两个分区**已被手动清空**（旧记录来自一次静默退化的全库检索，DOI 全是无关论文，
+> 留着会把正确结果挡在去重之外），所以下一轮会被当成首次运行 ——
+> **第一封邮件覆盖 30 天**，之后回到 14 天。
 > 运行日志里的「使用 30 天窗口」就是这个原因，不是配置错了。
 
 ```python
 RESEARCH_TOPICS: list[dict] = [
     {
         "name": "富锂锰正极",
-        "topic_query": "lithium-rich manganese-based cathode",   # 第 1 层召回
+        "search_terms": ["li-rich", "lithium-rich", "oxygen redox",
+                         "anionic redox", "voltage decay"],   # 第 1 层召回
         "keywords": ["Li-rich Mn-based cathode", "voltage decay", "anionic redox"],
         "description": "只看富锂锰基层状氧化物正极（LRLO / LMR），不含磷酸铁锂 / 三元 NCM",
     },
     {
         "name": "钠离子正极",
-        "topic_query": "sodium-ion battery cathode material",
+        "search_terms": ["sodium-ion", "sodium ion", "na-ion",
+                         "sodium layered oxide", "prussian blue"],
         "keywords": ["layered sodium transition metal oxide", "P2-type", "O3-type", "NASICON"],
         "description": "只看钠离子正极（层状 / 普鲁士蓝 / 聚阴离子），不含硬碳等负极",
         # ↓ 只对这一个主题生效的加分：层状钠离子正极 +2
@@ -750,8 +829,9 @@ RESEARCH_TOPICS: list[dict] = [
 | 字段 | 必填 | 说明 |
 |---|---|---|
 | `name` | ✅ | 主题显示名。用于日志、邮件标题、预览文件名、**去重分区键** |
-| `topic_query` | ✅ | 第 1 层召回用的语义主题短语（= 单方向模式里的 `TOPIC_QUERY`） |
-| `keywords` | ✅ | 第 2 层 AI 的打分尺（= 单方向模式里的 `USER_KEYWORDS`） |
+| `search_terms` | — | 第 1 层**真正决定候选量**的召回词（keyword 模式）。OR 并联，必须短、必须能逐字命中 |
+| `keywords` | ✅ | 第 2 层 AI 的打分尺（= 单方向模式里的 `USER_KEYWORDS`），不参与召回 |
+| `topic_query` | — | 仅 topic / both 模式用：语义主题短语（= 单方向模式里的 `TOPIC_QUERY`） |
 | `description` | — | 补充「要什么 / 不要什么」，AI 判不准时最有效的一招 |
 | `bonuses` | — | **只对本主题生效**的加分规则，写法同全局 `BONUS_RULES`（见 [内容加权](#内容加权bonus_rules--exclude_rules)） |
 | `exclude` | — | **只对本主题生效**的剔除规则，写法同全局 `EXCLUDE_RULES` |
@@ -902,41 +982,43 @@ python -m src.main --topic 富锂锰正极 --topic 钠离子正极
 
 `RETRIEVAL_MODE` 三选一：
 
-| 值 | 含义 | 实测候选量（30 天） | `USER_KEYWORDS` 参与召回？ |
-|---|---|---|---|
-| `"topic"`（默认） | 只用语义主题分类 | 194 篇 | ❌ 不参与（只当打分尺） |
-| `"keyword"` | 只用 `title_and_abstract.search` 字面匹配 | 36 篇（会漏） | ✅ 参与 |
-| `"both"` | 两者并集 | 202 篇 | ✅ 参与 |
+| 值 | 含义 | 召回词用哪些 |
+|---|---|---|
+| `"keyword"`（**默认**） | 只用 `title_and_abstract.search` 字面匹配 | 主题的 `search_terms`（单方向模式：`USER_KEYWORDS`） |
+| `"topic"` | 只用 OpenAlex 语义主题分类 | 主题的 `topic_query`（粒度粗，细分方向常为 0 条） |
+| `"both"` | 两者并集（召回最全，请求数翻倍） | 两者都用 |
 
 也可临时用 `--retrieval-mode` 覆盖。
 
-> **如果你已经不止一次困惑"改了关键词没反应"，直接把 `RETRIEVAL_MODE` 改成 `"both"`。**
-> 代价只是候选量从 194 → 202（+4%），换来的是**改 `TOPIC_QUERY` 和 `USER_KEYWORDS` 都能影响召回**，
-> 不用再记"哪个字段管哪一层"。
+> ⚠️ 不管选哪个，**召回条件缺失都会直接报错**（`keyword` 缺 `search_terms` / `topic` 缺主题 id）。
+> 以前那种「静默退化成全库检索」的路径已经被彻底堵死。
+>
+> **不过要小心另一种「0 篇」**：条件写对了但词写得不好（比如带了括号、词组太长、
+> 期刊 ISSN 写错），程序**不会报错**，你只会收到一封「本周无新文献」的心跳邮件。
+> 所以改完务必用 `--dry-run --no-ai -v` 看一眼日志里的 `OpenAlex 命中总数 meta.count=N`。
 
-### 改关键词（`USER_KEYWORDS`）
+### 改关键词（`USER_KEYWORDS` / 主题的 `search_terms`、`keywords`）
 
-就是上面「如何换研究方向」里的 `USER_KEYWORDS`。**它属于旋钮 B**。
+**先记住两句话**：
 
-**先记住一句话**：
-
-> 在默认的 `topic` 模式下，`USER_KEYWORDS` **不参与召回**，只当 AI 的打分尺子。
-> 所以改了它之后「候选量一点没变」是**正常的**，变的是 AI 认为什么算相关。
-> 想让它真正影响「能搜到什么」，就把 `RETRIEVAL_MODE` 改成 `"both"`。
+> 1. **`search_terms` 管召回，`keywords` 管打分。**
+>    想让某类论文**进得了候选池**，得把它写成能在标题/摘要里逐字命中的短词放进 `search_terms`；
+>    只在 `keywords` 里写，AI 能判得更准，但搜不到就是搜不到。
+> 2. **单方向模式下没有单独的 `search_terms`**，此时 `USER_KEYWORDS` 会兼任召回词
+>    （仅 `keyword` / `both` 模式）；多主题模式下每个主题用自己的 `search_terms`。
 
 **按你的目的选做法**：
 
 | 你的目的 | 该改哪里 |
 |---|---|
-| AI 判得不够准，想让它更懂"我要什么" | `USER_KEYWORDS`（+ `RESEARCH_DESCRIPTION` 写"不要什么"） |
-| **能搜到的论文变多 / 变少** | `RETRIEVAL_MODE` → `"both"`，或改 `TOPIC_QUERY` |
-| **换一个研究方向** | `RESEARCH_FIELD` + `RESEARCH_DESCRIPTION` + `USER_KEYWORDS` + `TOPIC_QUERY` **四个一起改**，再跑 `--show-config` 复查 |
+| AI 判得不够准，想让它更懂"我要什么" | 主题的 `keywords`（+ `description` 写"不要什么"） |
+| **能搜到的论文变多 / 变少** | 主题的 `search_terms`（就是召回层） |
+| **换一个研究方向** | `search_terms` + `keywords` + `description` 一起改（用 topic 模式时再加 `topic_query`），再跑 `--show-config` 复查 |
 | 只是几个词想临时试试，不改配置文件 | `--keywords "a;b"` |
 
 细节：
 
-- `USER_KEYWORDS` 只有在 `RETRIEVAL_MODE = "keyword"` / `"both"` 时才用于 OpenAlex 检索
-  （此时多词短语自动加引号，OpenAlex 会做**词干化**匹配，`battery` 能匹配 `batteries`）。
+- `search_terms` 里多词短语会自动加引号，OpenAlex 会做**词干化**匹配（`battery` 能匹配 `batteries`）。
 - 想临时试别的研究方向用 `--keywords "a;b"`（全角 `；，` 会自动归一化）。
   此时 AI 只拿到这几个词；不传 `--keywords` 时 AI 收到的是
   `RESEARCH_FIELD + RESEARCH_DESCRIPTION + USER_KEYWORDS` 的完整描述，上下文更全。
@@ -981,7 +1063,7 @@ on:
     inputs:
       dry_run: ...              # boolean，只生成 HTML 不发信
       lookback_days: ...        # string，覆盖时间窗
-      retrieval_mode: ...       # choice: topic / keyword / both
+      retrieval_mode: ...       # choice: keyword（默认）/ topic / both
       topic: ...                # string，只跑指定主题（留空 = 全部）
 ```
 
@@ -1010,7 +1092,7 @@ on:
 ## 本地开发
 
 ```bash
-# 跑测试（135 个）
+# 跑测试（150 个）
 python -m unittest discover -s tests -v
 
 # 语法检查
@@ -1024,13 +1106,24 @@ python -m src.main --to your@email.com --lookback-days 7
 
 - DOI 归一化（`https://doi.org/` 前缀、大小写、尾部标点）
 - 倒排索引摘要重建（含重复词）
-- **第 1 层默认必须是 `topics.id` 语义检索**（回归测试）
+- **第 1 层默认必须是字面短词召回（`keyword`）**，不能把 `topics.id` 当成默认（回归测试）
 - **`keyword` 模式必须用 `title_and_abstract` 而非 `fulltext`**（回归测试）
+- **召回词只能用 `search_terms`，不得偷偷拿 `keywords` 去检索**；
+  `search_terms` 缺失时才回退到 `keywords`（回归测试）
+- **召回条件为空必须报错，不得静默变成「全部期刊近 N 天」**：
+  `keyword` 模式缺召回词、`topic` 模式解析不到主题 id，两者都必须 `RuntimeError`（回归测试）
+- **`both` 模式只有一种召回失效时要大声降级**（WARNING 日志），不能一声不唧（回归测试）
+- **config 里真实配置的 `search_terms` 必须干净**：
+  不得出现括号/斜杠、不得出现超过 4 个词的短语（实测命中数为 0）（回归测试）
+- **OpenAlex 额度耗尽的 429 必须与突发限流区分**：
+  前者立即失败并解释原因（等次日 UTC 零点 / 配 `OPENALEX_API_KEY`），后者才退避重试；
+  4xx 不得无意义重试（回归测试）
+- **`OPENALEX_API_KEY` 只在配了的时候才拼进请求**（回归测试）
 - `both` 模式必须同时含主题与关键词、且 ISSN/日期过滤不丢
 - **主题解析必须保留 OpenAlex 的相关性顺序**，不能按 `works_count` 重排（回归测试）
 - **换研究方向只能改 config**：AI 提示词、邮件标题必须跟着 `RESEARCH_FIELD` 变，
   且提示词里不得残留任何硬编码学科词（回归测试）
-- 主题解析失败必须返回空并降级告警，不得抛异常中断运行（回归测试）
+- 主题解析失败必须返回空、由 `build_filter` 直接报错中断该主题（回归测试）
 - **AI 打分结果必须分成"入选 / 调用失败 / 低于阈值"三堆**，
   且失败项不得混进"低于阈值"（否则会被错误标记已读而永不重试）
 - 无 DOI 文献必须丢弃、期刊名可从 ISSN 表兜底
@@ -1073,20 +1166,25 @@ C:\Users\16047\AppData\Local\Programs\Python\Python312\python.exe -m src.main --
 
 ## 成本参考
 
-OpenAlex 免费（礼貌池约 10 万次/天）。AI 是唯一开销。
+OpenAlex 免费，但有**每日额度**：2026 年起按请求计费（匿名 1000 积分/天、约 10 积分/次 ≈ 100 次，
+用完要到次日 UTC 零点才恢复，返回 429 `Insufficient budget`）。
+本流程每次运行只需个位数请求（每主题 1–2 次翻页），**正常使用碰不到上限**；
+只有本地反复调试才会打光当天额度。
+需要更多额度可以在 openalex.org 免费注册后把 key 配成 `OPENALEX_API_KEY`。
+AI 是唯一真花钱的地方。
 
-实测 11 本期刊 / 30 天 / 主题 `T10281`（固态电池方向）的候选量约 **194 篇/次**，
-其中约 96% 带摘要。按每篇约 1.5k token 计，每周一次折合约 30 万 token，
-用 DeepSeek 的成本约 **每月几毛钱**。
+实测 14 本期刊 / 30 天，两个主题各自的候选量约 **18 篇（富锂锰正极）** 与
+**~43 篇（钠离子正极）**，其中约 96% 带摘要。按每篇约 1.5k token 计，
+每周一次折合约 5 万 token，用 DeepSeek 的成本约 **每月一两毛钱**。
 
-> 换研究方向后候选量会变（越宽泛的方向候选越多）。第一次换向建议先跑
-> `python -m src.main --dry-run --no-ai` 看候选量，必要时调 `TOPIC_RESOLVE_LIMIT`
-> 或 `AI_THRESHOLD`。
+> 候选量随召回词数量与宽泛程度变化。第一次改召回词后建议先跑
+> `python -m src.main --dry-run --no-ai -v` 看日志里的 `OpenAlex 命中总数 meta.count=N`，
+> 必要时调 `MAX_WORKS_FETCH` 或 `AI_THRESHOLD`。
 
-### 为什么候选从 36 篇涨到 194 篇，成本没有失控
+### 为什么打分全部候选，成本也没有失控
 
-邮件只展示 20 篇，但第 2 层要打分全部 194 篇。若不做处理，下周这 194 篇
-（减去已展示的 20 篇）会被**原封不动重新打分一遍**，每周白烧 5 倍费用。因此：
+邮件只展示 20 篇，但第 2 层要打分全部候选。若不做处理，下周这些论文
+（减去已展示的 20 篇）会被**原封不动重新打分一遍**，每周白烧五倍费用。因此：
 
 | 分类 | 是否回写"已读" | 原因 |
 |---|---|---|
@@ -1096,4 +1194,4 @@ OpenAlex 免费（礼貌池约 10 万次/天）。AI 是唯一开销。
 | AI 调用失败 | ❌ | 分数不可信，必须重试 |
 | 超过 20 篇被截断的高分文献 | ❌ | 它们本该进邮件，下轮再给一次机会 |
 
-所以**每周的 AI 打分总量稳定在约 194 篇**，不随去重库增长而无限膨胀。
+所以**每周的 AI 打分总量稳定在「候选量」这个量级**，不随去重库增长而无限膨胀。
