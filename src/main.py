@@ -260,7 +260,14 @@ def show_config(args: argparse.Namespace) -> int:
         print(f"     邮件标题    {topic.email_title}")
         print(f"     TOPIC_QUERY {topic.topic_query!r}")
         print(f"     TOPICS      {topic.topics or '（空 → 按 TOPIC_QUERY 自动解析）'}")
-        print(f"     USER_KEYWORDS {list(topic.keywords) or '（空）'}")
+        print(
+            f"     search_terms {list(topic.search_terms) or '（空 → 退回用 keywords 召回）'}"
+            "   ← 第 1 层「能搜到什么」"
+        )
+        print(
+            f"     keywords    {list(topic.keywords) or '（空）'}"
+            "   ← 第 2 层「给 AI 看的语义线索」"
+        )
         print(f"     补充说明    {topic.description.strip() or '（未设置）'}")
         print(f"     主题加分    {content_rules.describe_bonuses(topic)}")
         print(f"     主题剔除    {content_rules.describe_excludes(topic)}")
@@ -298,7 +305,8 @@ def show_config(args: argparse.Namespace) -> int:
         for problem in problems:
             print(f"  ⚠️  {problem}")
     print("-" * 68)
-    print("  想换「能搜到什么」        → 改 RETRIEVAL_MODE / RESEARCH_TOPICS[].topic_query")
+    print("  想换「能搜到什么」        → keyword 模式改 RESEARCH_TOPICS[].search_terms（短词，OR 并联）")
+    print("                              topic 模式改 topic_query（必须短且通用，否则解析为 0 会直接报错）")
     print("  想换「搜到的里面留下什么」 → 改 RESEARCH_TOPICS[].keywords / description")
     print("  想换「期刊权重」          → 改 JOURNAL_TIERS（顺序即权重顺序）")
     print("  想换「内容加权 / 不看什么」→ 改 BONUS_RULES / EXCLUDE_RULES，或主题的 bonuses / exclude")

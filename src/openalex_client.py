@@ -204,7 +204,9 @@ def resolve_topics(query: str, limit: int | None = None) -> dict[str, str]:
     结果按 ``limit`` 取前若干个（默认 ``config.TOPIC_RESOLVE_LIMIT``），
     并缓存到 ``data/topics_cache.json``（同一个查询只联网一次）。
 
-    联网失败或查不到时返回空字典 —— 调用方会降级，不会抛异常打断整轮。
+    查不到时返回空字典 —— 但**不代表调用方可以当无事发生**：
+    ``build_filter`` 在 topic / both 模式下拿到空字典会直接抛 ``RuntimeError``，
+    把该主题当失败处理（否则就会静默变成「全部期刊近 N 天」的全库检索）。
     """
     query = (query or "").strip()
     if not query:
@@ -238,7 +240,12 @@ def resolve_topics(query: str, limit: int | None = None) -> dict[str, str]:
         if item.get("id")
     ]
     if not items:
-        log.warning("OpenAlex 没找到与 %r 匹配的主题，请换一个更通用的英文短语", query)
+        log.error(
+            "OpenAlex 里没有与 %r 匹配的主题（返回 0 条）：这个短语太窄/太长，"
+            "主题粒度到不了这么细。请改用更通用的英文短语（用 --find-topic 试），"
+            '或把 RETRIEVAL_MODE 改成 "keyword" 并用 search_terms 写字面短词。',
+            query,
+        )
         return {}
 
     _save_topic_cache(query, items)
@@ -283,17 +290,26 @@ def topic_filter_value(topic=None) -> str:
 def effective_keywords(keywords: list[str] | None, topic=None) -> list[str]:
     """keyword / both 模式下真正用于召回的词表。
 
-    优先用命令行传入的 ``--keywords``，其次用主题自己的 ``keywords``，
-    最后退回 ``config.USER_KEYWORDS``。
+    优先级：``--keywords``（命令行） > 主题自己的 ``search_terms`` >
+    主题自己的 ``keywords`` > ``config.USER_KEYWORDS``。
+
+    ``search_terms`` 是【召回用的短词】（要求能在标题/摘要里逐字出现），
+    ``keywords`` 是【给 AI 看的语义线索】（可以很长）。旧配置没写 ``search_terms``
+    时自动退回 ``keywords``，行为与以前一致。
 
     ⚠️ 这里必须兜底：否则 ``both`` 模式在没传 ``--keywords`` 时会**静默退化成
-    纯 topic 模式**，说是并集实际只走主题，现象是「改了 USER_KEYWORDS 也不涨候选量」。
+    纯 topic 模式**，说是并集实际只走主题，现象是「改了关键词也不涨候选量」。
     """
     if keywords:
         return [kw for kw in keywords if kw and kw.strip()]
     if topic is not None:
-        return list(topic.keywords)
+        return list(topic.search_terms) or list(topic.keywords)
     return list(config.USER_KEYWORDS)
+
+
+def _topic_label(topic) -> str:
+    """报错信息里的主题名（多主题时才有 topic 对象）。"""
+    return getattr(topic, "name", "") or config.RESEARCH_FIELD
 
 
 def build_filter(
@@ -313,6 +329,12 @@ def build_filter(
 
     ⚠️ ``title_and_abstract.search`` 必须写进 filter，不能作为 URL query 参数（会 400）。
     检索串本身不含逗号，因此与其它条件用逗号拼接是安全的。
+
+    ⚠️ **召回条件缺失时直接抛 ``RuntimeError``，绝不静默退化成「无过滤」**：
+    少一个召回条件，搜索结果就从「你关心的方向」变成「全部期刊近 N 天」，
+    而整轮跑完还是绿的、还会发信、还会把 DOI 记进去重库 —— 这种「看起来成功的错」
+    比直接失败坏得多（真实事故：topic_query 写得太长解析为 0 个主题，
+    两个主题各拿到同一批 300 篇无关论文，一个报 0 篇、一个报 4 篇）。
     """
     parts = [
         f"primary_location.source.issn:{ISSN_FILTER}",
@@ -325,24 +347,53 @@ def build_filter(
         topic_ids = topic_filter_value(topic)
         if topic_ids:
             parts.append(f"topics.id:{topic_ids}")
+        elif mode == "topic":
+            raise RuntimeError(
+                f"topic 模式但主题「{_topic_label(topic)}」没解析到任何 OpenAlex 主题 id"
+                "（多半是 topic_query 这个短语在 /topics 里查不到东西 —— "
+                "OpenAlex 的主题粒度很粗，短语一长就返回 0 条）。"
+                "本轮已中止该主题，以免静默退化成「全部期刊近 N 天」的全库检索。\n"
+                "  修法一：`python -m src.main --find-topic \"简短通用的英文短语\"` "
+                "试出能解析的短语（日志里能看到 Txxxxx 才算数）；\n"
+                '  修法二：把 RETRIEVAL_MODE 改成 "keyword"，并在该主题的 '
+                "search_terms 里写能在标题/摘要里逐字出现的短词。"
+            )
         else:
-            log.warning("topic 模式但没解析到任何主题 id，本轮将退化为无主题过滤（召回会暴涨）")
+            log.warning(
+                "both 模式但没解析到主题 id（%s）：本轮只走字面关键词召回", _topic_label(topic)
+            )
     if mode in ("keyword", "both"):
-        query = build_keyword_query(effective_keywords(keywords, topic))
+        words = effective_keywords(keywords, topic)
+        query = build_keyword_query(words)
         if query:
             parts.append(f"{SEARCH_FIELD}:{query}")
+        elif mode == "keyword":
+            raise RuntimeError(
+                f"keyword 模式但主题「{_topic_label(topic)}」的 search_terms / keywords 都是空的："
+                "第 1 层没有任何召回条件。本轮已中止该主题，"
+                "以免静默退化成「全部期刊近 N 天」的全库检索。\n"
+                "  修法：在该主题的 search_terms 里加几条短词（多条之间是 OR）。"
+            )
+        else:
+            log.warning("both 模式但字面词表为空（%s）：本轮只走主题召回", _topic_label(topic))
     return ",".join(parts)
 
 
 def _describe_filter(mode: str, keywords: list[str] | None, topic=None) -> str:
-    """给人看的检索条件说明，用于日志。"""
-    topics = active_topics(topic)
-    topic_desc = f"{list(topics.values())}（{'、'.join(topics)}）" if topics else "（未解析到主题）"
+    """给人看的检索条件说明，用于日志。
+
+    ⚠️ keyword 模式下**不要去解析主题**：那是一次多余的联网请求，
+    而且解析失败还会打出误导性的 WARNING（明明跟本轮召回无关）。
+    """
     words = effective_keywords(keywords, topic)
     if mode == "keyword":
-        return f"关键词 {words}"
+        return f"字面词组 {len(words)} 个：{'、'.join(words)}"
+    topic_desc = ""
+    if mode in ("topic", "both"):
+        topics = active_topics(topic)
+        topic_desc = f"{list(topics.values())}（{'、'.join(topics)}）" if topics else "（未解析到主题）"
     if mode == "both":
-        return f"主题 {topic_desc} + 关键词 {words}"
+        return f"主题 {topic_desc} + 字面词组 {words}"
     if mode == "topic":
         return f"主题 {topic_desc}"
     return f"未知模式 {mode!r}"

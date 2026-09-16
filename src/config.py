@@ -344,20 +344,29 @@ USER_KEYWORDS: list[str] = [
 # ---------------------------------------------------------------------------
 # 第 1 层检索策略
 # ---------------------------------------------------------------------------
-# "topic"  —— 用 OpenAlex 的**语义主题分类**（topics.id）召回（默认，推荐）
-#              优点：不依赖字面关键词，garnet electrolyte / LLZO /
-#                    sulfide electrolyte 这类论文也能被召回
-#              ⚠️ 代价：此模式下 USER_KEYWORDS 完全不参与召回（只当打分尺）
-# "keyword" —— 用 title_and_abstract.search 做字面关键词召回（召回低）
-# "both"    —— 两者取并集（召回最高，候选量也最大）
+# "keyword" —— 用 title_and_abstract.search 做**字面词组召回**（当前采用）
+# "topic"   —— 用 OpenAlex 的**语义主题分类**（topics.id）召回
+# "both"    —— 两者取并集
 #
-# ★ 想让 USER_KEYWORDS 真正影响"能搜到什么"，必须选 "both" 或 "keyword"。
+# ★ 当前为什么是 "keyword"：
+#   OpenAlex 的主题分类只有约 4500 个、粒度很粗，实测
+#     /topics?search="lithium-rich cathode"       → 0 条
+#     /topics?search="lithium-rich"               → 0 条
+#     /topics?search="sodium-ion battery"         → 0 条
+#   也就是说 topic 模式**根本表达不了**「富锂锰正极」「钠离子正极」，
+#   只能退回「电池材料」这种一锅端泛主题（14 本刊 30 天 237 篇，全靠 AI 去捞）。
+#   字面检索反而准得多：一组 search_terms OR 起来能把两个方向基本捞全（18 / 45 篇每 30 天）。
+#   于是分工是：第 1 层（字面检索）保证**不漏**，第 2 层（AI + description）保证**不滥**。
 #
-# 实测（11 本顶刊 / 近 30 天）：
+# ⚠️ 想切回语义主题：改成 "topic"，并给每个主题配上 "能解析到"的 topic_query
+#    （先用 `python -m src.main --find-topic "短语"` 试，日志里能解析出 Txxxxx 才算数）。
+#    解析不到时**会直接报错中断该主题**，不会再静默退化成"全库检索"。
+#
+# 实测（11 本顶刊 / 近 30 天，单方向「固态电池」的旧数据）：
 #   无过滤                        → 2069 篇
-#   keyword 模式（上面 5 个词）    →   36 篇   ← 召回严重不足
-#   topic   模式（T10281）        →  194 篇   ← 采用
-RETRIEVAL_MODE = "topic"
+#   keyword 模式（5 个长短语）     →   36 篇
+#   topic   模式（T10281）        →  194 篇
+RETRIEVAL_MODE = "keyword"
 
 # ★ 旋钮 A 的核心：topic / both 模式下，**这一行才决定"召回什么"**。
 # 一般就写你方向里最核心的那个英文词，不必和 USER_KEYWORDS 完全一致。
@@ -401,10 +410,37 @@ TOPICS: dict[str, str] = {}
 #                    全局的 BONUS_RULES / EXCLUDE_RULES 仍然照常生效，这里是叠加。
 #
 # 当前启用：两个方向（想回到单方向就把 RESEARCH_TOPICS 改回 []）
+#
+# 【三层字段的分工 —— 改方向前先看这一段】
+#   search_terms  【召回层】进 OpenAlex 的字面检索（title_and_abstract.search），
+#                 多条之间是 OR。必须是「能在真实标题/摘要里逐字出现」的短词。
+#                 ⚠️ 写长短语等于没写：实测 "lithium-rich layered oxide (LRLO / LMR)"
+#                    这类带括号/斜杠的短语命中数为 0，12 条长短语 OR 起来只有 1 篇/30 天。
+#   keywords      【打分层】给 AI 看的语义线索（"关注关键词"），可以写得又细又长，
+#                 它不要求能在标题里逐字出现，作用只是让 AI 判得更准。
+#   description   【打分层】这个方向「要什么 / 不要什么」的一段话，权重大于 keywords。
+#   topic_query   ⚠️ 当前**不生效**（RETRIEVAL_MODE = "keyword"），留空即可 ——
+#                 OpenAlex 的主题分类粒度太粗，没有「富锂锰正极」「钠离子正极」这种主题，
+#                 /topics?search= 对这两种说法一律返回 0 条，写了只是个坑（详见 RETRIEVAL_MODE 注释）。
 RESEARCH_TOPICS: list[dict] = [
     {
         "name": "富锂锰正极",
-        "topic_query": "lithium-rich manganese-based cathode",
+        # 留空 = 不走 topics.id。OpenAlex 没有这个主题（"lithium-rich" 查出来是 0 条）
+        "topic_query": "",
+        # 实测（14 本期刊 / 近 30 天，OR 并集 = 18 篇）：
+        #   "li-rich" 8 篇、"lithium-rich" 2 篇、"oxygen redox" 7 篇、
+        #   "anionic redox" 5 篇、"voltage decay" 4 篇、"voltage hysteresis" 1 篇
+        # ⚠️ 带上氧/阴离子氧化还原这类机理词会顺带捞到少量钠电论文 ——
+        #    这是**故意的**：宁可多召回几篇交给 AI 判，也不要漏。
+        "search_terms": [
+            "li-rich",
+            "lithium-rich",
+            "lithium rich",
+            "oxygen redox",
+            "anionic redox",
+            "voltage decay",
+            "voltage hysteresis",
+        ],
         "keywords": [
             # —— 材料本体 ——
             "lithium-rich layered oxide (LRLO / LMR)",
@@ -431,7 +467,24 @@ RESEARCH_TOPICS: list[dict] = [
     },
     {
         "name": "钠离子正极",
-        "topic_query": "sodium-ion battery cathode material",
+        # 留空 = 不走 topics.id。OpenAlex 没有这个主题
+        # （"sodium-ion battery" / "sodium-ion batteries" 查出来都是 0 条）
+        "topic_query": "",
+        # 实测（14 本期刊 / 近 30 天，OR 并集 ≈ 45 篇）：
+        #   "sodium-ion" 34 篇、"na-ion" 8 篇、"prussian blue" 5 篇，
+        #   另加几条高精度词兜住层状氧化物 / 普鲁士蓝的其它写法。
+        # ⚠️ 钠电方向必然会捞到硬碳负极、电解液、隔膜类论文 ——
+        #    交给第 2 层处理：AI 打分（description 里已写明「只看正极」）
+        #    + EXCLUDE_RULES（电解液工程 / 隔膜改性）。
+        "search_terms": [
+            "sodium-ion",
+            "sodium ion",
+            "na-ion",
+            "sodium layered oxide",
+            "prussian blue",
+            "na0.67mno2",
+            "sodium cathode",
+        ],
         "keywords": [
             # —— 材料体系（层状是重点，另有普鲁士蓝 / 聚阴离子）——
             "sodium-ion battery cathode",
@@ -484,6 +537,8 @@ class ResearchTopic:
 
     name: str
     topic_query: str = ""
+    #: 【召回层】进 OpenAlex 字面检索的短词（OR 联结）。留空则退回用 keywords 召回。
+    search_terms: list[str] = field(default_factory=list)
     keywords: list[str] = field(default_factory=list)
     description: str = ""
     topics: dict[str, str] = field(default_factory=dict)
@@ -499,6 +554,8 @@ class ResearchTopic:
         self.topic_query = (self.topic_query or "").strip()
         self.description = self.description or ""
         self.key = (self.key or "").strip() or self.name
+        self.search_terms = [str(term).strip() for term in self.search_terms if str(term).strip()]
+        self.keywords = [str(word).strip() for word in self.keywords if str(word).strip()]
 
     @property
     def email_title(self) -> str:
@@ -548,7 +605,8 @@ def active_research_topics() -> list[ResearchTopic]:
         candidate = ResearchTopic(
             name=str(item.get("name") or ""),
             topic_query=str(item.get("topic_query") or ""),
-            keywords=[str(kw).strip() for kw in (item.get("keywords") or []) if str(kw).strip()],
+            search_terms=[str(term) for term in (item.get("search_terms") or [])],
+            keywords=[str(kw) for kw in (item.get("keywords") or [])],
             description=str(item.get("description") or ""),
             topics=dict(item.get("topics") or {}),
             title=str(item.get("title") or ""),
@@ -682,6 +740,8 @@ def relevance_plan(mode: str = RETRIEVAL_MODE, topic: ResearchTopic | None = Non
     view = topic if topic is not None else _legacy_topic()
     query = view.topic_query
     keywords = list(view.keywords)
+    # ⚠️ 召回真正用的是 search_terms；只有它为空时才退回 keywords（兼容旧配置）
+    terms = list(view.search_terms) or keywords
 
     if mode == "topic":
         recall = (
@@ -694,10 +754,18 @@ def relevance_plan(mode: str = RETRIEVAL_MODE, topic: ResearchTopic | None = Non
             "想换召回方向 → 改 TOPIC_QUERY。详见 src/config.py 顶部「两把旋钮」说明。"
         )
     elif mode == "keyword":
-        recall = f"keyword（字面关键词）—— 由 USER_KEYWORDS 决定：{keywords}"
+        if terms:
+            recall = f"keyword（字面词组）—— 由 search_terms 决定，{len(terms)} 个词 OR 并联：{terms}"
+        else:
+            recall = (
+                "keyword（字面词组）—— ⚠️ search_terms 与 keywords 都是空的："
+                "本轮会**直接报错**（不再静默搜索全部期刊）"
+            )
         hint = (
-            "keyword 模式召回偏低（实测 5 个词/30 天仅 36 篇）。"
-            '除非你明确只要字面命中的论文，否则建议改用 "both"。'
+            "keyword 模式的召回量完全由 search_terms 决定："
+            "词写得太长（＞4 个词）或带括号/斜杠时 OpenAlex 命中数为 0，写了等于没写。"
+            "想更不漏 → 加同义词；想更准 → 删词。"
+            '想让 OpenAlex 主题分类也参与 → RETRIEVAL_MODE = "both"（前提是 topic_query 能解析到主题）。'
         )
     elif mode == "both":
         recall = f"both（并集）—— topics.id（TOPIC_QUERY={query!r}） ∪ 字面关键词 {keywords}"
@@ -756,10 +824,28 @@ def _topic_warnings(mode: str, view: ResearchTopic) -> list[str]:
             f"USER_KEYWORDS 为空（主题「{view.name}」）："
             "AI 只能靠方向名一句话打分，判准率会明显下降"
         )
+    if mode in ("keyword", "both") and not (view.search_terms or view.keywords):
+        problems.append(
+            f"keyword 模式但 search_terms 与 keywords 都为空（主题「{view.name}」）："
+            "第 1 层没有任何召回条件，该主题本轮会**直接报错**"
+            "（不再静默退化成「全部期刊近 N 天」的全库检索）"
+        )
+    for term in view.search_terms:
+        if any(char in term for char in "()/"):
+            problems.append(
+                f"search_terms 里的「{term}」（主题「{view.name}」）含括号或斜杠："
+                "OpenAlex 字面检索下这类词命中数几乎必然为 0（实测为 0），建议拆成不含符号的短词"
+            )
+        elif len(term.split()) > 4:
+            problems.append(
+                f"search_terms 里的「{term}」（主题「{view.name}」）有 {len(term.split())} 个词："
+                "词组越长命中越少（实测 >4 个词基本搜不到），建议缩短"
+            )
     if mode in ("topic", "both") and not view.topics and not view.topic_query.strip():
         problems.append(
             f"topic 模式但 TOPIC_QUERY 为空且 TOPICS 未手工指定（主题「{view.name}」）："
-            "解析不到主题 id，该主题会退化成无主题过滤（召回到全刊所有论文）"
+            "解析不到主题 id，该主题本轮会**直接报错**"
+            "（不再静默退化成「全部期刊近 N 天」的全库检索）"
         )
     problems.extend(validate_rule_list(view.bonuses, f"主题「{view.name}」的 bonuses"))
     problems.extend(validate_rule_list(view.exclude, f"主题「{view.name}」的 exclude"))

@@ -30,13 +30,13 @@ on:
         required: false
         type: string
       retrieval_mode:
-        description: "第 1 层检索方式：topic（语义主题，默认）/ keyword（字面关键词）/ both（并集）"
+        description: "第 1 层检索方式：keyword（字面短词，默认）/ topic（OpenAlex 语义主题，粒度粗）/ both（并集）"
         required: false
         type: choice
-        default: topic
+        default: keyword
         options:
-          - topic
           - keyword
+          - topic
           - both
       topic:
         description: "只跑指定主题（留空 = 跑全部；多个用英文逗号分隔，写 name 或 key 均可）"

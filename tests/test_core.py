@@ -127,12 +127,108 @@ class TestQueryBuilding(unittest.TestCase):
         self.assertIn("topics.id:", value)
         self.assertIn("title_and_abstract.search:", value)
 
-    def test_default_mode_is_topic(self):
-        """默认参数就应当是 topic —— 防止有人悄悄改回去。"""
+    def test_default_mode_is_keyword(self):
+        """默认参数应当是 keyword —— 防止有人悄悄改回 topic。
+
+        历史教训：默认曾经是 topic，但 OpenAlex 的主题分类粒度太粗。
+        实测 ``"sodium-ion battery"`` / ``"lithium-rich"`` 这类短语在
+        ``/topics?search=`` 里返回 **0 条**，于是每个主题都静默退化成
+        「全部期刊近 N 天」，两个主题拿到**同一批**无关论文，
+        最后一边报 0 篇、一边报 4 篇（看起来像「规则太严」，实际是没搜到）。
+        所以默认改成 keyword，并要求 search_terms 写能在标题/摘要里逐字出现的短词。
+        """
         from datetime import date
 
-        self.assertEqual(config.RETRIEVAL_MODE, "topic")
-        self.assertIn("topics.id:", build_filter(date(2026, 8, 16), ["x"]))
+        self.assertEqual(config.RETRIEVAL_MODE, "keyword")
+        value = build_filter(date(2026, 8, 16), ["x"])
+        self.assertIn("title_and_abstract.search:", value)
+        self.assertNotIn("topics.id:", value)
+
+
+class TestRecallTermsAreShortAndLiteral(unittest.TestCase):
+    """召回层（search_terms）与打分层（keywords）必须分开，且缺失时必须吵。
+
+    锁的是三件事：
+      1. 进 OpenAlex 的是 search_terms，不是给 AI 看的长句子 keywords；
+        没写 search_terms 的老主题要能退回 keywords（不能静默召回为空）；
+      2. 召回条件为空时 build_filter **抛异常**，不能静默搜全库
+         （真实事故：两个主题各拿到同一批 300 篇无关论文，一个报 0 篇、一个报 4 篇）；
+      3. 写得太长/带括号斜杠的 search_terms 会被 config 校验点名。
+    """
+
+    def test_search_terms_drive_recall_and_keywords_stay_out_of_the_query(self):
+        from datetime import date
+
+        topic = config.ResearchTopic(
+            name="富锂锰正极",
+            search_terms=["li-rich", "oxygen redox"],
+            keywords=["lithium-rich layered oxide (LRLO / LMR) —— 给 AI 看的语义线索"],
+        )
+        value = build_filter(date(2026, 8, 16), None, mode="keyword", topic=topic)
+        self.assertIn('"li-rich" OR "oxygen redox"', value)
+        self.assertNotIn("LRLO", value)
+
+    def test_missing_search_terms_fall_back_to_keywords(self):
+        """老配置（只有 keywords）行为不变：这才是「向后兼容」的含义。"""
+        from datetime import date
+
+        topic = config.ResearchTopic(name="老主题", keywords=["solid-state battery"])
+        value = build_filter(date(2026, 8, 16), None, mode="keyword", topic=topic)
+        self.assertIn('"solid-state battery"', value)
+
+    def test_empty_search_terms_raises_instead_of_searching_everything(self):
+        from datetime import date
+
+        topic = config.ResearchTopic(name="空主题")
+        with self.assertRaises(RuntimeError) as ctx:
+            build_filter(date(2026, 8, 16), None, mode="keyword", topic=topic)
+        self.assertIn("空主题", str(ctx.exception))
+        self.assertIn("全库检索", str(ctx.exception))
+
+    def test_unresolved_topic_ids_raise_in_topic_mode(self):
+        """topic 模式解析到 0 个 id 时必须抛错 —— 静默退化的代价是「绿着跑错」。"""
+        from datetime import date
+
+        with patch.object(openalex_client, "topic_filter_value", return_value=""):
+            with self.assertRaises(RuntimeError) as ctx:
+                build_filter(date(2026, 8, 16), ["x"], mode="topic", topic=None)
+        self.assertIn("全库检索", str(ctx.exception))
+
+    def test_both_mode_degrades_loudly_when_topic_ids_missing(self):
+        """both 模式有字面词兜底，所以不抛错，但必须留下 WARNING。"""
+        from datetime import date
+
+        with patch.object(openalex_client, "topic_filter_value", return_value=""):
+            with self.assertLogs(openalex_client.log, level="WARNING") as captured:
+                value = build_filter(date(2026, 8, 16), ["li-rich"], mode="both")
+        self.assertNotIn("topics.id", value)
+        self.assertIn("title_and_abstract.search:", value)
+        self.assertTrue(any("只走字面关键词召回" in line for line in captured.output))
+
+    def test_config_flags_symbols_and_long_phrases_in_search_terms(self):
+        topic = config.ResearchTopic(
+            name="X",
+            search_terms=["lithium-rich layered oxide (LRLO / LMR)", "one two three four five"],
+            keywords=["keep"],
+        )
+        problems = config.topic_warnings("keyword", topic)
+        self.assertTrue(any("括号或斜杠" in p for p in problems))
+        self.assertTrue(any("个词" in p and "缩短" in p for p in problems))
+
+    def test_config_flags_empty_recall_terms_in_keyword_mode(self):
+        topic = config.ResearchTopic(name="X", keywords=[])
+        problems = config.topic_warnings("keyword", topic)
+        self.assertTrue(any("直接报错" in p for p in problems))
+
+    def test_live_config_recall_terms_are_clean(self):
+        """真实 config 的 search_terms 必须过校验，且每个主题都要有召回词。"""
+        for topic in config.active_research_topics():
+            self.assertTrue(topic.search_terms, f"主题「{topic.name}」没有 search_terms")
+            problems = [
+                p for p in config.topic_warnings("keyword", topic)
+                if "search_terms" in p
+            ]
+            self.assertEqual(problems, [], f"主题「{topic.name}」的 search_terms 有问题：{problems}")
 
 
 class TestResearchDirectionIsConfigurable(unittest.TestCase):
@@ -315,11 +411,16 @@ class TestConfigWarnings(unittest.TestCase):
         problems = config.config_warnings("topic")
         self.assertTrue(any("USER_KEYWORDS 为空" in p for p in problems))
 
-    def test_topic_mode_without_any_topic_source_warns(self):
+    def test_topic_mode_without_any_topic_source_says_it_will_fail(self):
+        """没主题可解析时必须说清楚「会直接报错」，而不是「退化成全库检索」。
+
+        因为现在真的会报错（build_filter 抛 RuntimeError），
+        提醒文案与行为不一致的话，看日志的人会被引到错的方向。
+        """
         config.TOPICS = {}
         config.TOPIC_QUERY = "   "
         problems = config.config_warnings("topic")
-        self.assertTrue(any("退化成无主题过滤" in p for p in problems))
+        self.assertTrue(any("直接报错" in p and "全库检索" in p for p in problems))
 
         # 手工锁定了 TOPICS 后就不该再报
         config.TOPICS = {"X": "T1"}
