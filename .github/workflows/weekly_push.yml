@@ -1,20 +1,23 @@
 name: weekly-literature-push
 
-# 每周三 23:07（北京时间）自动运行 + 支持手动触发
+# 每周五 23:07（北京时间）自动运行 + 支持手动触发
+#
+# 多主题：src/config.py 里的 RESEARCH_TOPICS 有几个主题，就跑几个，
+#         每个主题各自检索、各自打分、**各发一封邮件、各记各的已推送记录**。
 #
 # timezone 字段是 GitHub Actions 官方支持的写法（IANA 时区名），
-# 因此无需再手工做 UTC 换算（若写成 UTC 则是 "7 15 * * 3"）。
+# 因此无需再手工做 UTC 换算（若写成 UTC 则是 "7 15 * * 5"）。
 #
 # 为什么是 07 分而不是整点 00 分：GitHub 官方文档明确说明 schedule 事件
 # 在 Actions 负载高峰时会被延迟，而"高峰期包括每个整点"，
-# 故避开整点能显著降低延迟概率。改回整点只需把 cron 写成 "0 23 * * 3"。
+# 故避开整点能显著降低延迟概率。改回整点只需把 cron 写成 "0 23 * * 5"。
 #
 # 下面三个 action 都用 v7：旧版（checkout@v4 / setup-python@v5 /
 # upload-artifact@v4）内部声明的是 Node 20，而 Node 20 已于 2026-09-23
 # 从 GitHub runner 上彻底移除，届时会直接报错。v7 系列声明的是 node24。
 on:
   schedule:
-    - cron: "7 23 * * 3"
+    - cron: "7 23 * * 5"
       timezone: "Asia/Shanghai"
   workflow_dispatch:
     inputs:
@@ -35,6 +38,10 @@ on:
           - topic
           - keyword
           - both
+      topic:
+        description: "只跑指定主题（留空 = 跑全部；多个用英文逗号分隔，写 name 或 key 均可）"
+        required: false
+        type: string
 
 # 允许把更新后的 data/pushed_dois.json 提交回仓库
 permissions:
@@ -91,6 +98,15 @@ jobs:
           if [ -n "${{ inputs.retrieval_mode }}" ]; then
             ARGS+=("--retrieval-mode" "${{ inputs.retrieval_mode }}")
           fi
+          if [ -n "${{ inputs.topic }}" ]; then
+            IFS=',' read -ra PICKED <<< "${{ inputs.topic }}"
+            for one in "${PICKED[@]}"; do
+              one="$(echo "$one" | xargs)"      # 去掉前后空格
+              if [ -n "$one" ]; then
+                ARGS+=("--topic" "$one")
+              fi
+            done
+          fi
           echo "运行参数：${ARGS[*]:-（无）}"
           python -m src.main -v "${ARGS[@]}"
 
@@ -113,9 +129,15 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
-      # 只在流水线成功（即邮件确实发出）后才回写状态
+      # 回写去重状态。
+      #
+      # 为什么是 always() 而不是 success()：多主题模式下每个主题各自发信、各自回写，
+      # 其中一个主题失败时其余主题的邮件是**真的发出去了**，那些记录必须提交，
+      # 否则下周会把同一批文献重复推给你。安全性由程序本身保证 ——
+      # 状态文件里只会有「邮件确实发出」的记录（发信成功后才写盘），
+      # 且发信前失败时文件无变化，下面的 git diff 守卫会直接跳过提交。
       - name: Commit pushed DOIs
-        if: success() && inputs.dry_run != true
+        if: always() && inputs.dry_run != true
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"

@@ -289,7 +289,7 @@ Write-Host "===============================================" -ForegroundColor Wh
 Write-Host @"
 
  接下来会发生什么：
-   * 下次定时任务（每周三 23:07 北京时间）会直接用新配置
+   * 下次定时任务（每周五 23:07 北京时间）会直接用新配置
    * 想立刻验证：GitHub → Actions → weekly-literature-push → Run workflow
      第一次务必勾上 dry_run（不发信，只产出 HTML 预览 artifact）
 

@@ -29,6 +29,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formatdate, make_msgid
 
+from . import ranking
 from .config import (
     EMAIL_TITLE,
     MAX_EMAIL_ITEMS,
@@ -80,7 +81,21 @@ def _render_card(work: dict) -> str:
     doi = work.get("doi") or ""
     doi_url = work.get("doi_url") or (f"https://doi.org/{doi}" if doi else "")
 
+    # 最终分 = AI 相关性分 + 期刊档次加成（缺失排序字段时退化成 AI 分，测试友好）
+    ai_score = work.get("ai_score")
+    bonus = int(work.get("journal_bonus") or 0)
+    tier = str(work.get("journal_tier") or "").strip()
+    if work.get("final_score") is None:
+        final_score = int(ai_score or 0) + bonus
+    else:
+        final_score = int(work["final_score"])
+
     tags: list[str] = []
+    if bonus > 0:
+        tags.append(
+            f'<span style="{_STYLE["tag"]}">{_esc(tier)} +{bonus}'
+            f'（AI {_esc(ai_score)}）</span>'
+        )
     if not (work.get("abstract") or "").strip():
         tags.append(f'<span style="{_STYLE["tag"]}">依据：标题（摘要缺失）</span>')
     if work.get("ai_error"):
@@ -103,7 +118,7 @@ def _render_card(work: dict) -> str:
   <div style="{_STYLE['meta']}">
     <span style="{_STYLE['journal']}">{_esc(work.get('journal'))}</span>
     &nbsp;·&nbsp;{_esc(work.get('pub_date') or '日期未知')}
-    <span style="{_STYLE['score']}">AI {_esc(work.get('ai_score'))}</span>
+    <span style="{_STYLE['score']}">{'最终' if bonus > 0 else 'AI'} {_esc(final_score)} 分</span>
     &nbsp;{tag_html}
   </div>
   <div style="{_STYLE['title']}">{_esc(work.get('title'))}</div>
@@ -122,16 +137,27 @@ def build_html(
     total_candidates: int = 0,
     after_dedup: int = 0,
     ai_failed: int = 0,
+    title: str | None = None,
+    extra_meta: str = "",
+    max_items: int | None = None,
 ) -> tuple[str, str]:
     """渲染邮件正文。
 
+    :param title: 邮件标题前缀；为空时用 ``config.EMAIL_TITLE``
+                  （多主题调研时每个主题传自己的标题）。
+    :param extra_meta: 追加到头部元信息行末尾的说明（已转义前的纯文本）。
+    :param max_items: 单封最多展示篇数；默认 ``config.MAX_EMAIL_ITEMS``。
     :return: ``(html, 纯文本备选)``
     """
+    email_title = title or EMAIL_TITLE
+    limit = MAX_EMAIL_ITEMS if max_items is None else max(1, int(max_items))
     scope = "首次预热" if first_run else "常规滚动"
     meta_line = (
         f"检索窗口：近 {lookback_days} 天（{scope}） &nbsp;·&nbsp; "
         f"候选 {total_candidates} 篇 &nbsp;·&nbsp; 去重后 {after_dedup} 篇"
     )
+    if extra_meta:
+        meta_line = f"{meta_line} &nbsp;·&nbsp; {_esc(extra_meta)}"
 
     if not works:
         body = f"""\
@@ -142,14 +168,14 @@ def build_html(
   <div style="margin-top:12px;font-size:12px;color:#9ca3af;">{meta_line}</div>
 </div>"""
         plain = (
-            f"{EMAIL_TITLE} · {run_date}\n"
+            f"{email_title} · {run_date}\n"
             f"本周没有新的相关文献。\n"
             f"检索窗口：近 {lookback_days} 天（{scope}）\n"
             f"候选 {total_candidates} 篇，去重后 {after_dedup} 篇。\n"
         )
-        return _wrap(body, run_date, meta_line), plain
+        return _wrap(body, run_date, meta_line, email_title), plain
 
-    shown = works[:MAX_EMAIL_ITEMS]
+    shown = works[:limit]
     overflow = len(works) - len(shown)
 
     cards = "\n".join(_render_card(work) for work in shown)
@@ -157,8 +183,8 @@ def build_html(
     notices: list[str] = []
     if overflow > 0:
         notices.append(
-            f"另有 <b>{overflow}</b> 篇相关文献因单封邮件上限（{MAX_EMAIL_ITEMS} 篇）未在此展示，"
-            "已按相关性评分降序截断。"
+            f"另有 <b>{overflow}</b> 篇相关文献因单封邮件上限（{limit} 篇）未在此展示，"
+            "已按<b>最终分（AI 相关性分 + 期刊档次加成）</b>降序截断。"
         )
     if ai_failed:
         notices.append(f"有 <b>{ai_failed}</b> 篇文献 AI 打分失败，本次未纳入统计（详见运行日志）。")
@@ -171,11 +197,11 @@ def build_html(
 
     body = f'{notice_html}\n{cards}'
 
-    plain_lines = [f"{EMAIL_TITLE} · {run_date}（{len(shown)} 篇）", ""]
+    plain_lines = [f"{email_title} · {run_date}（{len(shown)} 篇）", ""]
     for index, work in enumerate(shown, start=1):
         plain_lines += [
             f"{index}. {work.get('title')}",
-            f"   [{work.get('journal')}] {work.get('pub_date')} · AI 评分 {work.get('ai_score')}",
+            f"   [{work.get('journal')}] {work.get('pub_date')} · {ranking.breakdown(work)} 分",
         ]
         if work.get("ai_takeaway"):
             plain_lines.append(f"   解读：{work['ai_takeaway']}")
@@ -186,10 +212,10 @@ def build_html(
     plain_lines += [f"检索窗口：近 {lookback_days} 天（{scope}），候选 {total_candidates} 篇。"]
     plain = "\n".join(plain_lines)
 
-    return _wrap(body, run_date, meta_line), plain
+    return _wrap(body, run_date, meta_line, email_title), plain
 
 
-def _wrap(body: str, run_date: str, meta_line: str) -> str:
+def _wrap(body: str, run_date: str, meta_line: str, title: str | None = None) -> str:
     return f"""\
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -197,12 +223,13 @@ def _wrap(body: str, run_date: str, meta_line: str) -> str:
 <body style="{_STYLE['body']}">
   <div style="{_STYLE['wrapper']}">
     <div style="{_STYLE['header']}">
-      <p style="{_STYLE['header_title']}">{_esc(EMAIL_TITLE)} · {_esc(run_date)}</p>
+      <p style="{_STYLE['header_title']}">{_esc(title or EMAIL_TITLE)} · {_esc(run_date)}</p>
       <p style="{_STYLE['header_meta']}">{meta_line}</p>
     </div>
     {body}
     <p style="{_STYLE['footer']}">
       本邮件由 GitHub Actions 自动生成。期刊范围与关键词可在仓库 <code>src/config.py</code> 中调整。<br>
+      排序规则：最终分 = AI 相关性分 + 期刊档次加成（正刊/大子刊/Joule/小子刊/JACS/Angew/AM）。<br>
       邮件正文中所有字段均已做 HTML 转义，DOI 链接指向 doi.org 官方解析。
     </p>
   </div>
@@ -268,16 +295,18 @@ def send_mail(subject: str, html_body: str, plain_body: str, recipients: list[st
     log.info("邮件已发送至 %s（主题：%s）", ", ".join(recipients), subject)
 
 
-def build_subject(works: list[dict], run_date: str) -> str:
+def build_subject(works: list[dict], run_date: str, title: str | None = None) -> str:
     """邮件主题。
 
     ``main.py`` 与 ``send()`` 都要用它，之前两处各写一份已出现过不一致，
-    现在统一到这里，标题前缀由 ``config.EMAIL_TITLE`` 派生。
+    现在统一到这里，标题前缀默认由 ``config.EMAIL_TITLE`` 派生；
+    多主题调研时由调用方传入该主题自己的标题。
     """
+    prefix = title or EMAIL_TITLE
     if works:
         count = min(len(works), MAX_EMAIL_ITEMS)
-        return f"{EMAIL_TITLE} · {run_date} · {count} 篇"
-    return f"{EMAIL_TITLE} · {run_date} · 本周无新文献"
+        return f"{prefix} · {run_date} · {count} 篇"
+    return f"{prefix} · {run_date} · 本周无新文献"
 
 
 def send(
@@ -290,6 +319,7 @@ def send(
     after_dedup: int = 0,
     ai_failed: int = 0,
     recipients: list[str] | None = None,
+    title: str | None = None,
 ) -> dict:
     """渲染并发送。返回统计信息供日志记录。
 
@@ -304,19 +334,23 @@ def send(
         total_candidates=total_candidates,
         after_dedup=after_dedup,
         ai_failed=ai_failed,
+        title=title,
     )
 
-    subject = build_subject(works, run_date)
+    subject = build_subject(works, run_date, title)
     send_mail(subject, html_body, plain_body, recipients=recipients)
     return {"subject": subject, "count": min(len(works), MAX_EMAIL_ITEMS), "html": html_body}
 
 
-def save_preview(html_body: str, run_date: str, outbox_dir: str) -> str:
-    """``--dry-run`` 模式：把邮件 HTML 写到本地文件，供浏览器预览。"""
+def save_preview(html_body: str, run_date: str, outbox_dir: str, suffix: str = "") -> str:
+    """``--dry-run`` 模式：把邮件 HTML 写到本地文件，供浏览器预览。
+
+    ``suffix`` 用于多主题时区分每个主题的预览（如 ``-无负极钠离子电池``）。
+    """
     import os
 
     os.makedirs(outbox_dir, exist_ok=True)
-    path = os.path.join(outbox_dir, f"{run_date}.html")
+    path = os.path.join(outbox_dir, f"{run_date}{suffix}.html")
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(html_body)
     log.info("[dry-run] 邮件预览已写入：%s", path)

@@ -46,14 +46,16 @@ from .config import (
 log = logging.getLogger(__name__)
 
 
-def build_system_prompt() -> str:
+def build_system_prompt(topic=None) -> str:
     """构造 system prompt。
 
     做成函数而不是模块级常量：这样它总是反映 **当前** 的 ``config``，
     测试或运行期改配置都不会拿到过期文本。
+    ``topic`` 为空时用 ``config.RESEARCH_FIELD``（单方向模式）。
     """
+    field = topic.name if topic is not None else config.RESEARCH_FIELD
     return (
-        f"你是学术文献筛选助手，服务于一位研究「{config.RESEARCH_FIELD}」的研究生。"
+        f"你是学术文献筛选助手，服务于一位研究「{field}」的研究生。"
         "你的任务是判断论文与用户研究方向的相关性，并给出中文解读。"
         "你只输出一个 JSON 对象，不输出任何解释性文字、不使用 Markdown 代码块。"
     )
@@ -146,8 +148,13 @@ def normalize_result(data: dict) -> tuple[int, str, str]:
 # ---------------------------------------------------------------------------
 # 单篇调用
 # ---------------------------------------------------------------------------
-def build_prompt(work: dict, keywords: list[str] | None = None) -> str:
-    """拼出单篇论文的 user prompt。``keywords=None`` 时用 config 的研究方向。"""
+def build_prompt(work: dict, keywords: list[str] | None = None, topic=None) -> str:
+    """拼出单篇论文的 user prompt。
+
+    判据优先级：显式 ``keywords`` > ``topic`` 的方向描述 > ``config`` 的研究方向。
+    注意 ``keywords`` 与 ``topic`` 是**两种不同**的粒度：前者只是一串词，
+    后者带方向名与补充说明（更准）。
+    """
     abstract = (work.get("abstract") or "").strip()
     if abstract:
         abstract_block = abstract[:ABSTRACT_MAX_CHARS]
@@ -159,7 +166,12 @@ def build_prompt(work: dict, keywords: list[str] | None = None) -> str:
             "若仅凭标题无法确定，宁可给低分并在 reason 里说明依据不足）"
         )
 
-    brief = config.research_brief() if keywords is None else "、".join(keywords)
+    if keywords:
+        brief = "、".join(keywords)
+    elif topic is not None:
+        brief = topic.brief()
+    else:
+        brief = config.research_brief()
     return USER_TEMPLATE.format(
         keywords=brief,
         journal=work.get("journal") or "未知期刊",
@@ -186,18 +198,18 @@ def _post_chat(payload: dict) -> str:
     return resp.json()["choices"][0]["message"]["content"]
 
 
-def call_ai(work: dict, keywords: list[str] | None = None) -> tuple[int, str, str]:
+def call_ai(work: dict, keywords: list[str] | None = None, topic=None) -> tuple[int, str, str]:
     """调用 AI 并返回 ``(score, takeaway, reason)``。失败时抛出异常由上层处理。
 
-    ``keywords=None`` 表示使用 config 里的完整研究方向描述。
+    ``keywords=None`` 表示使用 ``topic``（或 config）的完整研究方向描述。
     """
     global _json_mode_supported
 
     payload = {
         "model": AI_MODEL,
         "messages": [
-            {"role": "system", "content": build_system_prompt()},
-            {"role": "user", "content": build_prompt(work, keywords)},
+            {"role": "system", "content": build_system_prompt(topic)},
+            {"role": "user", "content": build_prompt(work, keywords, topic)},
         ],
         "temperature": AI_TEMPERATURE,
     }
@@ -235,7 +247,14 @@ def call_ai(work: dict, keywords: list[str] | None = None) -> tuple[int, str, st
     raise RuntimeError(f"AI 调用失败: {last_error}")
 
 
-def evaluate_one(work: dict, keywords: list[str] | None = None) -> dict:
+def _dispatch_call(work: dict, keywords: list[str] | None, topic) -> tuple[int, str, str]:
+    """单方向模式下只传两个参数调 ``call_ai``（保持向后兼容），有主题时再传第三个。"""
+    if topic is None:
+        return call_ai(work, keywords)
+    return call_ai(work, keywords, topic)
+
+
+def evaluate_one(work: dict, keywords: list[str] | None = None, topic=None) -> dict:
     """给单篇文献打分，返回带 ``ai_score`` / ``ai_takeaway`` / ``ai_reason`` 的副本。
 
     即使 AI 失败也会返回结果（``ai_error=True`` + 保守分 0），
@@ -243,7 +262,7 @@ def evaluate_one(work: dict, keywords: list[str] | None = None) -> dict:
     """
     result = dict(work)
     try:
-        score, takeaway, reason = call_ai(work, keywords)
+        score, takeaway, reason = _dispatch_call(work, keywords, topic)
         result.update(ai_score=score, ai_takeaway=takeaway, ai_reason=reason, ai_error=False)
     except Exception as exc:
         log.error("AI 打分失败 %s: %s", work.get("doi"), exc)
@@ -264,6 +283,7 @@ def evaluate_works(
     keywords: list[str] | None = None,
     threshold: int = AI_THRESHOLD,
     max_workers: int = AI_MAX_WORKERS,
+    topic=None,
 ) -> tuple[list[dict], list[dict], list[dict]]:
     """并发打分，并按阈值把结果分成三堆。
 
@@ -275,7 +295,8 @@ def evaluate_works(
     之所以要把"低于阈值"单独返回：候选量有近 200 篇而邮件只发 20 篇，
     若不记录这些已判定过的文献，下周它们会被原封不动地重新打分一遍。
 
-    :param keywords: 打分判据；``None`` 表示用 config 的研究方向描述。
+    :param keywords: 打分判据；``None`` 表示用 ``topic``（或 config）的研究方向描述。
+    :param topic: ``config.ResearchTopic``；多主题调研时每个主题各用各的判据。
     """
     if not works:
         return [], [], []
@@ -284,7 +305,7 @@ def evaluate_works(
     scored: list[dict] = []
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(evaluate_one, work, keywords): work for work in works}
+        futures = {pool.submit(evaluate_one, work, keywords, topic): work for work in works}
         for index, future in enumerate(as_completed(futures), start=1):
             try:
                 scored.append(future.result())

@@ -44,23 +44,18 @@ import logging
 import sys
 import traceback
 
-from . import abstract_source, ai_matcher, dedup, mailer, openalex_client
+from . import abstract_source, ai_matcher, config, dedup, mailer, openalex_client, ranking
 from .config import (
     AI_THRESHOLD,
-    EMAIL_TITLE,
     ISSN_FILTER,
     LOOKBACK_DAYS,
     LOOKBACK_DAYS_FIRST_RUN,
     MAX_EMAIL_ITEMS,
     MAX_WORKS_FETCH,
     OUTBOX_DIR,
-    RESEARCH_DESCRIPTION,
     RESEARCH_FIELD,
     RETRIEVAL_MODE,
-    TOPICS,
     TOPIC_QUERY,
-    USER_KEYWORDS,
-    config_warnings,
     mail_recipients,
     relevance_plan,
     validate_env,
@@ -77,17 +72,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m src.main",
         description=(
-            f"文献自动推送机器人：OpenAlex 检索 → AI 相关性筛选 → 邮件周报"
-            f"（当前研究方向：{RESEARCH_FIELD}）"
+            "文献自动推送机器人：OpenAlex 检索 → AI 相关性筛选 → 期刊加权排序"
+            " → 邮件周报（支持多主题，每个主题一封邮件）"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "示例：\n"
             "  python -m src.main --dry-run --verbose\n"
             "  python -m src.main --lookback-days 90 --max-items 50\n"
+            "  python -m src.main --topic 富锂锰正极 --dry-run\n"
             "  python -m src.main --no-ai --to me@example.com\n"
             "  python -m src.main --find-topic \"perovskite solar cell\"\n"
-            "\n换研究方向只需改 src/config.py 的「研究方向」段落。\n"
+            "\n多个主题只需在 src/config.py 的 RESEARCH_TOPICS 里加一项，本文件无需改动。\n"
         ),
     )
     parser.add_argument(
@@ -158,6 +154,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--topic",
+        action="append",
+        default=None,
+        metavar="NAME",
+        help=(
+            "只跑指定主题（按 RESEARCH_TOPICS 里的 name 或 key 匹配，可重复："
+            "--topic A --topic B）；不传则跑全部主题"
+        ),
+    )
+    parser.add_argument(
         "--show-config",
         action="store_true",
         help=(
@@ -222,39 +228,67 @@ def find_topic(query: str) -> int:
 # --show-config 辅助命令
 # ---------------------------------------------------------------------------
 def show_config(args: argparse.Namespace) -> int:
-    """离线打印「这一轮靠什么召回、靠什么打分」，不联网、不发邮件。
+    """离线打印「这一轮靠什么召回、靠什么打分、靠什么排序」，不联网、不发邮件。
 
     为什么需要它：默认 topic 模式下 USER_KEYWORDS 不参与召回，
-    改完它跑一遍会发现候选量毫无变化。这个命令把两层的分工直接摊开，
+    改完它跑一遍会发现候选量毫无变化。这个命令把各层的分工直接摊开，
     免得每次都要靠猜或者等一次完整的联网运行。
     """
     mode = args.retrieval_mode
+    topics = _select_topics(args)
+    multi = len(topics) > 1
+
     print()
-    print(f"{EMAIL_TITLE} · 生效配置（离线查看，未联网）")
+    print("文献推送 · 生效配置（离线查看，未联网）")
     print("-" * 68)
-    print(f"  研究方向        {RESEARCH_FIELD}")
-    print(f"  补充说明        {RESEARCH_DESCRIPTION.strip() or '（未设置）'}")
-    print(f"  USER_KEYWORDS   {USER_KEYWORDS or '（空）'}")
-    print(f"  TOPIC_QUERY     {TOPIC_QUERY!r}")
-    print(f"  TOPICS          {TOPICS or '（空 → 按 TOPIC_QUERY 自动解析）'}")
+    print(
+        f"  主题            {len(topics)} 个"
+        f"（来源：{'RESEARCH_TOPICS' if config.RESEARCH_TOPICS else '单方向 RESEARCH_FIELD 等'}，"
+        "每个主题一封邮件、各记各的已推送记录）"
+    )
+    for index, topic in enumerate(topics, start=1):
+        print(f"  {index}. {topic.name}")
+        print(f"     邮件标题    {topic.email_title}")
+        print(f"     TOPIC_QUERY {topic.topic_query!r}")
+        print(f"     TOPICS      {topic.topics or '（空 → 按 TOPIC_QUERY 自动解析）'}")
+        print(f"     USER_KEYWORDS {list(topic.keywords) or '（空）'}")
+        print(f"     补充说明    {topic.description.strip() or '（未设置）'}")
+        print(f"     去重分区键  {topic.key}")
     print(f"  期刊            {len(ISSN_FILTER.split('|'))} 本")
     print(
         f"  时间窗          首次 {LOOKBACK_DAYS_FIRST_RUN} 天 / 之后 {LOOKBACK_DAYS} 天"
         f"（最多拉取 {MAX_WORKS_FETCH} 篇）"
     )
     print(f"  AI 入选线       ≥ {AI_THRESHOLD} 分，单封最多展示 {MAX_EMAIL_ITEMS} 篇")
+    print(f"  排序规则        {ranking.describe()}")
+    print(
+        "  期刊加成        "
+        + " ｜ ".join(f"{tier} +{bonus}" for tier, bonus in ranking.tiers())
+        + " ｜ 其它 +0"
+    )
     print(f"  本轮检索模式    {mode}")
     print("-" * 68)
-    for label, detail in relevance_plan(mode):
-        print(f"  【{label}】{detail}")
-    problems = config_warnings(mode)
-    if problems:
+    for index, topic in enumerate(topics, start=1):
+        if multi:
+            print(f"  ── 主题「{topic.name}」（{index}/{len(topics)}）")
+        for label, detail in relevance_plan(mode, topic):
+            print(f"  【{label}】{detail}")
+    notices = config.config_notices()
+    problems = config.config_warnings(mode)
+    if multi:
+        for topic in topics:
+            problems += config.topic_warnings(mode, topic)
+    if notices or problems:
         print()
+        for notice in notices:
+            print(f"  ℹ️  {notice}")
         for problem in problems:
             print(f"  ⚠️  {problem}")
     print("-" * 68)
-    print("  想换「能搜到什么」        → 改 RETRIEVAL_MODE / TOPIC_QUERY")
-    print("  想换「搜到的里面留下什么」 → 改 RESEARCH_FIELD / RESEARCH_DESCRIPTION / USER_KEYWORDS")
+    print("  想换「能搜到什么」        → 改 RETRIEVAL_MODE / RESEARCH_TOPICS[].topic_query")
+    print("  想换「搜到的里面留下什么」 → 改 RESEARCH_TOPICS[].keywords / description")
+    print("  想换「期刊权重」          → 改 JOURNAL_TIERS（顺序即权重顺序）")
+    print("  想换「有哪些主题」        → 改 RESEARCH_TOPICS（空 = 回到单方向模式）")
     print("  真正解析出的主题 id 要看联网日志：python -m src.main --dry-run -v")
     print()
     return 0
@@ -263,50 +297,157 @@ def show_config(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
+def _safe_filename(name: str) -> str:
+    """把主题名变成安全的文件名片段（Windows 不允许 \\ / : * ? " < > |）。"""
+    cleaned = "".join("_" if ch in '\\/:*?"<>|' else ch for ch in name).strip()
+    return cleaned or "topic"
+
+
+def _select_topics(args: argparse.Namespace) -> list[config.ResearchTopic]:
+    """根据 ``--topic`` 选出本轮要跑的主题；不传则全部。"""
+    topics = config.active_research_topics()
+    wanted = [str(name).strip() for name in (getattr(args, "topic", None) or []) if str(name).strip()]
+    if not wanted:
+        return topics
+
+    by_name = {topic.name: topic for topic in topics}
+    by_key = {topic.key: topic for topic in topics}
+    picked: list[config.ResearchTopic] = []
+    for name in wanted:
+        topic = by_name.get(name) or by_key.get(name)
+        if topic is None:
+            raise RuntimeError(
+                f"--topic {name!r} 不存在。当前可用主题：{'、'.join(by_name) or '（无）'}"
+            )
+        if topic not in picked:
+            picked.append(topic)
+    return picked
+
+
+def _describe_pushed_state(topics: list[config.ResearchTopic]) -> str:
+    """一句话说明去重库现状，含"孤儿分区"提醒。"""
+    counts = dedup.topic_counts()
+    text = f"去重库分区 {counts or '（空）'}"
+    orphans = dedup.orphan_topic_keys([topic.key for topic in topics])
+    if orphans:
+        text += (
+            f"；⚠️ 状态文件里有当前没在用的分区 {orphans}"
+            "（旧记录仍在，但不再参与去重 → 这些主题会重新走首次运行的 30 天预热）"
+        )
+    return text
+
+
 def run(args: argparse.Namespace) -> int:
+    """多主题编排：对每个主题各跑一遍完整链路，各发一封邮件。"""
     run_date = today_str()
+    mode = args.retrieval_mode
+    topics = _select_topics(args)
     keywords = parse_keywords(args.keywords)
 
     log.info("=" * 68)
-    log.info("%s · 运行开始（%s）", EMAIL_TITLE, run_date)
-    # 把「两把旋钮」的分工直接打出来：topic 模式下改 USER_KEYWORDS 不会改变候选量，
-    # 这是本项目最容易让人误判成 bug 的地方，所以每轮都明说一下。
-    for label, detail in relevance_plan(args.retrieval_mode):
-        log.info("【%s】%s", label, detail)
+    log.info("文献推送 · 运行开始（%s）· %s 个主题", run_date, len(topics))
+    for index, topic in enumerate(topics, start=1):
+        log.info("【主题 %s/%s】%s（邮件标题：%s）", index, len(topics), topic.name, topic.email_title)
+        for label, detail in relevance_plan(mode, topic):
+            log.info("  【%s】%s", label, detail)
+    log.info("【排序】%s", ranking.describe())
     if keywords:
-        log.info(
-            "【覆盖】--keywords 生效：AI 打分改用 %s（本轮 config.USER_KEYWORDS 不参与打分）",
-            "、".join(keywords),
-        )
+        if len(topics) > 1:
+            log.warning("【覆盖】--keywords 在多主题模式下会被忽略（每个主题用自己的 keywords）")
+            keywords = None
+        else:
+            log.info(
+                "【覆盖】--keywords 生效：AI 打分改用 %s（本轮该主题的 keywords 不参与打分）",
+                "、".join(keywords),
+            )
     log.info("【模式】%s", "DRY-RUN（不发邮件）" if args.dry_run else "正式运行")
+    log.info("【状态】%s", _describe_pushed_state(topics))
     log.info("=" * 68)
-    for problem in config_warnings(args.retrieval_mode):
-        log.warning("配置提醒：%s", problem)
 
-    # ---- 1. 配置校验（快速失败）----
+    for notice in config.config_notices():
+        log.info("配置说明：%s", notice)
+    for problem in config.config_warnings(mode):
+        log.warning("配置提醒：%s", problem)
+    if len(topics) > 1:
+        # 单主题时上面那条已经覆盖了主题级提醒，多主题才需要逐主题补
+        for topic in topics:
+            for problem in config.topic_warnings(mode, topic):
+                log.warning("配置提醒（%s）：%s", topic.name, problem)
+
+    # ---- 1. 配置校验（快速失败，只需校验一次）----
     validate_env(require_ai=not args.no_ai, require_mail=not args.dry_run)
 
-    # ---- 2. 时间窗 ----
-    first_run = args.force_first_run or dedup.is_first_run()
+    recipients = (
+        [addr.strip() for addr in args.to.replace(";", ",").split(",") if addr.strip()]
+        if args.to
+        else mail_recipients()
+    )
+
+    stats: list[dict] = []
+    failures: list[str] = []
+    for index, topic in enumerate(topics, start=1):
+        try:
+            stats.append(
+                run_topic(topic, args, run_date, keywords, recipients, index=index, total=len(topics))
+            )
+        except Exception as exc:  # 一个主题挂掉不该连累其它主题
+            log.error("主题「%s」运行失败：%s", topic.name, exc)
+            log.debug("详细堆栈：\n%s", traceback.format_exc())
+            failures.append(topic.name)
+
+    _log_overall(stats, failures, len(topics), dry_run=args.dry_run)
+    if failures:
+        raise RuntimeError(
+            f"{len(failures)}/{len(topics)} 个主题运行失败：{'、'.join(failures)}"
+            "（其余主题已处理完毕，详见上面的日志）"
+        )
+    return 0
+
+
+def run_topic(
+    topic: config.ResearchTopic,
+    args: argparse.Namespace,
+    run_date: str,
+    keywords: list[str] | None,
+    recipients: list[str],
+    *,
+    index: int = 1,
+    total: int = 1,
+) -> dict:
+    """跑一个主题的完整链路：检索 → 去重 → 摘要 → AI 打分 → 加权排序 → 发信 → 回写状态。"""
+    mode = args.retrieval_mode
+    prefix = f"[{index}/{total}] " if total > 1 else ""
+    if total > 1:
+        log.info("-" * 68)
+        log.info("%s主题：%s", prefix, topic.name)
+
+    # ---- 2. 时间窗（按主题各自的去重记录判定首次运行）----
+    first_run = args.force_first_run or dedup.is_first_run(topic.key)
     if args.lookback_days is not None:
         lookback_days = args.lookback_days
     else:
         lookback_days = LOOKBACK_DAYS_FIRST_RUN if first_run else LOOKBACK_DAYS
-    log.info("时间窗：近 %s 天（%s）", lookback_days, "首次运行预热" if first_run else "常规滚动")
+    log.info(
+        "%s时间窗：近 %s 天（%s）",
+        prefix,
+        lookback_days,
+        "首次运行预热" if first_run else "常规滚动",
+    )
 
     # ---- 3. 检索（第 1 层筛选：主题分类 / 字面关键词）----
     works = openalex_client.fetch_works(
         keywords,
         lookback_days,
         max_works=args.max_fetch,
-        mode=args.retrieval_mode,
+        mode=mode,
+        topic=topic,
     )
     total_candidates = len(works)
     if not total_candidates:
-        log.warning("OpenAlex 未返回任何候选文献（时间窗 %s 天）", lookback_days)
+        log.warning("%sOpenAlex 未返回任何候选文献（时间窗 %s 天）", prefix, lookback_days)
 
-    # ---- 4. 去重 ----
-    fresh = dedup.filter_new(works)
+    # ---- 4. 去重（按主题各自的记录）----
+    fresh = dedup.filter_new(works, topic_key=topic.key)
     after_dedup = len(fresh)
 
     # ---- 5. 摘要回退 ----
@@ -319,13 +460,24 @@ def run(args: argparse.Namespace) -> int:
     if not fresh:
         selected: list[dict] = []
     elif args.no_ai:
-        log.warning("--no-ai 已启用：跳过 AI 打分，全部 %s 篇直接进入结果", len(fresh))
+        log.warning("%s--no-ai 已启用：跳过 AI 打分，全部 %s 篇直接进入结果", prefix, len(fresh))
         for work in fresh:
             work.update(ai_score=0, ai_takeaway="（跳过 AI）", ai_reason="--no-ai 模式", ai_error=False)
-        selected = sorted(fresh, key=lambda w: w.get("pub_date") or "", reverse=True)
+        selected = list(fresh)
     else:
         selected, ai_failed, rejected = ai_matcher.evaluate_works(
-            fresh, keywords=keywords, threshold=args.threshold
+            fresh, keywords=keywords, threshold=args.threshold, topic=topic
+        )
+
+    # ---- 6.5 期刊档次加权排序：最终分 = AI 分 + 期刊加成 ----
+    selected = ranking.rank(selected)
+    if selected:
+        top = selected[0]
+        log.info(
+            "%s加权排序完成，首位：%s 分（%s）",
+            prefix,
+            top.get("final_score"),
+            ranking.breakdown(top),
         )
 
     # ---- 7. 渲染 ----
@@ -337,27 +489,41 @@ def run(args: argparse.Namespace) -> int:
         total_candidates=total_candidates,
         after_dedup=after_dedup,
         ai_failed=len(ai_failed),
+        title=topic.email_title,
+        max_items=args.max_items,
+        extra_meta=f"主题：{topic.name}" if total > 1 else "",
     )
+
+    stats = {
+        "name": topic.name,
+        "candidates": total_candidates,
+        "after_dedup": after_dedup,
+        "selected": len(selected),
+        "shown": min(len(selected), args.max_items),
+        "mailed": 0,
+    }
 
     # ---- 8. 输出 ----
     if args.dry_run:
-        path = mailer.save_preview(html_body, run_date, OUTBOX_DIR)
-        log.info("[dry-run] 未发送邮件、未修改去重状态")
-        log.info("[dry-run] 预览文件：%s", path)
-        _log_summary(total_candidates, after_dedup, len(selected), len(ai_failed), dry_run=True)
-        return 0
+        suffix = f"-{_safe_filename(topic.name)}" if total > 1 else ""
+        path = mailer.save_preview(html_body, run_date, OUTBOX_DIR, suffix=suffix)
+        log.info("%s[dry-run] 未发送邮件、未修改去重状态；预览文件：%s", prefix, path)
+        _log_summary(
+            topic.name, total_candidates, after_dedup, len(selected), len(ai_failed), dry_run=True
+        )
+        return stats
 
-    recipients = [addr.strip() for addr in args.to.replace(";", ",").split(",") if addr.strip()] if args.to else mail_recipients()
-    subject = mailer.build_subject(selected, run_date)
+    subject = mailer.build_subject(selected, run_date, topic.email_title)
 
     # 发送成功后才回写状态（关键：避免邮件失败导致文献永久丢失）
     mailer.send_mail(subject, html_body, plain_body, recipients=recipients)
-    log.info("邮件发送成功：%s", subject)
+    log.info("%s邮件发送成功：%s", prefix, subject)
+    stats["mailed"] = 1
 
     shown = selected[: args.max_items]
 
     # ------------------------------------------------------------------
-    # 回写"已读"标记的规则
+    # 回写"已读"标记的规则（按主题各自的记录）
     # ------------------------------------------------------------------
     # 主题检索下候选近 200 篇，而邮件只发 20 篇。若只记录展示过的那 20 篇，
     # 剩下 170+ 篇下周会被原封不动地重新打分一遍 —— 每周白烧 5 倍 AI 费用。
@@ -372,26 +538,37 @@ def run(args: argparse.Namespace) -> int:
     #     结论可能完全反转，不能让"已读"把它永久锁死
     to_mark = shown + [w for w in rejected if w.get("abstract")]
     if to_mark:
-        dedup.mark_pushed(to_mark, run_date=run_date)
+        dedup.mark_pushed(to_mark, run_date=run_date, topic_key=topic.key)
     else:
         # 心跳邮件场景：也要更新 last_run，但不动 DOIs
-        dedup.save_state([], run_date=run_date)
+        dedup.save_state([], run_date=run_date, topic_key=topic.key)
 
     log.info(
-        "状态回写：%s 篇标记已读（展示 %s + 已判定不相关 %s）；未标记的备选 %s 篇下轮会重新评估",
+        "%s状态回写：%s 篇标记已读（展示 %s + 已判定不相关 %s）；未标记的备选 %s 篇下轮会重新评估",
+        prefix,
         len(to_mark),
         len(shown),
         len(to_mark) - len(shown),
         max(0, len(selected) - len(shown)),
     )
-    _log_summary(total_candidates, after_dedup, len(shown), len(ai_failed), dry_run=False)
-    return 0
+    _log_summary(
+        topic.name, total_candidates, after_dedup, len(shown), len(ai_failed), dry_run=False
+    )
+    return stats
 
 
-def _log_summary(candidates: int, after_dedup: int, selected: int, ai_failed: int, dry_run: bool) -> None:
+def _log_summary(
+    topic_name: str,
+    candidates: int,
+    after_dedup: int,
+    selected: int,
+    ai_failed: int,
+    dry_run: bool,
+) -> None:
     log.info("-" * 68)
     log.info(
-        "运行摘要：候选 %s 篇 → 去重后 %s 篇 → 入选 %s 篇%s%s",
+        "运行摘要（%s）：候选 %s 篇 → 去重后 %s 篇 → 入选 %s 篇%s%s",
+        topic_name,
         candidates,
         after_dedup,
         selected,
@@ -401,19 +578,41 @@ def _log_summary(candidates: int, after_dedup: int, selected: int, ai_failed: in
     log.info("-" * 68)
 
 
+def _log_overall(stats: list[dict], failures: list[str], total_topics: int, dry_run: bool) -> None:
+    """多主题的总账。放在最后一行，方便 Actions 日志一眼看到全貌。"""
+    log.info("=" * 68)
+    for item in stats:
+        log.info(
+            "【%s】候选 %s → 去重后 %s → 入选 %s%s",
+            item["name"],
+            item["candidates"],
+            item["after_dedup"],
+            item["selected"],
+            "" if dry_run else f" → 已发邮件 {item['mailed']} 封",
+        )
+    sent = sum(item["mailed"] for item in stats)
+    log.info(
+        "全部完成：%s 个主题%s%s",
+        total_topics,
+        "（dry-run，未发送任何邮件）" if dry_run else f"，已发送 {sent} 封邮件",
+        f"，失败 {len(failures)} 个：{'、'.join(failures)}" if failures else "",
+    )
+    log.info("=" * 68)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
     setup_logging(verbose=args.verbose)
 
-    if args.show_config:
-        return show_config(args)
-
-    if args.find_topic:
-        return find_topic(args.find_topic)
-
     try:
+        if args.show_config:
+            return show_config(args)
+
+        if args.find_topic:
+            return find_topic(args.find_topic)
+
         return run(args)
     except RuntimeError as exc:
         log.error("运行失败：%s", exc)

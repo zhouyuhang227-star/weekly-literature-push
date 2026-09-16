@@ -21,8 +21,9 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src import abstract_source, ai_matcher, config, mailer  # noqa: E402
-from src import openalex_client  # noqa: E402
+from src import abstract_source, ai_matcher, config, dedup, mailer  # noqa: E402
+from src import main as main_module  # noqa: E402
+from src import openalex_client, ranking  # noqa: E402
 from src.openalex_client import (  # noqa: E402
     build_filter,
     build_keyword_query,
@@ -267,12 +268,18 @@ class TestRelevanceLayersAreExplained(unittest.TestCase):
 
 
 class TestConfigWarnings(unittest.TestCase):
-    """只报真正配错的组合，不狼来了。"""
+    """只报真正配错的组合，不狼来了。
+
+    这些用例针对的是【单方向模式】，所以先把 RESEARCH_TOPICS 清空 —— 
+    默认 config 已开启多主题，不清空的话那些常数本就不参与，也就无从报错。
+    """
 
     def setUp(self):
         self._saved = {
-            name: getattr(config, name) for name in ("USER_KEYWORDS", "TOPIC_QUERY", "TOPICS")
+            name: getattr(config, name)
+            for name in ("USER_KEYWORDS", "TOPIC_QUERY", "TOPICS", "RESEARCH_TOPICS")
         }
+        config.RESEARCH_TOPICS = []
 
     def tearDown(self):
         for name, value in self._saved.items():
@@ -304,6 +311,14 @@ class TestConfigWarnings(unittest.TestCase):
 
 class TestShowConfigCommand(unittest.TestCase):
     """--show-config 必须离线、不跑主流程，并把两层分工讲清楚。"""
+
+    def setUp(self):
+        # 这些断言按「单方向」写法组织，因此先关掉多主题（默认已开启）。
+        self._saved_topics = config.RESEARCH_TOPICS
+        config.RESEARCH_TOPICS = []
+
+    def tearDown(self):
+        config.RESEARCH_TOPICS = self._saved_topics
 
     def test_show_config_prints_layers_and_returns_zero(self):
         from src import main as main_module
@@ -704,87 +719,476 @@ class TestMailerEscaping(unittest.TestCase):
 
 
 class TestDedupState(unittest.TestCase):
+    """v2 状态文件：按主题分区 + 自动迁移 v1/纯数组格式。"""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.path = os.path.join(self.tmp.name, "pushed.json")
-        self._orig = None
+        self._orig_file = config.PUSHED_FILE
+        self._orig_topics = config.RESEARCH_TOPICS
+        config.PUSHED_FILE = self.path
+        config.RESEARCH_TOPICS = []  # 单方向模式，分区键 = RESEARCH_FIELD
 
     def tearDown(self):
+        config.PUSHED_FILE = self._orig_file
+        config.RESEARCH_TOPICS = self._orig_topics
         self.tmp.cleanup()
 
-    def _patch(self):
-        from src import config
+    # -- 小工具 ---------------------------------------------------------
+    def _write(self, payload):
+        with open(self.path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
 
-        self._orig = config.PUSHED_FILE
-        config.PUSHED_FILE = self.path
-        import src.dedup as dedup
+    def _read(self) -> dict:
+        with open(self.path, encoding="utf-8") as handle:
+            return json.load(handle)
 
-        self._orig_dedup = dedup.PUSHED_FILE
-        dedup.PUSHED_FILE = self.path
-
-    def _unpatch(self):
-        from src import config
-        import src.dedup as dedup
-
-        config.PUSHED_FILE = self._orig
-        dedup.PUSHED_FILE = self._orig_dedup
-
+    # -- 用例 -----------------------------------------------------------
     def test_first_run_and_roundtrip(self):
-        self._patch()
-        try:
-            import src.dedup as dedup
+        topic = config.active_research_topics()[0].key
+        self.assertTrue(dedup.is_first_run(topic))
+        self.assertEqual(dedup.load_pushed(topic), set())
 
-            self.assertTrue(dedup.is_first_run())
-            self.assertEqual(dedup.load_pushed(), set())
+        works = [
+            {"doi": "10.1/a", "openalex_id": "W1"},
+            {"doi": "10.1/B", "openalex_id": "W2"},
+        ]
+        dedup.mark_pushed(works, run_date="2026-09-15", topic_key=topic)
 
-            works = [
-                {"doi": "10.1/a", "openalex_id": "W1"},
-                {"doi": "10.1/B", "openalex_id": "W2"},
-            ]
-            dedup.mark_pushed(works, run_date="2026-09-15")
+        self.assertFalse(dedup.is_first_run(topic))
+        self.assertEqual(dedup.load_pushed(topic), {"10.1/a", "10.1/b"})
 
-            self.assertFalse(dedup.is_first_run())
-            self.assertEqual(dedup.load_pushed(), {"10.1/a", "10.1/b"})
+        state = dedup.load_state()
+        self.assertEqual(state["last_run"], "2026-09-15")
+        self.assertEqual(state["schema_version"], 2)
+        self.assertEqual(state["topics"][topic], ["10.1/a", "10.1/b"])
 
-            state = dedup.load_state()
-            self.assertEqual(state["last_run"], "2026-09-15")
-            self.assertEqual(state["schema_version"], 1)
+        # 再次去重应全部被过滤掉
+        self.assertEqual(dedup.filter_new(works, topic_key=topic), [])
 
-            # 再次去重应全部被过滤掉
-            self.assertEqual(dedup.filter_new(works), [])
+        # dry_run 不应改动文件
+        before = self._read()
+        dedup.mark_pushed([{"doi": "10.1/new"}], run_date="2026-09-16", dry_run=True, topic_key=topic)
+        self.assertEqual(self._read(), before)
 
-            # dry_run 不应改动文件
-            with open(self.path, encoding="utf-8") as handle:
-                before = json.load(handle)
-            dedup.mark_pushed([{"doi": "10.1/new"}], run_date="2026-09-16", dry_run=True)
-            with open(self.path, encoding="utf-8") as handle:
-                after = json.load(handle)
-            self.assertEqual(before, after)
-        finally:
-            self._unpatch()
+    def test_topics_are_independent(self):
+        """多主题去重：各记各的，同一篇可以出现在两个主题的邮件里。"""
+        shared = {"doi": "10.1/shared"}
+        dedup.mark_pushed([shared, {"doi": "10.1/only-a"}], run_date="d", topic_key="A")
+        dedup.mark_pushed([shared], run_date="d", topic_key="B")
+
+        self.assertEqual(dedup.load_pushed("A"), {"10.1/shared", "10.1/only-a"})
+        self.assertEqual(dedup.load_pushed("B"), {"10.1/shared"})
+        # 不指定主题时是并集（"这篇到底推过没有"）
+        self.assertEqual(dedup.load_pushed(), {"10.1/shared", "10.1/only-a"})
+
+        # A 已推的不影响 B 的判定
+        self.assertEqual(dedup.filter_new([{"doi": "10.1/only-a"}], topic_key="B"), [{"doi": "10.1/only-a"}])
+        self.assertEqual(dedup.filter_new([{"doi": "10.1/only-a"}], topic_key="A"), [])
+
+        self.assertEqual(dedup.topic_counts(), {"A": 2, "B": 1})
+        self.assertEqual(dedup.orphan_topic_keys(["A"]), ["B"])
+        self.assertEqual(dedup.orphan_topic_keys(["A", "B"]), [])
+
+    def test_new_topic_keeps_other_partitions(self):
+        self._write({"schema_version": 2, "topics": {"A": ["10.1/a"], "B": []}, "last_run": None})
+        dedup.save_state(["10.1/c"], topic_key="B", run_date="2026-09-20")
+        state = dedup.load_state()
+        self.assertEqual(state["topics"]["A"], ["10.1/a"])
+        self.assertEqual(state["topics"]["B"], ["10.1/c"])
+        self.assertEqual(state["last_run"], "2026-09-20")
 
     def test_corrupt_state_falls_back_to_empty(self):
-        self._patch()
-        try:
-            import src.dedup as dedup
+        with open(self.path, "w", encoding="utf-8") as handle:
+            handle.write("{ this is not json")
+        self.assertEqual(dedup.load_state()["topics"], {})
+        self.assertTrue(dedup.is_first_run())
 
-            with open(self.path, "w", encoding="utf-8") as handle:
-                handle.write("{ this is not json")
-            self.assertEqual(dedup.load_state()["dois"], [])
-            self.assertTrue(dedup.is_first_run())
-        finally:
-            self._unpatch()
+    def test_v1_global_list_migrates_without_losing_dois(self):
+        self._write({"schema_version": 1, "dois": ["10.1/old", "10.1/older"], "last_run": "2026-09-01"})
+        state = dedup.load_state()
+        self.assertEqual(state["schema_version"], 2)
+        # 旧记录整体归入「当前第一个主题」，一条都不丢
+        self.assertEqual(state["topics"][dedup.default_topic_key()], ["10.1/old", "10.1/older"])
+        self.assertEqual(state["last_run"], "2026-09-01")
+        self.assertEqual(dedup.load_pushed(), {"10.1/old", "10.1/older"})
+        self.assertFalse(dedup.is_first_run(dedup.default_topic_key()))
 
     def test_legacy_array_format(self):
-        self._patch()
-        try:
-            import src.dedup as dedup
+        self._write(["10.1/old"])
+        self.assertEqual(dedup.load_pushed(), {"10.1/old"})
 
-            with open(self.path, "w", encoding="utf-8") as handle:
-                json.dump(["10.1/old"], handle)
-            self.assertEqual(dedup.load_pushed(), {"10.1/old"})
+
+class TestJournalRanking(unittest.TestCase):
+    """期刊档次加权：最终分 = AI 分 + 档次加成。"""
+
+    def _work(self, journal: str, ai: int, issn: str = "", pub_date: str = "2026-09-01") -> dict:
+        return {"doi": f"10.1/{journal}", "journal": journal, "issn": issn, "ai_score": ai, "pub_date": pub_date}
+
+    def test_issn_lookup_beats_display_name(self):
+        # OpenAlex 返回的 display_name 与配置写法不同，靠 ISSN 兜住
+        work = {"journal": "Angewandte Chemie International Edition", "issn": "1521-3773"}
+        self.assertEqual(ranking.journal_tier(work), ("Angew", 3))
+
+    def test_falls_back_to_journal_name(self):
+        self.assertEqual(ranking.journal_tier({"journal": "Joule", "issn": "1111-2222"}), ("Joule", 7))
+
+    def test_advanced_functional_materials_is_not_advanced_materials(self):
+        afm_issn = config.JOURNALS["Advanced Functional Materials"]
+        self.assertEqual(ranking.journal_tier({"journal": "Advanced Functional Materials", "issn": afm_issn}), ("其他", 0))
+        self.assertEqual(ranking.journal_tier({"journal": "Advanced Materials", "issn": "1521-4095"}), ("AM", 2))
+
+    def test_unknown_journal_has_no_bonus(self):
+        self.assertEqual(ranking.journal_tier({"journal": "Some Other Journal", "issn": ""}), ("其他", 0))
+
+    def test_tier_order_follows_config(self):
+        self.assertEqual([tier for tier, _ in ranking.tiers()], list(config.JOURNAL_TIERS))
+        bonuses = [bonus for _, bonus in ranking.tiers()]
+        self.assertEqual(bonuses, sorted(bonuses, reverse=True))  # 顺序即权重顺序
+
+    def test_weighted_score_can_overtake_higher_ai_score(self):
+        works = [
+            self._work("Energy & Environmental Science", 75),          # 75 + 0 = 75
+            self._work("Nature Energy", 68, issn="2058-7546"),         # 68 + 9 = 77
+        ]
+        ranked = ranking.rank(works)
+        self.assertEqual(ranked[0]["journal"], "Nature Energy")
+        self.assertEqual(ranked[0]["final_score"], 77)
+        self.assertEqual(ranked[0]["journal_tier"], "大子刊")
+        self.assertEqual(ranked[1]["journal_bonus"], 0)
+        self.assertEqual(ranked[1]["final_score"], 75)
+
+    def test_final_score_ties_break_on_ai_score(self):
+        works = [
+            self._work("Nature Energy", 60, issn="2058-7546"),          # 60 + 9 = 69
+            self._work("Energy & Environmental Science", 69),           # 69 + 0 = 69
+        ]
+        ranked = ranking.rank(works)
+        self.assertEqual([w["final_score"] for w in ranked], [69, 69])
+        self.assertEqual(ranked[0]["journal"], "Energy & Environmental Science")  # 同分看真实相关性
+
+    def test_ranking_is_stable_on_full_tie(self):
+        first = self._work("Joule", 70, pub_date="2026-09-01")
+        second = self._work("Joule", 70, pub_date="2026-09-09")
+        ranked = ranking.rank([first, second])
+        self.assertEqual([w["pub_date"] for w in ranked], ["2026-09-09", "2026-09-01"])
+
+    def test_breakdown_text(self):
+        work = {"ai_score": 62, "journal_tier": "大子刊", "journal_bonus": 9, "final_score": 71}
+        self.assertEqual(ranking.breakdown(work), "AI 62 + 大子刊 9 = 71")
+        self.assertEqual(ranking.breakdown({"ai_score": 70}), "AI 70")
+
+    def test_annotate_writes_final_score(self):
+        work = {"journal": "Joule", "ai_score": 50}
+        ranking.annotate([work])
+        self.assertEqual(work["journal_tier"], "Joule")
+        self.assertEqual(work["journal_bonus"], 7)
+        self.assertEqual(work["final_score"], 57)
+
+
+class TestResearchTopics(unittest.TestCase):
+    """多主题配置：RESEARCH_TOPICS（空 = 回到单方向模式）。"""
+
+    def setUp(self):
+        self._orig = config.RESEARCH_TOPICS
+
+    def tearDown(self):
+        config.RESEARCH_TOPICS = self._orig
+
+    def test_single_direction_fallback(self):
+        config.RESEARCH_TOPICS = []
+        topics = config.active_research_topics()
+        self.assertEqual(len(topics), 1)
+        self.assertEqual(topics[0].name, config.RESEARCH_FIELD)
+        self.assertEqual(topics[0].topic_query, config.TOPIC_QUERY)
+        self.assertEqual(topics[0].keywords, list(config.USER_KEYWORDS))
+        self.assertEqual(topics[0].email_title, config.EMAIL_TITLE)
+
+    def test_two_topics_are_normalized(self):
+        config.RESEARCH_TOPICS = [
+            {
+                "name": "富锂锰正极",
+                "topic_query": "lithium-rich manganese oxide cathode",
+                "keywords": ["富锂锰", "电压衰减"],
+                "description": "关注层状富锂材料的电压衰减机理",
+            },
+            {
+                "name": "无负极钠离子电池",
+                "topic_query": "anode-free sodium metal battery",
+                "keywords": ["无负极"],
+                "title": "无负极钠电周报",
+                "key": "sodium",
+            },
+        ]
+        topics = config.active_research_topics()
+        self.assertEqual([topic.name for topic in topics], ["富锂锰正极", "无负极钠离子电池"])
+        self.assertEqual(topics[0].email_title, "富锂锰正极顶刊周报")  # 未指定 title 时自动派生
+        self.assertEqual(topics[1].email_title, "无负极钠电周报")
+        self.assertEqual(topics[1].key, "sodium")  # 手工指定分区键
+        self.assertEqual(topics[0].key, "富锂锰正极")  # 默认 key = name
+        self.assertIn("富锂锰", topics[0].brief())
+        self.assertIn("电压衰减机理", topics[0].brief())
+
+    def test_duplicate_names_rejected(self):
+        config.RESEARCH_TOPICS = [{"name": "A"}, {"name": "A"}]
+        with self.assertRaises(RuntimeError):
+            config.active_research_topics()
+
+    def test_missing_name_rejected(self):
+        config.RESEARCH_TOPICS = [{"topic_query": "x"}]
+        with self.assertRaises(RuntimeError):
+            config.active_research_topics()
+
+    def test_non_dict_entry_rejected(self):
+        config.RESEARCH_TOPICS = ["just a string"]
+        with self.assertRaises(RuntimeError):
+            config.active_research_topics()
+
+    def test_single_direction_warnings_are_skipped_when_topics_configured(self):
+        config.RESEARCH_TOPICS = [{"name": "A", "keywords": []}]
+        # 「RESEARCH_TOPICS 已生效」是说明而非错误，走 INFO
+        notices = config.config_notices()
+        self.assertTrue(any("RESEARCH_TOPICS" in notice for notice in notices))
+        # 那五项已不生效，就不该再对它们报警
+        globals_ = config.config_warnings("topic")
+        self.assertFalse(any("USER_KEYWORDS 为空" in problem for problem in globals_))
+        self.assertEqual(globals_, [])
+        # 主题级提醒仍会给出，且带上主题名
+        topic_problems = config.topic_warnings("topic", config.active_research_topics()[0])
+        self.assertTrue(any("USER_KEYWORDS 为空" in problem for problem in topic_problems))
+        self.assertTrue(any("A" in problem for problem in topic_problems))
+
+
+class TestTopicAwareRetrieval(unittest.TestCase):
+    """每个主题各用各的检索词与 ISSN 判定。"""
+
+    def test_pick_issn_prefers_configured_eissn(self):
+        source = {"issn_l": "0028-0836", "issn": ["0028-0836", "1476-4687"]}
+        self.assertEqual(openalex_client._pick_issn(source), "1476-4687")
+
+    def test_pick_issn_falls_back_when_nothing_configured(self):
+        self.assertEqual(openalex_client._pick_issn({"issn": ["1111-2222"], "issn_l": "9999-0000"}), "1111-2222")
+        self.assertEqual(openalex_client._pick_issn(None), "")
+        self.assertEqual(openalex_client._pick_issn({}), "")
+
+    def test_effective_keywords_precedence(self):
+        topic = config.ResearchTopic(name="T", keywords=["主题词"])
+        self.assertEqual(openalex_client.effective_keywords(["命令行词"], topic), ["命令行词"])
+        self.assertEqual(openalex_client.effective_keywords(None, topic), ["主题词"])
+        self.assertEqual(openalex_client.effective_keywords(None), list(config.USER_KEYWORDS))
+
+    def test_both_mode_filter_uses_topic_own_words(self):
+        from datetime import date
+
+        topic = config.ResearchTopic(name="富锂锰正极", topic_query="lithium-rich cathode", keywords=["富锂锰"])
+        with patch.object(openalex_client, "resolve_topics", return_value={"Layered oxides": "T9"}):
+            built = build_filter(date(2026, 8, 16), None, mode="both", topic=topic)
+        self.assertIn("topics.id:T9", built)
+        self.assertIn("富锂锰", built)
+        self.assertIn("title_and_abstract.search", built)
+
+    def test_topic_mode_filter_ignores_keywords(self):
+        from datetime import date
+
+        topic = config.ResearchTopic(name="A", topic_query="q", keywords=["不该出现"])
+        with patch.object(openalex_client, "resolve_topics", return_value={"T": "T1"}):
+            built = build_filter(date(2026, 8, 16), None, mode="topic", topic=topic)
+        self.assertIn("topics.id:T1", built)
+        self.assertNotIn("不该出现", built)
+
+
+class TestMultiTopicOrchestration(unittest.TestCase):
+    """多主题编排：每个主题一封邮件、各记各的已推送记录。"""
+
+    WORKS = [
+        {
+            "doi": "10.1/shared",
+            "openalex_id": "W1",
+            "title": "Shared paper",
+            "journal": "Joule",
+            "issn": "2542-4351",
+            "pub_date": "2026-09-01",
+            "abstract": "abstract text",
+            "doi_url": "https://doi.org/10.1/shared",
+        }
+    ]
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._orig_file = config.PUSHED_FILE
+        self._orig_topics = config.RESEARCH_TOPICS
+        config.PUSHED_FILE = os.path.join(self.tmp.name, "pushed.json")
+        config.RESEARCH_TOPICS = [
+            {"name": "富锂锰正极", "topic_query": "lithium rich cathode", "keywords": ["富锂锰"]},
+            {"name": "无负极钠离子电池", "topic_query": "anode free sodium", "keywords": ["无负极"]},
+        ]
+        self.sent: list[tuple[str, str]] = []
+        self.fetched: list[str] = []
+
+    def tearDown(self):
+        config.PUSHED_FILE = self._orig_file
+        config.RESEARCH_TOPICS = self._orig_topics
+        self.tmp.cleanup()
+
+    # -- 桩 -------------------------------------------------------------
+    def _fake_fetch(self, keywords, lookback_days, max_works=None, mode=None, topic=None, **_kw):
+        self.fetched.append(topic.name)
+        return [dict(work) for work in self.WORKS]
+
+    @staticmethod
+    def _fake_eval(works, keywords=None, threshold=None, topic=None, **_kw):
+        passed = [
+            dict(work, ai_score=70, ai_takeaway="解读", ai_reason="理由", ai_error=False)
+            for work in works
+        ]
+        return passed, [], []
+
+    def _patches(self):
+        return [
+            patch.object(main_module, "validate_env", lambda **_kw: None),
+            patch.object(main_module.openalex_client, "fetch_works", side_effect=self._fake_fetch),
+            patch.object(main_module.abstract_source, "enrich_abstracts", side_effect=lambda works: works),
+            patch.object(main_module.ai_matcher, "evaluate_works", side_effect=self._fake_eval),
+            patch.object(
+                main_module.mailer,
+                "send_mail",
+                side_effect=lambda subject, html_body, plain_body, recipients=None: self.sent.append(
+                    (subject, html_body)
+                ),
+            ),
+        ]
+
+    def _run(self, argv: list[str] | None = None):
+        args = main_module.build_parser().parse_args(argv or [])
+        patches = self._patches()
+        for item in patches:
+            item.start()
+        try:
+            return main_module.run(args)
         finally:
-            self._unpatch()
+            for item in patches:
+                item.stop()
+
+    # -- 用例 -----------------------------------------------------------
+    def test_two_topics_send_two_emails_with_independent_state(self):
+        self.assertEqual(self._run(), 0)
+
+        self.assertEqual(self.fetched, ["富锂锰正极", "无负极钠离子电池"])
+        self.assertEqual(len(self.sent), 2)
+
+        subjects = [subject for subject, _ in self.sent]
+        self.assertTrue(subjects[0].startswith("富锂锰正极顶刊周报"), subjects[0])
+        self.assertTrue(subjects[1].startswith("无负极钠离子电池顶刊周报"), subjects[1])
+        self.assertNotEqual(subjects[0], subjects[1])
+        # 同一篇论文可以同时出现在两个主题的邮件里
+        self.assertTrue(all("10.1/shared" in html for _, html in self.sent))
+
+        counts = dedup.topic_counts()
+        self.assertEqual(counts, {"富锂锰正极": 1, "无负极钠离子电池": 1})
+        self.assertEqual(dedup.load_pushed("富锂锰正极"), {"10.1/shared"})
+        self.assertEqual(dedup.load_pushed("无负极钠离子电池"), {"10.1/shared"})
+
+    def test_second_run_is_deduped_per_topic(self):
+        self._run()
+        self.sent.clear()
+        self.fetched.clear()
+
+        self.assertEqual(self._run(), 0)
+
+        # 两个主题都已经记过这篇 → 都发心跳邮件
+        self.assertEqual(len(self.sent), 2)
+        for subject, _ in self.sent:
+            self.assertTrue(subject.endswith("本周无新文献"), subject)
+        self.assertEqual(dedup.topic_counts(), {"富锂锰正极": 1, "无负极钠离子电池": 1})
+
+    def test_topic_flag_runs_only_selected_topic(self):
+        self.assertEqual(self._run(["--topic", "无负极钠离子电池"]), 0)
+        self.assertEqual(self.fetched, ["无负极钠离子电池"])
+        self.assertEqual(list(dedup.topic_counts()), ["无负极钠离子电池"])
+
+    def test_topic_flag_accepts_custom_key(self):
+        config.RESEARCH_TOPICS = [dict(topic, key="sodium") if topic["name"] == "无负极钠离子电池" else topic
+                                 for topic in config.RESEARCH_TOPICS]
+        self.assertEqual(self._run(["--topic", "sodium"]), 0)
+        self.assertEqual(self.fetched, ["无负极钠离子电池"])
+
+    def test_unknown_topic_flag_fails_fast(self):
+        with self.assertRaises(RuntimeError):
+            self._run(["--topic", "不存在的主题"])
+
+    def test_one_topic_failure_does_not_block_the_other(self):
+        def flaky_fetch(keywords, lookback_days, max_works=None, mode=None, topic=None, **_kw):
+            self.fetched.append(topic.name)
+            if topic.name == "富锂锰正极":
+                raise RuntimeError("检索挂了")
+            return [dict(work) for work in self.WORKS]
+
+        args = main_module.build_parser().parse_args([])
+        with patch.object(main_module, "validate_env", lambda **_kw: None), patch.object(
+            main_module.openalex_client, "fetch_works", side_effect=flaky_fetch
+        ), patch.object(
+            main_module.abstract_source, "enrich_abstracts", side_effect=lambda works: works
+        ), patch.object(
+            main_module.ai_matcher, "evaluate_works", side_effect=self._fake_eval
+        ), patch.object(
+            main_module.mailer,
+            "send_mail",
+            side_effect=lambda subject, html_body, plain_body, recipients=None: self.sent.append(
+                (subject, html_body)
+            ),
+        ):
+            with self.assertRaises(RuntimeError):
+                main_module.run(args)
+
+        self.assertEqual(self.fetched, ["富锂锰正极", "无负极钠离子电池"])
+        self.assertEqual(len(self.sent), 1)  # 活下来的主题照常发信
+
+    def test_dry_run_writes_one_preview_per_topic_and_no_state(self):
+        outbox = os.path.join(self.tmp.name, "outbox")
+        args = main_module.build_parser().parse_args(["--dry-run"])
+        with patch.object(main_module, "validate_env", lambda **_kw: None), patch.object(
+            main_module, "OUTBOX_DIR", outbox
+        ), patch.object(
+            main_module.openalex_client, "fetch_works", side_effect=self._fake_fetch
+        ), patch.object(
+            main_module.abstract_source, "enrich_abstracts", side_effect=lambda works: works
+        ), patch.object(
+            main_module.ai_matcher, "evaluate_works", side_effect=self._fake_eval
+        ), patch.object(
+            main_module.mailer, "send_mail", side_effect=AssertionError("dry-run 不该发邮件")
+        ):
+            self.assertEqual(main_module.run(args), 0)
+
+        previews = sorted(os.listdir(outbox))
+        self.assertEqual(len(previews), 2)
+        self.assertTrue(any("富锂锰正极" in name for name in previews), previews)
+        self.assertTrue(any("无负极钠离子电池" in name for name in previews), previews)
+        # --dry-run 完全无副作用
+        self.assertFalse(os.path.exists(config.PUSHED_FILE))
+
+    def test_email_shows_weighted_score_and_bonus(self):
+        self._run(["--topic", "富锂锰正极"])
+        _, html_body = self.sent[0]
+        self.assertIn("最终 77 分", html_body)  # 70（AI）+ 7（Joule）
+        self.assertIn("Joule +7（AI 70）", html_body)
+
+    def test_show_config_lists_every_topic(self):
+        from src import main as main_module
+
+        args = main_module.build_parser().parse_args(["--show-config"])
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = main_module.show_config(args)
+
+        self.assertEqual(code, 0)
+        text = buffer.getvalue()
+        # 两个主题各自回显自己的检索短语，否则看了也不知道在搜什么
+        self.assertIn("lithium rich cathode", text)
+        self.assertIn("anode free sodium", text)
+        self.assertIn("2 个（来源：RESEARCH_TOPICS", text)
+        # 多主题下那五项常数已不生效：只给 INFO 说明，不再对它们报警
+        self.assertIn("已配置 RESEARCH_TOPICS", text)
+        self.assertNotIn("USER_KEYWORDS 为空", text)
 
 
 if __name__ == "__main__":

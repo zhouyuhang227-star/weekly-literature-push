@@ -1,13 +1,18 @@
 # 顶刊文献自动推送机器人
 
-每周三晚自动检索 11 本材料/能源/化学顶刊的最新论文，用 AI 判断是否与**你配置的研究方向**
+每周五晚自动检索 14 本材料/能源/化学顶刊的最新论文，用 AI 判断是否与**你配置的研究方向**
 相关，只把真正相关的文献整理成中文周报邮件发到你的邮箱。
 
 > 🚀 **第一次用？** 直接看 [部署到 GitHub（完整流程）](#部署到-github完整流程)
 > —— 从装 Git 到收到第一封邮件，6 步走完，全程约 20 分钟。
 
-> **换课题只需改 `src/config.py` 里的一段配置**（`RESEARCH_FIELD` / `RESEARCH_DESCRIPTION` /
-> `USER_KEYWORDS` / `TOPIC_QUERY`），代码不用动。详见 [如何换研究方向](#如何换研究方向)。
+> **换课题只需改 `src/config.py` 里的一段配置**（`RESEARCH_TOPICS`，或单方向时的
+> `RESEARCH_FIELD` / `RESEARCH_DESCRIPTION` / `USER_KEYWORDS` / `TOPIC_QUERY`），代码不用动。
+> 详见 [如何换研究方向](#如何换研究方向)。
+
+> **当前已开启多主题**：同时跟了两个方向 —— 「富锂锰正极」+「无负极钠离子电池」，
+> **每个主题各检索、各打分、各发一封邮件、各记各的已推送记录**。
+> 详见 [多主题调研](#多主题调研)。
 
 筛选分**两层**，各司其职：
 
@@ -17,6 +22,9 @@
 | 第 2 层 | AI 逐篇打分（0–100），低于阈值丢弃 | 按**你的具体兴趣**做精读判断 | ~20 篇入选 |
 
 > AI **不负责关键词匹配**。它拿到的是第 1 层已经筛过的候选集，再做一轮语义相关性打分。
+
+入选后的**排序**会按期刊档次加权：`最终分 = AI 相关性分 + 期刊加成`
+（正刊 +12 > 大子刊 +9 > Joule +7 > 小子刊 +5 > JACS +4 > Angew +3 > AM +2 > 其他 +0）。
 
 - 检索：**OpenAlex**（无需 API Key，免费）
 - 筛选：任意 **OpenAI 兼容** 的 AI 接口（默认 DeepSeek `deepseek-chat`）
@@ -29,17 +37,18 @@
 
 ```
 .
-├── .github/workflows/weekly_push.yml   # 定时任务（每周三 23:07 北京时间）
+├── .github/workflows/weekly_push.yml   # 定时任务（每周五 23:07 北京时间）
 ├── src/
 │   ├── config.py                       # ★所有"可能要改"的参数（研究方向、期刊、阈值）
 │   ├── logger.py                       # 日志初始化（时区正确、幂等）
 │   ├── openalex_client.py              # 第 1 层检索：拼查询 + 分页 + 解析 + 主题自动解析
 │   ├── abstract_source.py              # 摘要三级回退：OpenAlex → Crossref → S2
 │   ├── ai_matcher.py                   # 第 2 层：AI 并发打分 + 稳健 JSON 解析
-│   ├── dedup.py                        # DOI 去重 + 运行状态持久化
+│   ├── ranking.py                      # 期刊档次加权 + 最终分排序
+│   ├── dedup.py                        # DOI 去重 + 运行状态持久化（按主题分区）
 │   ├── mailer.py                       # HTML 渲染 + SMTP 发送
-│   └── main.py                         # 主流程编排 + 命令行
-├── tests/test_core.py                  # 52 个单元测试（锁定高风险修复）
+│   └── main.py                         # 主流程编排（多主题循环）+ 命令行
+├── tests/test_core.py                  # 98 个单元测试（锁定高风险修复）
 ├── data/
 │   ├── pushed_dois.json                # 去重状态（唯一需要提交的文件）
 │   ├── topics_cache.json               # 语义主题解析缓存（已 gitignore，自动重建）
@@ -55,7 +64,7 @@
 
 ## 部署到 GitHub（完整流程）
 
-> 目标：代码躺在 GitHub 上，GitHub Actions 每周三 23:07（北京时间）自动跑一次并把邮件发出去。
+> 目标：代码躺在 GitHub 上，GitHub Actions 每周五 23:07（北京时间）自动跑一次并把邮件发出去。
 > **全程只做一次，之后不用管。**
 
 ### 第 0 步：装 Git
@@ -219,16 +228,16 @@ git push -u origin main
 ```yaml
 on:
   schedule:
-    - cron: "7 23 * * 3"        # 每周三 23:07
+    - cron: "7 23 * * 5"        # 每周五 23:07
       timezone: "Asia/Shanghai" # GitHub 原生支持 IANA 时区，自动处理 UTC 换算
 ```
 
 `timezone` 是 GitHub 官方支持的字段（[官方文档](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)），
-**不需要自己换算成 UTC**。（等价的手工 UTC 写法是 `cron: "7 15 * * 3"`。）
+**不需要自己换算成 UTC**。（等价的手工 UTC 写法是 `cron: "7 15 * * 5"`。）
 
 > **为什么是 23:07 而不是 23:00？** GitHub 官方文档明确说明 `schedule` 事件
 > 在 Actions 负载高峰时会被延迟，而「高峰期包括每个整点」——
-> 安排在非整点能显著降低延迟。想改回整点就把 cron 写成 `"0 23 * * 3"`。
+> 安排在非整点能显著降低延迟。想改回整点就把 cron 写成 `"0 23 * * 5"`。
 
 ---
 
@@ -240,7 +249,7 @@ on:
 | 没有 `Run workflow` 按钮 | workflow 不在默认分支，或私有仓库禁用了 Actions |
 | 报 `Missing required env` | Secret 名字拼错。**必须全大写、下划线**，如 `AI_API_KEY`。改名后要重新触发一次 |
 | 邮件认证失败 | `SMTP_PASS` 填成了邮箱登录密码。QQ/163 要**授权码**，Gmail 要 **App Password** |
-| 发信时间不对 | 检查仓库默认分支是不是 `main`、`timezone:` 那行还在不在。注意定时时间是 **23:07**（`cron: "7 23 * * 3"`），不是整点 |
+| 发信时间不对 | 检查仓库默认分支是不是 `main`、`timezone:` 那行还在不在。注意定时时间是 **23:07**（`cron: "7 23 * * 5"`，每周五），不是整点 |
 | Actions 显示绿色但没收到邮件 | 看日志末行的「运行摘要：候选 N → 去重后 M → 入选 K」。K=0 时也会发心跳邮件；若连心跳邮件都没有，检查 `MAIL_TO` 和垃圾邮件箱 |
 | `git push` 报 `src refspec main does not match any` | 本地还没 `git commit`，或者本地分支不叫 `main` |
 | push 被拒绝 `rejected (fetch first)` | ① 建仓库时勾了 "Add a README file"；② **机器人自动提交了 `data/pushed_dois.json`**（最常见）。别手动折腾，直接双击 `push.cmd`，它会自动 fetch + rebase + 重试推送 |
@@ -251,7 +260,7 @@ on:
 
 > **想让定时任务更准时**：GitHub 官方文档明确说明**整点（minute = 0）是负载高峰**，
 > 任务可能被延迟几分钟甚至几十分钟，所以本项目已经把 cron 设成了非整点的
-> `"7 23 * * 3"`（每周三 23:07 北京时间）。
+> `"7 23 * * 5"`（每周五 23:07 北京时间）。
 
 ---
 
@@ -269,6 +278,7 @@ python -m src.main [选项]
 | `--lookback-days N` | 临时覆盖时间窗天数，如 `--lookback-days 90` 回补三个月 |
 | `--max-items N` | 单封邮件最多展示篇数（默认 20） |
 | `--max-fetch N` | 最多拉取候选文献数（默认 300） |
+| `--topic NAME` | 只跑指定主题（可重复，如 `--topic 富锂锰正极 --topic 无负极钠离子电池`），匹配主题的 `name` 或 `key`；省略则跑全部 |
 | `--threshold N` | AI 相关性阈值，低于此值不展示（默认 60） |
 | `--keywords "a;b"` | 临时覆盖研究方向（`topic` 模式下用作 **AI 打分标准**，不参与检索） |
 | `--show-config` | 只打印「靠什么召回 / 靠什么打分」然后退出，**纯离线、不联网、不跑主流程**。改完配置拿不准改动落在哪一层时先跑它 |
@@ -304,6 +314,9 @@ python -m src.main --find-topic
 
 # 试一个全新的研究方向（找候选主题 id）
 python -m src.main --find-topic "perovskite solar cell"
+
+# 多主题时只跑其中一个方向（名字或 key 都行，可重复）
+python -m src.main --dry-run --topic 富锂锰正极
 ```
 
 ---
@@ -324,24 +337,28 @@ python -m src.main --find-topic "perovskite solar cell"
 ```mermaid
 flowchart LR
     A[校验配置] --> B[判定时间窗]
-    B --> C["第 1 层：OpenAlex 检索<br/>11 期刊 × 语义主题"]
+    B --> C["第 1 层：OpenAlex 检索<br/>14 期刊 × 语义主题"]
     C --> D[DOI 去重]
     D --> E[摘要三级回退]
     E --> F["第 2 层：AI 并发相关性打分"]
-    F --> G[阈值过滤 + 排序 + 截断]
-    G --> H{--dry-run?}
+    F --> G[阈值过滤]
+    G --> R[期刊档次加权 + 最终分排序 + 截断]
+    R --> H{--dry-run?}
     H -- 是 --> I[写 HTML 到 outbox]
     H -- 否 --> J[发邮件]
     J --> K[回写 pushed_dois.json]
 ```
+
+> 多主题时上面这段链路**每个主题各跑一遍**（各自去重、各自排序、各自一封邮件），
+> 任一主题失败不影响其余主题，但最终仍会让 Actions 变红，避免静默漏推。
 
 **关键安全约定：只有邮件发送成功才回写状态。** 否则一旦 SMTP 挂了，
 文献会被标记成"已推送"而永久丢失。
 
 ### 第 1 层：为什么用「语义主题」而不是「关键词」
 
-用 11 本期刊 / 30 天做对照实测（2026-09 校验，以 `TOPIC_QUERY = "solid-state battery"` 为例；
-换方向后数字会变，但结论一致）：
+用 11 本期刊 / 30 天做对照实测（2026-09 校验，当时的期刊清单为 11 本；
+以 `TOPIC_QUERY = "solid-state battery"` 为例；换方向后数字会变，但结论一致）：
 
 | 检索方式 | 候选量 | 问题 |
 |---|---|---|
@@ -435,7 +452,8 @@ AI 打分失败时卡片会打 `AI 打分失败` 标签，且该文献仍会展�
 
 ```
 ┌──────────────────────────────────────────────┐
-│ Nature Energy · 2026-09-10        AI 88 分   │
+│ Joule · 2026-09-10              最终 77 分    │
+│ Joule +7（AI 70）                            │
 │ 依据：标题（摘要缺失）                        │
 │ 全固态电池界面阻抗的定量表征                  │
 │ ├ 一句话结论：用原位 EIS 量化了界面阻抗主导因素 │
@@ -444,8 +462,13 @@ AI 打分失败时卡片会打 `AI 打分失败` 标签，且该文献仍会展�
 └──────────────────────────────────────────────┘
 ```
 
-- 邮件主题：`固态电池顶刊周报 · 2026-09-16 · 8 篇`（前缀取自 `RESEARCH_FIELD`）
-- 单封最多 20 篇，超出部分显示「另有 N 篇…」，避免 Gmail 102KB 截断
+- 邮件主题：多主题下**每个主题一封**，形如 `富锂锰正极顶刊周报 · 2026-09-16 · 8 篇`、
+  `无负极钠离子电池顶刊周报 · 2026-09-16 · 3 篇`（前缀由主题的 `title` 或 `<name>顶刊周报` 决定；
+  单方向时用 `EMAIL_TITLE`，即 `固态电池顶刊周报 · …`）
+- 单封最多 20 篇，候选多于 20 篇时按**最终分降序**取舍，超出部分显示「另有 N 篇…」，
+  避免 Gmail 102KB 截断
+- 有期刊加成的论文：右上角显示 `最终 77 分`（而不是 `AI 70 分`），
+  并多一个 `Joule +7（AI 70）` 标签，让你一眼看出它排在前面的原因
 - **0 篇结果时也会发一封"心跳邮件"**（主题为 `… · 本周无新文献`），让你知道任务还活着，而不是静默失败
 - 所有插入到 HTML 的字段都经过转义（标题里的 `<script>` 不会被执行）
 - 同时生成纯文本副本，兼容不显示 HTML 的客户端
@@ -467,6 +490,13 @@ AI 打分失败时卡片会打 `AI 打分失败` 标签，且该文献仍会展�
 | 改了会怎样 | **候选量会变** | **候选量一点不变**，变的只是 AI 那把打分尺 |
 | 怎么确认改对了 | 日志里的「候选 N 篇」 | 邮件里的 AI 分数 / 理由有没有变准 |
 
+> ⚠️ **当前已经开启多主题**（`RESEARCH_TOPICS` 非空），所以上面表里的 5 个变量
+> **全部不再生效**，每个主题改用自己字典里的 `topic_query` / `keywords` / `description`。
+> 这张表依然要看，因为它说的「两把旋钮」在多主题下同样成立，只是旋钮换成了
+> 「主题的 `topic_query`」和「主题的 `keywords`」。
+>
+> 想回到单方向模式：把 `RESEARCH_TOPICS` 改回 `[]`。
+
 > ⚠️ **默认 `RETRIEVAL_MODE = "topic"`，此时 `USER_KEYWORDS` 不参与召回。**
 > 所以「我改了关键词，跑一遍候选量纹丝不动」是**正常现象，不是 bug**。
 > 想让关键词真正参与召回 → 把 `RETRIEVAL_MODE` 改成 `"both"`。
@@ -478,12 +508,12 @@ AI 打分失败时卡片会打 `AI 打分失败` 标签，且该文献仍会展�
 > ```
 >
 > ```
-> 【召回层】topic（语义主题）—— 由 TOPIC_QUERY='solid-state battery' 解析出的 topics.id 决定，USER_KEYWORDS 不参与
-> 【打分层】AI 0-100 分、入选线 ≥ 60 —— 尺子 = RESEARCH_FIELD='固态电池' + 关注关键词 5 个
-> 【提示】topic 模式下改 USER_KEYWORDS 不会改变候选量，它只当 AI 的打分尺子。想让关键词也参与召回 → RETRIEVAL_MODE = "both"；想换召回方向 → 改 TOPIC_QUERY。
+> 【召回层】topic（语义主题）—— 由 TOPIC_QUERY='lithium-rich manganese-based cathode' 解析出的 topics.id 决定，USER_KEYWORDS 不参与
+> 【打分层】AI 0-100 分、入选线 ≥ 60 —— 尺子 = 「富锂锰正极」 + 关注关键词 4 个；排序 = 最终分（AI 分 + 期刊档次加成）降序
+> 【提示】topic 模式下改 USER_KEYWORDS 不会改变候选量，它只当 AI 的打分尺子。……（多主题模式：改 RESEARCH_TOPICS 里「富锂锰正极」的 topic_query / keywords）
 > ```
 >
-> 这三行在**每次正常运行时也会打进日志开头**，所以每周 Actions 的日志里都留着
+> 这两组三行在**每个主题、每次正常运行**时也会打进日志开头，所以每周 Actions 的日志里都留着
 > 当时生效的配置与提示，事后回溯不用猜。
 
 ### 改完怎么生效：一键同步到 GitHub
@@ -496,7 +526,9 @@ AI 打分失败时卡片会打 `AI 打分失败` 标签，且该文献仍会展�
 | 召回策略（主题 / 关键词 / 并集） | `RETRIEVAL_MODE` | 旋钮 A |
 | **搜到的里面留下什么**（AI 的打分尺） | **`USER_KEYWORDS`** + `RESEARCH_DESCRIPTION` | 旋钮 B |
 | 方向名（邮件标题也用它） | `RESEARCH_FIELD` | 旋钮 B |
+| **同时跑几个方向** | **`RESEARCH_TOPICS`** | — |
 | **期刊** | **`JOURNALS`** | — |
+| **期刊权重**（顶刊加多少分） | **`JOURNAL_TIERS`** | — |
 | 评分阈值 / 并发 / 时间窗 | `AI_THRESHOLD` / `AI_MAX_WORKERS` / `LOOKBACK_DAYS` | — |
 | 密钥、AI 供应商、收件人 | **GitHub Secrets**，改完即生效，**不用改代码也不用 push** | — |
 
@@ -507,7 +539,7 @@ AI 打分失败时卡片会打 `AI 打分失败` 标签，且该文献仍会展�
 python -m src.main --show-config
 
 # ② 再看真实检索结果对不对，别白等一周
-python -m src.main --find-topic           # 确认 TOPIC_QUERY 解析到了正确方向
+python -m src.main --find-topic "lithium-rich manganese-based cathode"  # 确认主题短语解析到正确方向
 python -m src.main --dry-run --no-ai --verbose
 
 # ③ 同步到 GitHub
@@ -517,7 +549,7 @@ python -m src.main --dry-run --no-ai --verbose
 `push.cmd`（实际逻辑在 `push.ps1`）会依次做 5 件事：
 
 1. 检查待提交文件，**拦住 `.env` 等敏感文件**（推上去就泄露了，而且删掉也仍留在 git 历史里）
-2. 跑全部单元测试（当前 65 个），**不通过就中止**（配置改错了根本推不上去）
+2. 跑全部单元测试（当前 98 个），**不通过就中止**（配置改错了根本推不上去）
 3. `fetch` + `rebase` ← **关键，见下方说明**
 4. `push`，失败自动重试 4 次（`github.com` 在国内时通时不通）
 5. 校验远程 commit 和本地是否一致
@@ -525,7 +557,7 @@ python -m src.main --dry-run --no-ai --verbose
 > **★ 为什么第 3 步「rebase」不能省**
 >
 > 每次真实发信后，GitHub 上的机器人会**自动提交一次** `data/pushed_dois.json`
-> （记录已推送的 DOI，防止下周重复推送给你）。
+> （记录已推送的 DOI，按主题分区，防止下周重复推送给你）。
 > 也就是说**远程永远会比你本地多一个提交**。
 > 如果你直接 `git push`，会被拒绝并报：
 >
@@ -554,7 +586,11 @@ python -m src.main --dry-run --no-ai --verbose
 ### 如何换研究方向
 
 **只需要改 `src/config.py` 里的一段配置**，其它文件一个字都不用动。
-AI 提示词、检索条件、邮件标题全部由这四个变量派生：
+AI 提示词、检索条件、邮件标题全部由这几个变量派生：
+
+> **当前模式：多主题。** 所以真正生效的是 `RESEARCH_TOPICS`（见下一节
+> [多主题调研](#多主题调研)），下面这段「单方向」常数虽然还在文件里，但**暂时不起作用**。
+> 想回到单方向：把 `RESEARCH_TOPICS` 改回 `[]`，下面这几个变量立刻恢复生效。
 
 > ⚠️ 前提是**四个变量一起改**。只改关键词而忘了 `TOPIC_QUERY`，
 > 程序会**静默地继续用旧方向检索**（不报错、日志也看不出来）。
@@ -638,7 +674,7 @@ TOPIC_QUERY = "perovskite solar cell"     # → 自动解析到 T10247
 （Nature、Science、Joule、Nature Energy、Adv. Mater. …）。
 如果你从固态电池换到**同一大类**内的方向（钙钛矿、催化、电化学储能…），
 这份清单仍然合适；但如果换成**计算机 / 医学 / 经济**等方向，
-11 本期刊里可能一篇相关的都没有 —— 检索结果会是空的，而不是报错。
+14 本期刊里可能一篇相关的都没有 —— 检索结果会是空的，而不是报错。
 
 另外两个建议顺手一起调：
 
@@ -663,8 +699,123 @@ ISSN 可在 [OpenAlex Sources](https://openalex.org/sources) 或期刊官网查�
 > ⚠️ **ISSN 写错不会报错，只会返回 0 篇**，表现是收到一封「本周无新文献」的心跳邮件。
 > 改完务必跑一次 `python -m src.main --dry-run --no-ai` 确认「候选 N 篇」不是 0。
 >
-> ⚠️ **跨学科换向必须同时换期刊**。当前这 11 本是材料 / 能源 / 化学类，
+> ⚠️ **跨学科换向必须同时换期刊**。当前这 14 本是材料 / 能源 / 化学类，
 > 如果你想换成计算机、医学等方向，光改研究方向会让候选集几乎为空（同样不报错）。
+
+### 多主题调研（`RESEARCH_TOPICS`）
+
+<a id="多主题调研" name="多主题调研"></a>
+
+想同时跟两个以上方向（例如「富锂锰正极」+「无负极钠离子电池」），
+就在 `src/config.py` 里的 `RESEARCH_TOPICS` 里填 —— **每个主题各检索、各打分、各发一封邮件**。
+
+> **当前已启用两个主题**：「富锂锰正极」（分区键 `富锂锰正极`）和
+> 「无负极钠离子电池」（分区键 `无负极钠离子电池`）。
+> 旧的 161 条记录（固态电池方向）已被保留在 `固态电池` 分区里，**不再参与去重**，
+> 这两个新主题因此都会被当成首次运行 —— **第一封邮件覆盖 30 天**，之后回到 14 天。
+> 运行日志里的「使用 30 天窗口」就是这个原因，不是配置错了。
+
+```python
+RESEARCH_TOPICS: list[dict] = [
+    {
+        "name": "富锂锰正极",
+        "topic_query": "lithium-rich manganese-based cathode",   # 第 1 层召回
+        "keywords": ["Li-rich Mn-based cathode", "voltage decay", "anionic redox"],
+    },
+    {
+        "name": "无负极钠离子电池",
+        "topic_query": "anode-free sodium metal battery",
+        "keywords": ["anode-free", "sodium metal anode", "sodiophilic"],
+        "description": "只关心无负极（anode-free）构型，不含常规硬碳负极体系",
+    },
+]
+```
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `name` | ✅ | 主题显示名。用于日志、邮件标题、预览文件名、**去重分区键** |
+| `topic_query` | ✅ | 第 1 层召回用的语义主题短语（= 单方向模式里的 `TOPIC_QUERY`） |
+| `keywords` | ✅ | 第 2 层 AI 的打分尺（= 单方向模式里的 `USER_KEYWORDS`） |
+| `description` | — | 补充「要什么 / 不要什么」，AI 判不准时最有效的一招 |
+| `title` | — | 邮件标题前缀，默认是「`<name>`顶刊周报」 |
+| `topics` | — | 手工锁定主题 id，格式同 `TOPICS`；留空则按 `topic_query` 自动解析 |
+| `key` | — | 状态文件里的分区键，默认等于 `name`（下面「改名字」一段有说明） |
+
+**行为说明（都是刻意设计的，不是 bug）：**
+
+| 现象 | 说明 |
+|---|---|
+| 填了 `RESEARCH_TOPICS` 后，`RESEARCH_FIELD` / `USER_KEYWORDS` / `TOPIC_QUERY` / `TOPICS` / `RESEARCH_DESCRIPTION` 不再生效 | 每个主题改用自己字典里的字段。程序会在日志里以 `配置说明：` 提示（INFO 级，不是报错） |
+| **同一篇论文可能同时出现在两个主题的邮件里** | 去重是**按主题分区**的：`data/pushed_dois.json` 里每个主题各一份已推 DOI 列表。两个方向的交叉论文（比如同时讲钠电与无负极）都该看到 |
+| `name` 改了，该主题突然又推了 30 天的旧文章 | 分区键默认是 `name`，改名 = 换了一个新分区 → 被视为首次运行（30 天预热）。想改名又不重推，把 `key` 填成旧 `name` |
+| 某个主题挂掉，其它主题照常发信 | 单个主题异常不会连累其余主题；但最终 Actions 仍会变红，避免静默漏推 |
+| 想看每个主题各自的分区情况 | 每次运行开头会打印 `【状态】去重库分区 {...}` |
+
+**只跑其中一个方向**（调试时很有用，可重复传）：
+
+```bash
+python -m src.main --dry-run --topic 富锂锰正极
+python -m src.main --topic 富锂锰正极 --topic 无负极钠离子电池
+```
+
+> `--topic` 匹配 `name` 或 `key`，传错会直接报错并列出可用主题，不会默默跑全部。
+> `--dry-run` 多主题时会在 `data/outbox/` 生成**每个主题一个 HTML**
+> （文件名带主题名，如 `2026-09-16-富锂锰正极.html`）。
+>
+> ⚠️ 多主题下 `--keywords` 会被忽略（每个主题用自己的 `keywords`），
+> 日志里会提醒，避免你以为改生效了其实没有。
+
+#### 已推送不重复推送是怎么做到的
+
+`data/pushed_dois.json` 现在的结构（schema v2）：
+
+```json
+{
+  "schema_version": 2,
+  "topics": {
+    "富锂锰正极": ["10.1016/j.joule.2026.102680"],
+    "无负极钠离子电池": ["10.1016/j.joule.2026.102680"]
+  },
+  "last_run": "2026-09-16"
+}
+```
+
+- 每轮先 `filter_new(works, topic_key=...)`：只保留该主题分区里没有的 DOI（无 DOI 的用 `openalex:<id>` 兼底）
+- **只有邮件发送成功**才回写状态（SMTP 挂了不会把文献误标成已推送）
+- 邮件里**展示过的 + 摘要可用但被阈值刷掉的**都会记入 —— 后者不会因“这次不及格”而下周又出现
+- `--dry-run` 完全不写状态文件
+- 旧格式（v1 的 `{"dois": [...]}`、或更早的纯数组）会**自动迁移**为 v2，
+  旧记录整体归入当前第一个主题，**一条都不会丢**（宁可归错也不丢）
+- 本仓库的 `data/pushed_dois.json` 已经手工迁移完毕：161 条旧 DOI 全部归在 `固态电池` 分区
+  （这个分区现在不在主题列表里，所以日志里会出现一次「当前没在用的分区」提醒，属正常）
+
+> ⚠️ 状态文件里出现了当前没在用的分区（比如主题改名了），运行日志会提醒：
+> 旧记录仍在，但不再参与去重 → 那个主题会重新走 30 天预热。
+
+### 期刊权重（`JOURNAL_TIERS`）
+
+入选后按**最终分**降序排列：`最终分 = AI 相关性分 + 期刊档次加成`。
+
+| 档次 | 加成 | 期刊 |
+|---|---|---|
+| 正刊 | **+12** | Nature、Science |
+| 大子刊 | **+9** | Nature Energy、Nature Materials、Nature Chemistry、Nature Sustainability |
+| Joule | **+7** | Joule |
+| 小子刊 | **+5** | Nature Communications、Science Advances |
+| JACS | **+4** | Journal of the American Chemical Society |
+| Angew | **+3** | Angewandte Chemie Int. Ed. |
+| AM | **+2** | Advanced Materials |
+| （其它） | 0 | Energy & Environmental Science、Advanced Functional Materials 等 |
+
+要点：
+
+- **加成只影响排序，不影响入选** —— 是否进邮件仍然只看 AI 分数是否过 `AI_THRESHOLD`。
+  一本低档刊但只要真相关，仍会入选，只是排在后面。
+- 效果：大子刊 AI 给 62 分 → 最终 71 分，会排在 AM 的 70 分前面。
+  同分时看 AI 真实分（相关性更准），再同分看发表日。
+- 改权重就改 `JOURNAL_TIERS` 里的数字，**字典书写顺序就是高低顺序**。
+- 增删档次里的期刊时，**务必同步改 `JOURNALS`** —— 不在 `JOURNALS` 里的刊根本不会被检索到，
+  档次写在那里也白写（程序会在 `--show-config` 里提醒）。
 
 ### 改检索模式（第 1 层 = 旋钮 A）
 
@@ -743,17 +894,19 @@ ISSN 可在 [OpenAlex Sources](https://openalex.org/sources) 或期刊官网查�
 ```yaml
 on:
   schedule:
-    - cron: "7 23 * * 3"        # 每周三 23:07
+    - cron: "7 23 * * 5"        # 每周五 23:07
       timezone: "Asia/Shanghai" # GitHub 现已原生支持时区字段，无需手动换算 UTC
   workflow_dispatch:
     inputs:
       dry_run: ...              # boolean，只生成 HTML 不发信
       lookback_days: ...        # string，覆盖时间窗
       retrieval_mode: ...       # choice: topic / keyword / both
+      topic: ...                # string，只跑指定主题（留空 = 全部）
 ```
 
-> 手动触发时可临时切换 `retrieval_mode` 做对比实验。定时任务不带这个参数，
-> 走 `src/config.py` 里的 `RETRIEVAL_MODE`（默认 `topic`）。
+> 手动触发时可临时切换 `retrieval_mode` 做对比实验，或用 `topic` 只补跑某个方向
+> （多个用英文逗号分隔，写主题的 `name` 或 `key` 都行）。
+> 定时任务不带这些参数，走 `src/config.py` 里的 `RETRIEVAL_MODE` 与全部主题。
 
 几个容易踩的坑：
 
@@ -766,14 +919,17 @@ on:
    日志保留 30 天，HTML 预览保留 14 天，在工作流页面底部下载。
 4. **只有 `data/pushed_dois.json` 会被自动提交**，commit 信息形如
    `chore: update pushed DOIs 2026-09-16`；若状态无变化则跳过提交。
-   该步骤带有 `if: success()` 守卫——**只有邮件真的发出去了才会回写状态**。
+   该步骤用 `if: always()` + `git diff --cached --quiet` 守卫：只要文件真的变了就提交。
+   安全性由程序保证 —— 文件里只会出现「邮件确实发出」的记录，
+   所以即便多主题里有一个凑巧失败，其余主题的已推送记录仍会被保存，
+   **不会导致下周重复推送**。
 
 ---
 
 ## 本地开发
 
 ```bash
-# 跑测试（52 个）
+# 跑测试（98 个）
 python -m unittest discover -s tests -v
 
 # 语法检查
@@ -799,6 +955,15 @@ python -m src.main --to your@email.com --lookback-days 7
 - 无 DOI 文献必须丢弃、期刊名可从 ISSN 表兜底
 - AI 返回的字符串分数必须转成 `int`（回归测试）
 - HTML 转义（`<script>` 必须变成 `&lt;script&gt;`）
+- **期刊加成只能影响排序，不能影响入选**；同分时先看 AI 真实分（回归测试）
+- **期刊档次必须能通过 ISSN 命中**：OpenAlex 返回的刊名与配置写法不同
+  （`Angewandte Chemie International Edition` vs `Angewandte Chemie Int. Ed.`），
+  且 `Advanced Functional Materials` 不得被当成 `Advanced Materials`（回归测试）
+- **多主题去重必须相互独立**：同一篇 DOI 在两个主题下各自可推一次（回归测试）
+- v1 状态文件必须能自动迁到 v2，**一条 DOI 不丢**；状态文件损坏必须回退为空而不是抛异常
+- **两个主题必须发两封邮件**（各自标题、各自分区），一个主题挂了不影响另一个（回归测试）
+- `--dry-run` 多主题时每个主题各写一个 HTML 预览，且**完全不碰状态文件**（回归测试）
+- `--topic` 必须能按 `name` 或 `key` 选中主题，传错要立即报错而不是默默跑全部
 - 状态文件损坏时回退为空而非崩溃、兼容旧的裸数组格式
 - S2 连续限流必须熔断、成功必须重置失败计数（回归测试）
 

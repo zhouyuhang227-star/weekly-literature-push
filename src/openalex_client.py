@@ -129,6 +129,25 @@ def _journal_name(source: dict | None) -> str:
     return "未知期刊"
 
 
+def _pick_issn(source: dict | None) -> str:
+    """挑一个**能对上配置表**的 ISSN，供期刊档次加权用。
+
+    OpenAlex 的 ``source.issn`` 同时含印刷版与电子版，而配置里写的是 eISSN。
+    所以优先返回能在 ``ISSN_TO_NAME`` 里查到的那一个，查不到再退回 ``issn_l``。
+    否则会出现「明明配置了这本刊，加成却是 0」的静默错配。
+    """
+    if not source:
+        return ""
+    candidates = list(source.get("issn") or []) + [source.get("issn_l")]
+    for issn in candidates:
+        if issn and issn in ISSN_TO_NAME:
+            return str(issn).lower()
+    for issn in candidates:
+        if issn:
+            return str(issn).lower()
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # 查询构造
 # ---------------------------------------------------------------------------
@@ -239,26 +258,49 @@ def resolve_topics(query: str, limit: int | None = None) -> dict[str, str]:
     return {entry["name"]: entry["id"] for entry in picked}
 
 
-def active_topics() -> dict[str, str]:
+def active_topics(topic=None) -> dict[str, str]:
     """当前生效的主题表。
 
+    传入 ``config.ResearchTopic`` 时用该主题自己的 ``topics`` / ``topic_query``
+    （多主题调研时每个主题各查各的）。不传时退回单方向模式：
     优先用 ``config.TOPICS``（手工锁定）；它是空字典时按 ``config.TOPIC_QUERY``
     自动解析。注意读的是 **当前** 的 ``config``，保证「改 config 就生效」。
     """
+    if topic is not None:
+        if topic.topics:
+            return dict(topic.topics)
+        return resolve_topics(topic.topic_query)
     if config.TOPICS:
         return dict(config.TOPICS)
     return resolve_topics(config.TOPIC_QUERY)
 
 
-def topic_filter_value() -> str:
+def topic_filter_value(topic=None) -> str:
     """``topics.id`` 过滤器要用的 ``T1|T2`` 串；无主题时返回空串。"""
-    return "|".join(active_topics().values())
+    return "|".join(active_topics(topic).values())
+
+
+def effective_keywords(keywords: list[str] | None, topic=None) -> list[str]:
+    """keyword / both 模式下真正用于召回的词表。
+
+    优先用命令行传入的 ``--keywords``，其次用主题自己的 ``keywords``，
+    最后退回 ``config.USER_KEYWORDS``。
+
+    ⚠️ 这里必须兜底：否则 ``both`` 模式在没传 ``--keywords`` 时会**静默退化成
+    纯 topic 模式**，说是并集实际只走主题，现象是「改了 USER_KEYWORDS 也不涨候选量」。
+    """
+    if keywords:
+        return [kw for kw in keywords if kw and kw.strip()]
+    if topic is not None:
+        return list(topic.keywords)
+    return list(config.USER_KEYWORDS)
 
 
 def build_filter(
     from_date: date,
     keywords: list[str] | None = None,
     mode: str = RETRIEVAL_MODE,
+    topic=None,
 ) -> str:
     """构造 ``filter=`` 参数。
 
@@ -266,6 +308,8 @@ def build_filter(
       * ``"topic"``   —— 只用 OpenAlex 语义主题分类（``topics.id``）
       * ``"keyword"`` —— 只用字面关键词（``title_and_abstract.search``）
       * ``"both"``    —— 两者并集
+
+    ``topic`` 为空时用单方向模式的全局配置（向后兼容）。
 
     ⚠️ ``title_and_abstract.search`` 必须写进 filter，不能作为 URL query 参数（会 400）。
     检索串本身不含逗号，因此与其它条件用逗号拼接是安全的。
@@ -278,28 +322,29 @@ def build_filter(
         "is_paratext:false",
     ]
     if mode in ("topic", "both"):
-        topic_ids = topic_filter_value()
+        topic_ids = topic_filter_value(topic)
         if topic_ids:
             parts.append(f"topics.id:{topic_ids}")
         else:
             log.warning("topic 模式但没解析到任何主题 id，本轮将退化为无主题过滤（召回会暴涨）")
-    if mode in ("keyword", "both") and keywords:
-        query = build_keyword_query(keywords)
+    if mode in ("keyword", "both"):
+        query = build_keyword_query(effective_keywords(keywords, topic))
         if query:
             parts.append(f"{SEARCH_FIELD}:{query}")
     return ",".join(parts)
 
 
-def _describe_filter(mode: str, keywords: list[str] | None) -> str:
+def _describe_filter(mode: str, keywords: list[str] | None, topic=None) -> str:
     """给人看的检索条件说明，用于日志。"""
-    topics = active_topics()
+    topics = active_topics(topic)
     topic_desc = f"{list(topics.values())}（{'、'.join(topics)}）" if topics else "（未解析到主题）"
+    words = effective_keywords(keywords, topic)
+    if mode == "keyword":
+        return f"关键词 {words}"
+    if mode == "both":
+        return f"主题 {topic_desc} + 关键词 {words}"
     if mode == "topic":
         return f"主题 {topic_desc}"
-    if mode == "keyword":
-        return f"关键词 {keywords}"
-    if mode == "both":
-        return f"主题 {topic_desc} + 关键词 {keywords}"
     return f"未知模式 {mode!r}"
 
 
@@ -342,6 +387,7 @@ def parse_work(work: dict) -> dict | None:
         "doi_url": f"https://doi.org/{doi}",
         "title": (work.get("display_name") or "").strip() or "（无标题）",
         "journal": _journal_name(source),
+        "issn": _pick_issn(source),
         "pub_date": work.get("publication_date") or "",
         "cited_by": work.get("cited_by_count") or 0,
         "type": work.get("type") or "",
@@ -351,23 +397,25 @@ def parse_work(work: dict) -> dict | None:
 
 
 def fetch_works(
-    keywords: list[str],
+    keywords: list[str] | None,
     lookback_days: int,
     max_works: int = MAX_WORKS_FETCH,
     mode: str = RETRIEVAL_MODE,
+    topic=None,
 ) -> list[dict]:
     """检索指定时间窗内的顶刊论文，返回去重后的候选列表。
 
     第 1 层筛选由 ``mode`` 决定（主题分类 / 字面关键词 / 两者并集）。
     所有条件在**一次**查询里组合（比多次查询更省配额、更快）。
+    ``topic`` 为空时用单方向模式的全局配置（向后兼容）。
     """
     from_date = date.today() - timedelta(days=lookback_days)
-    filter_value = build_filter(from_date, keywords, mode)
+    filter_value = build_filter(from_date, keywords, mode, topic)
 
     log.info(
         "OpenAlex 检索：期刊 %s 本 / %s / 起始日期 %s / 上限 %s 篇",
         len(ISSN_FILTER.split("|")),
-        _describe_filter(mode, keywords),
+        _describe_filter(mode, keywords, topic),
         from_date.isoformat(),
         max_works,
     )
