@@ -1,6 +1,6 @@
 # 顶刊文献自动推送机器人
 
-每周五晚自动检索 14 本材料/能源/化学顶刊的最新论文，用 AI 判断是否与**你配置的研究方向**
+每周五晚自动检索 15 本材料/能源/化学顶刊的最新论文，用 AI 判断是否与**你配置的研究方向**
 相关，只把真正相关的文献整理成中文周报邮件发到你的邮箱。
 
 > 🚀 **第一次用？** 直接看 [部署到 GitHub（完整流程）](#部署到-github完整流程)
@@ -269,7 +269,7 @@ on:
 | `push.cmd` 一直提示连不上，最后报 `Failed to connect to github.com:443` | **不是你的 git 配错了，是网络**。国内 `github.com` 常常时通时不通（典型表现：`api.github.com` 能访问、`github.com` 超时 21 秒）。挂上代理后让 git 也走代理：`git config --global http.proxy http://127.0.0.1:7890`（端口换成你代理软件的）。取消：`git config --global --unset http.proxy` |
 | 黄色警告 `Node.js 20 is deprecated` | **任务仍然会成功，但要修**。三个官方 action 的旧大版本内部声明的是 Node 20，而 Node 20 已于 **2026-09-23 从 runner 上彻底移除**。本项目已升级到 `checkout@v7` / `setup-python@v7` / `upload-artifact@v7`（内部为 `node24`）。以后凡是「绿色 ✔ + 黄条警告」，八成都是这类依赖过时，去对应 action 的 releases 页取最新大版本号即可 |
 | **改了 `keywords`，候选量一点没变** | **不是 bug**：`keywords` 是给 AI 的打分尺，召回去看 `search_terms`（见 [两把旋钮](#two-knobs)）。拿不准就跑 `python -m src.main --show-config` |
-| **两个主题的候选数一模一样 / 都不像自己方向 / 少到发慌** | 这是曾经真实发生过的事故：主题短语解析为 0 时旧版本会**静默丢掉主题条件**，退化成「14 本刊近 30 天」全库检索，两个主题拿到同一批无关论文。现已改成**直接报错**（`RuntimeError` + 退出码非 0 + Actions 变红）。看到红色 ≠ 坏了，而是它在告诉你“召回条件没生效” |
+| **两个主题的候选数一模一样 / 都不像自己方向 / 少到发慌** | 这是曾经真实发生过的事故：主题短语解析为 0 时旧版本会**静默丢掉主题条件**，退化成「全部期刊近 30 天」全库检索，两个主题拿到同一批无关论文。现已改成**直接报错**（`RuntimeError` + 退出码非 0 + Actions 变红）。看到红色 ≠ 坏了，而是它在告诉你“召回条件没生效” |
 | 报 `OpenAlex 今日额度已用完（HTTP 429）` | 2026 年起 OpenAlex 按请求计费（匿名 1000 积分/天）。当天调试次数太多就会耗尽，**要等次日 UTC 零点**，重试无用。临时办法：触发 GitHub Actions（走另一套出口 IP）；彻底解决：配 `OPENALEX_API_KEY` |
 
 > **想让定时任务更准时**：GitHub 官方文档明确说明**整点（minute = 0）是负载高峰**，
@@ -288,7 +288,7 @@ python -m src.main [选项]
 |---|---|
 | `--dry-run` | 只把邮件 HTML 写到 `data/outbox/`，不发信、不写状态 |
 | `--retrieval-mode X` | 第 1 层召回方式：`keyword`（**默认**，主题 `search_terms` 字面短词，粒度准）/ `topic`（OpenAlex 语义主题，粒度粗）/ `both`（并集） |
-| `--force-first-run` | 强制按首次运行处理（用 30 天预热窗） |
+| `--force-first-run` | 强制按首次运行处理（用 90 天预热窗） |
 | `--lookback-days N` | 临时覆盖时间窗天数，如 `--lookback-days 90` 回补三个月 |
 | `--max-items N` | 单封邮件最多展示篇数（默认 20） |
 | `--max-fetch N` | 最多拉取候选文献数（默认 300） |
@@ -341,8 +341,15 @@ python -m src.main --dry-run --topic 富锂锰正极
 
 | 场景 | 时间窗 | 目的 |
 |---|---|---|
-| **首次运行**（`pushed_dois.json` 为空） | 最近 **30 天** | 一次性把积压的文献补齐，避免刚部署时收到空邮件 |
+| **首次运行**（`pushed_dois.json` 为空） | 最近 **90 天** | 一次性把积压的文献补齐，避免刚部署时收到空邮件 |
 | **之后每次** | 最近 **14 天** | 每周跑一次，14 天重叠期能兜住节假日跳过、接口抖动等漏网 |
+
+> ⚠️ 首次窗口特意开到 90 天，是因为 **OpenAlex 对新论文的收录有滞后**：
+> 论文可能月初就在线了，进 OpenAlex 却晚几周，而 `from_publication_date` 卡的是收录到的发表日。
+> 窗口开窄（早期默认 30 天）时，刚部署那阵子会出现「我手动翻期刊网站明明有好几篇，
+> 机器人却说没有」的假象。
+>
+> 首次跑完就会把推过的 DOI 写进 `pushed_dois.json`，之后每轮只按 14 天滚动，不会重复推送。
 
 可用 `--force-first-run` 或 `--lookback-days N` 临时改变。
 
@@ -760,7 +767,7 @@ TOPIC_QUERY = "perovskite solar cell"     # → 自动解析到 T10247
 （Nature、Science、Joule、Nature Energy、Adv. Mater. …）。
 如果你从固态电池换到**同一大类**内的方向（钙钛矿、催化、电化学储能…），
 这份清单仍然合适；但如果换成**计算机 / 医学 / 经济**等方向，
-14 本期刊里可能一篇相关的都没有 —— 检索结果会是空的，而不是报错。
+15 本期刊里可能一篇相关的都没有 —— 检索结果会是空的，而不是报错。
 
 另外两个建议顺手一起调：
 
@@ -785,7 +792,7 @@ ISSN 可在 [OpenAlex Sources](https://openalex.org/sources) 或期刊官网查�
 > ⚠️ **ISSN 写错不会报错，只会返回 0 篇**，表现是收到一封「本周无新文献」的心跳邮件。
 > 改完务必跑一次 `python -m src.main --dry-run --no-ai` 确认「OpenAlex 命中总数」不是 0。
 >
-> ⚠️ **跨学科换向必须同时换期刊**。当前这 14 本是材料 / 能源 / 化学类，
+> ⚠️ **跨学科换向必须同时换期刊**。当前这 15 本是材料 / 能源 / 化学类，
 > 如果你想换成计算机、医学等方向，光改研究方向会让候选集几乎为空（同样不报错）。
 
 ### 多主题调研（`RESEARCH_TOPICS`）
@@ -799,8 +806,8 @@ ISSN 可在 [OpenAlex Sources](https://openalex.org/sources) 或期刊官网查�
 > 「钠离子正极」（分区键 `钠离子正极`）。
 > 这两个分区**已被手动清空**（旧记录来自一次静默退化的全库检索，DOI 全是无关论文，
 > 留着会把正确结果挡在去重之外），所以下一轮会被当成首次运行 ——
-> **第一封邮件覆盖 30 天**，之后回到 14 天。
-> 运行日志里的「使用 30 天窗口」就是这个原因，不是配置错了。
+> **第一封邮件覆盖 90 天**，之后回到 14 天。
+> 运行日志里的「使用 90 天窗口」就是这个原因，不是配置错了。
 
 ```python
 RESEARCH_TOPICS: list[dict] = [
@@ -846,7 +853,7 @@ RESEARCH_TOPICS: list[dict] = [
 | 填了 `RESEARCH_TOPICS` 后，`RESEARCH_FIELD` / `USER_KEYWORDS` / `TOPIC_QUERY` / `TOPICS` / `RESEARCH_DESCRIPTION` 不再生效 | 每个主题改用自己字典里的字段。程序会在日志里以 `配置说明：` 提示（INFO 级，不是报错） |
 | **同一篇论文可能同时出现在两个主题的邮件里** | 去重是**按主题分区**的：`data/pushed_dois.json` 里每个主题各一份已推 DOI 列表。两个方向的交叉论文（比如同时讲钠电与层状氧化物）都该看到 |
 | 主题跨领域时期刊也不同 | 期刊列表 `JOURNALS` 是**全局共用**的；现在两个主题都属电池方向，所以一张表就够了 |
-| `name` 改了，该主题突然又推了 30 天的旧文章 | 分区键默认是 `name`，改名 = 换了一个新分区 → 被视为首次运行（30 天预热）。想改名又不重推，把 `key` 填成旧 `name` |
+| `name` 改了，该主题突然又推了 90 天的旧文章 | 分区键默认是 `name`，改名 = 换了一个新分区 → 被视为首次运行（90 天预热）。想改名又不重推，把 `key` 填成旧 `name` |
 | 某个主题挂掉，其它主题照常发信 | 单个主题异常不会连累其余主题；但最终 Actions 仍会变红，避免静默漏推 |
 | 想看每个主题各自的分区情况 | 每次运行开头会打印 `【状态】去重库分区 {...}` |
 
@@ -889,7 +896,7 @@ python -m src.main --topic 富锂锰正极 --topic 钠离子正极
   （这个分区现在不在主题列表里，所以日志里会出现一次「当前没在用的分区」提醒，属正常）
 
 > ⚠️ 状态文件里出现了当前没在用的分区（比如主题改名了），运行日志会提醒：
-> 旧记录仍在，但不再参与去重 → 那个主题会重新走 30 天预热。
+> 旧记录仍在，但不再参与去重 → 那个主题会重新走 90 天预热。
 
 ### 期刊权重（`JOURNAL_TIERS`）
 
@@ -904,7 +911,7 @@ python -m src.main --topic 富锂锰正极 --topic 钠离子正极
 | JACS | **+4** | Journal of the American Chemical Society |
 | Angew | **+3** | Angewandte Chemie Int. Ed. |
 | AM | **+2** | Advanced Materials |
-| （其它） | 0 | Energy & Environmental Science、Advanced Functional Materials 等 |
+| （其它） | 0 | Energy & Environmental Science、Advanced Functional Materials、Small 等 |
 
 要点：
 

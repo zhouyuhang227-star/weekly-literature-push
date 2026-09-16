@@ -50,6 +50,7 @@ JOURNALS: dict[str, str] = {
     "Advanced Materials": "1521-4095",
     "Energy & Environmental Science": "1754-5706",
     "Advanced Functional Materials": "1616-3028",
+    "Small": "1613-6829",
 }
 
 # OpenAlex 的 OR 语法：用 | 拼接 ISSN。
@@ -71,7 +72,8 @@ ISSN_TO_NAME: dict[str, str] = {issn: name for name, issn in JOURNALS.items()}
 #       AM  论文 AI 给 70 分 → 最终 70 + 2 = 72。
 #
 # 想调权重 → 改这里的数字，或增删档次；想加期刊 → 同时加进上面的 JOURNALS。
-# 不在这张表里的期刊（如 Energy & Environmental Science、AFM）加成为 0。
+# 不在这张表里的期刊（如 Energy & Environmental Science、AFM、Small）加成为 0 ——
+# 它们照样会被检索、会进邮件，只是排序时不额外加分。
 JOURNAL_TIERS: dict[str, tuple[int, tuple[str, ...]]] = {
     "正刊": (12, ("Nature", "Science")),
     "大子刊": (9, ("Nature Energy", "Nature Materials", "Nature Chemistry", "Nature Sustainability")),
@@ -441,13 +443,29 @@ RESEARCH_TOPICS: list[dict] = [
         #   "anionic redox" 5 篇、"voltage decay" 4 篇、"voltage hysteresis" 1 篇
         # ⚠️ 带上氧/阴离子氧化还原这类机理词会顺带捞到少量钠电论文 ——
         #    这是**故意的**：宁可多召回几篇交给 AI 判，也不要漏。
+        #
+        # 下面补的是富锂锰论文里的**高频机理词**（voltage fade / lattice oxygen /
+        # oxygen release / cation migration）：很多这类论文标题里并不写 "Li-rich"，
+        # 只写 "oxygen release in layered cathodes" 之类，光靠材料名会漏掉。
+        # ⚠️ 缩写一律不加：实测 "lrlo" / "lmr" / "li2mno3" 命中 0 篇；
+        #    化学式同理（"li1.2mn0.54..." 在索引里是**一整个词**，短语检索匹不上）。
         "search_terms": [
+            # —— 材料本体 ——
             "li-rich",
             "lithium-rich",
             "lithium rich",
+            "li-excess",
+            "lithium excess",
+            # —— 机理关键词（高召回）——
             "oxygen redox",
             "anionic redox",
+            "anion redox",
+            "lattice oxygen",
+            "oxygen release",
+            "cation migration",
+            # —— 电压问题 ——
             "voltage decay",
+            "voltage fade",
             "voltage hysteresis",
         ],
         "keywords": [
@@ -662,8 +680,13 @@ TOPIC_RESOLVE_LIMIT = 1
 SEARCH_FIELD = "title_and_abstract.search"
 
 # 时间窗。首次运行（去重库为空）用宽窗口做一次预热，之后固定滚动窗口。
+#
+# ⚠️ 首次预热窗口要留够长：OpenAlex 对新论文的收录有滞后（在线发表 → 进库可能差
+#    几周），而 from_publication_date 卡的是 publication_date。窗口开太窄，
+#    刚上线那阵子会「看起来一篇都没有」。首次跑完就会把 DOI 记进 pushed_dois.json，
+#    之后每轮只按 LOOKBACK_DAYS 滚动，不会重复推送。
 LOOKBACK_DAYS = 14
-LOOKBACK_DAYS_FIRST_RUN = 30
+LOOKBACK_DAYS_FIRST_RUN = 90
 
 # 分页与总量上限。per-page 最大 200（OpenAlex 上限）。
 PER_PAGE = 200
