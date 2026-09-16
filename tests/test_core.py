@@ -2634,12 +2634,34 @@ class TestLiveResearchConfig(unittest.TestCase):
         self.assertEqual(content_rules.exclusion_hit(work, lithium), None)
 
     def test_sodium_topic_recalls_anode_free_sodium_papers(self):
-        """★ 真实例子：《Anode-free sodium metal batteries enabled by electrolyte
-        engineering》—— 在这批补词之前，它在**召回阶段**就被丢了（一个词都不命中）。
+        """★ 真实例子：《Data-Driven Knowledge Discovery Reveals Quantitative
+        Electrolyte Design Rules for Anode-Free Sodium Metal Batteries》
+        （JACS 2026, 148(30) 31918，DOI 10.1021/jacs.6c05130）——
+        在这批补词之前，它在**召回阶段**就被丢了（真实标题里一个词都不命中）。
         """
         sodium = next(t for t in config.active_research_topics() if t.name == "钠离子正极")
         for term in ("sodium metal battery", "anode-free sodium"):
             self.assertIn(term, sodium.search_terms)
+
+    def test_real_jacs_anode_free_sodium_paper_passes_every_layer(self):
+        """★ 真实论文全链路回归：用**真实标题**钉住召回→剔除→保底→加分四层。
+
+        DOI ``10.1021/jacs.6c05130`` 是「补召回词」这件事的原始样本。它后来**仍然没被
+        推送**，原因不在规则层，而在时间窗（周更是 14 天增量窗口，它 online 于 2026-07-21）——
+        所以这里只用真实标题证明**规则层已经不漏**，窗口问题由 ``--lookback-days`` 解决。
+        """
+        work = {
+            "doi": "10.1021/jacs.6c05130",
+            "title": (
+                "Data-Driven Knowledge Discovery Reveals Quantitative Electrolyte Design "
+                "Rules for Anode-Free Sodium Metal Batteries"
+            ),
+        }
+        sodium = next(t for t in config.active_research_topics() if t.name == "钠离子正极")
+        self.assertTrue(source_base.matches_recall_terms(work, sodium.search_terms))
+        self.assertIsNone(content_rules.exclusion_hit(work, sodium))
+        self.assertEqual(content_rules.keep_hit(work, sodium), "无负极")
+        self.assertGreater(content_rules.bonus_score(work), 0)
 
     def test_topic_descriptions_mention_the_anode_free_configuration(self):
         """描述会拼进 AI 的判据，无负极构型得写进去（否则 AI 不会往那儿看）。"""

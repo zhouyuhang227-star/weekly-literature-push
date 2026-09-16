@@ -1180,7 +1180,7 @@ title 里有 `electrolyte engineering` 的**无负极钠电**论文会被**两�
 | 漏 | 补法 |
 |---|---|
 | **词表只能做字面匹配** —— 无负极是**电芯构型**，往往不是研究重点，标题里可能一个字都没有（「裸 Cu 集流体直接沉积」「负极过量≈0」），词表必定漏 | 让 **AI 顺手判一次**（见下），它本来就通读了摘要 |
-| **召回层根本没捞到** —— 《Anode-free sodium metal batteries enabled by electrolyte engineering》（JACS）在「钠离子正极」主题下**一个 `search_terms` 都不命中**（补词前 0 命中，于是连候选池都进不去，后面的保底再准也没用） | 给两个主题补召回词：补词后它命中 `sodium metal batteries` + `anode-free sodium` 两个词（有测试钉住），见 [改关键词](#改关键词user_keywords--主题的-search_termskeywords) |
+| **召回层根本没捞到** —— JACS 那篇《Data-Driven Knowledge Discovery Reveals Quantitative Electrolyte Design Rules for Anode-Free Sodium Metal Batteries》（`10.1021/jacs.6c05130`）在「钠离子正极」主题下**一个 `search_terms` 都不命中**（补词前 0 命中，于是连候选池都进不去，后面的保底再准也没用） | 给两个主题补召回词：补词后它命中 `sodium metal batteries` + `anode-free sodium` 两个词（有测试钉住），见 [改关键词](#改关键词user_keywords--主题的-search_termskeywords) |
 
 > 这类补词的代价是**会顺手捞到非本课题的无负极论文** —— 上面那篇锂硫就被
 > `anode-free lithium` 捞进了「富锂锰正极」的候选池。这是**故意**的：
@@ -1363,10 +1363,16 @@ def test_every_recall_term_can_also_pass_the_gate(self): ...
 细节：
 
 - `search_terms` 里多词短语会自动加引号，OpenAlex 会做**词干化**匹配（`battery` 能匹配 `batteries`）。
-- ⚠️ **“保底了却从来没推过”先查召回层。** 真实案例：`Anode-free sodium metal batteries enabled
-  by electrolyte engineering` 标题里没有任何原有召回词，于是在**第 1 层就被丢掉了**，
-  保底/加分根本来不及生效 —— 所以两个主题都补了 `anode-free sodium` / `sodium metal battery`
-  这类召回词。**保底词表和召回词表是两码事，两条都得改。**
+- ⚠️ **“保底了却从来没推过”要按顺序查三层：召回词 → 剔除规则 → 时间窗。** 真实案例：
+  JACS 那篇《Data-Driven Knowledge Discovery Reveals Quantitative Electrolyte Design Rules
+  for Anode-Free Sodium Metal Batteries》（`10.1021/jacs.6c05130`）——
+  ① 补召回词前，它的**真实标题里没有任何原有召回词**，在召回阶段就被丢了；
+  ② 补完词、闸门也放宽之后，它**依然没被推送** —— 因为它 `published-online 2026-07-21`，
+  而周更用的是 `LOOKBACK_DAYS = 14` 的**增量**窗口（首次运行才用 90 天），它落在窗口之外，
+  连候选池都进不去。
+  **保底词表和召回词表是两码事，两条都得改；窗口外的老论文则只能手动补扫** ——
+  Run workflow 时把 `lookback_days` 填大（如 `90` / `180`）：已推送的 DOI 会被去重库挡掉，
+  只有漏网的才会补出来。
 - 想临时试别的研究方向用 `--keywords "a;b"`（全角 `；，` 会自动归一化）。
   此时 AI 只拿到这几个词；不传 `--keywords` 时 AI 收到的是
   `RESEARCH_FIELD + RESEARCH_DESCRIPTION + USER_KEYWORDS` 的完整描述，上下文更全。

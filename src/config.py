@@ -353,10 +353,11 @@ BONUS_RULES: list[dict] = [
 #:     ``AI_THRESHOLD`` 照样进不了邮件。
 #:   * ``KEEP_RULES`` 管**入选**：命中就强制进邮件，AI 分再低也留。
 #:
-#: 为什么需要它：无负极构型的论文经常是"电解液工程"（如《Anode-free sodium
-#: metal batteries enabled by electrolyte engineering》），而「电解液工程」
-#: 是 ``EXCLUDE_RULES`` 里的硬剔除项 —— 在**还没进 AI 打分**时就被丢掉了，
-#: 加分规则根本来不及生效。老板要盯的方向不能这样丢，所以单开这一层。
+#: 为什么需要它：无负极构型的论文经常以"电解液设计/工程"为主题（例如 JACS 那篇
+#: 《Data-Driven Knowledge Discovery Reveals Quantitative Electrolyte Design Rules
+#: for Anode-Free Sodium Metal Batteries》，DOI ``10.1021/jacs.6c05130``），
+#: 而「电解液工程」是 ``EXCLUDE_RULES`` 里的硬剔除项 —— 在**还没进 AI 打分**时
+#: 就被丢掉了，加分规则根本来不及生效。老板要盯的方向不能这样丢，所以单开这一层。
 #:
 #: 另有一条**AI 侧保底**（口径见 ``AI_ANODE_FREE_HINT``）：AI 从摘要里判定"这篇就是
 #: 无负极"且体系对口时，同样按保底处理。因为上面这套词表只能做字面匹配，
@@ -797,9 +798,12 @@ RESEARCH_TOPICS: list[dict] = [
             "na0.67mno2",
             "sodium cathode",
             # —— 无负极钠电（★ 补于 Seg Q）——
-            # 真实例子：《Anode-free sodium metal batteries enabled by electrolyte
-            # engineering》（JACS）—— 标题里**一个现有召回词都没有**，
-            # 所以它在"多源并集检索"阶段就被丢了，后面的保底规则根本没机会看到它。
+            # 真实例子：《Data-Driven Knowledge Discovery Reveals Quantitative
+            # Electrolyte Design Rules for Anode-Free Sodium Metal Batteries》
+            # （JACS 2026, 148(30) 31918，DOI 10.1021/jacs.6c05130）——
+            # 标题里**一个原有召回词都没有**（``sodium metal battery`` 是**单数**，
+            # 匹配不上标题的复数 ``batteries``），所以它在"多源并集检索"阶段就被丢了，
+            # 后面的保底规则根本没机会看到它。
             "sodium metal battery",
             "sodium metal batteries",
             "na metal battery",
