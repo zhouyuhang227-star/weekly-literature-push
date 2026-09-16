@@ -19,11 +19,14 @@
 
 **失败必须看得见**
     * 某个源失败 → 其余源照常工作，日志记 ERROR，并把失败原因写进**邮件页头**；
+    * **源成功但结果不完整** → 也写进邮件页头（如 Crossref 有 1/15 本刊查询失败）。
+      这种情形最阴险：源状态是 ok，页头上只是一个偏小的篇数，看不出少了一整本刊；
     * 全部源失败 → 直接 ``raise``，让 Actions 变红，而不是发一封"本周无新文献"。
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
 
 from .. import config
@@ -95,6 +98,21 @@ def enabled_sources(names=None) -> list[str]:
     return ordered
 
 
+def _notes_sink(fn) -> list[str] | None:
+    """适配器接不接受 ``notes=`` 告警通道？接受就返回一个空列表，否则 ``None``。
+
+    为什么要探测而不是直接传：`ADAPTERS` 在测试里会被换成测试桩
+    （多为 ``lambda *_a, **_k``），给每个桩都加一个用不上的参数纯属噪音；
+    而带 ``**kwargs`` 的桩会把 ``notes`` 默默吃掉、告警就丢了，
+    所以**只有显式声明了 ``notes`` 的适配器才传**。
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):  # 拿不到签名的内建/C 可调用对象
+        return None
+    return [] if "notes" in params else None
+
+
 def fetch_works(
     keywords: list[str] | None,
     lookback_days: int,
@@ -156,11 +174,15 @@ def fetch_works(
             reports.append(SourceReport(name=name, status="skipped", error=reason))
             continue
 
+        notes = _notes_sink(ADAPTERS[name])
+        extra = {"notes": notes} if notes is not None else {}
         try:
             if name == OPENALEX:
-                works = ADAPTERS[name](terms, lookback_days, cap, mode=mode, topic=topic)
+                works = ADAPTERS[name](
+                    terms, lookback_days, cap, mode=mode, topic=topic, **extra
+                )
             else:
-                works = ADAPTERS[name](terms, lookback_days, cap)
+                works = ADAPTERS[name](terms, lookback_days, cap, **extra)
         except Exception as exc:  # noqa: BLE001 - 单源失败不该拖垮整轮
             log.error("[%s] 检索失败：%s", label, exc)
             reports.append(SourceReport(name=name, status="failed", error=str(exc)))
@@ -171,7 +193,12 @@ def fetch_works(
             works = works[:cap]
 
         log.info("[%s] 返回 %s 篇", label, len(works))
-        reports.append(SourceReport(name=name, status="ok", count=len(works)))
+        for note in notes or []:
+            # 源成功了但不完整：既记日志，也随 SourceReport 进邮件页头
+            log.warning("[%s] 结果不完整：%s", label, note)
+        reports.append(
+            SourceReport(name=name, status="ok", count=len(works), notes=list(notes or []))
+        )
         groups.append((name, works))
 
     if not groups:

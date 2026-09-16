@@ -2110,9 +2110,29 @@ class TestCrossrefAdapter(unittest.TestCase):
             seen["params"] = params
             return self._Resp(self._payload(items), status_code)
 
-        with patch.object(crossref_source.requests, "get", side_effect=fake_get):
+        # 重试等待归零：否则「全刊失败」那个用例要真实等 15×6 秒
+        with patch.object(crossref_source.requests, "get", side_effect=fake_get), \
+                patch.object(config, "CROSSREF_RETRY_WAIT", 0):
             works = crossref_source.fetch(terms, 90)
         return works, seen
+
+    def _run_scripted(self, plan, items, terms):
+        """``plan``: {issn: [状态码, ...]}，队列用完则回 200。返回 (works, 实际调用)。"""
+        calls: list[tuple[str, int]] = []
+        queue = {issn: list(codes) for issn, codes in plan.items()}
+        notes: list[str] = []
+
+        def fake_get(url, params=None, headers=None, timeout=None):
+            issn = url.split("/journals/", 1)[1].split("/", 1)[0]
+            code = queue[issn].pop(0) if queue.get(issn) else 200
+            calls.append((issn, code))
+            payload = self._payload(items) if code == 200 else {}
+            return self._Resp(payload, code)
+
+        with patch.object(crossref_source.requests, "get", side_effect=fake_get), \
+                patch.object(config, "CROSSREF_RETRY_WAIT", 0):
+            works = crossref_source.fetch(terms, 90, notes=notes)
+        return works, calls, notes
 
     def test_uses_the_per_journal_endpoint_with_an_ors_query(self):
         _, seen = self._run([], ["li-rich", "anion redox"])
@@ -2200,6 +2220,99 @@ class TestCrossrefAdapter(unittest.TestCase):
         ]
         works, _ = self._run(items, ["anion redox"])
         self.assertEqual(works, [])
+
+    # -- 限流重试 / 部分失败可见（缺陷 B）------------------------------
+    def test_429_is_retried_so_a_whole_journal_is_not_lost(self):
+        """实测：5 并发时 Crossref 回 429，整本 Angewandte 当轮消失（39 条 → 27 条）。
+
+        重试之后这本刊照旧进来 —— 单刊失败不该表现为「本轮少了一本顶刊」。
+        """
+        issn = config.JOURNALS["Joule"]
+        items = [self._item(
+            doi="10.1016/j.joule.9",
+            title="Li-rich cathode with anion redox",
+            abstract="<jats:p>Anion redox in Li-rich cathodes.</jats:p>",
+        )]
+        works, calls, notes = self._run_scripted(
+            {issn: [429, 429]}, items, ["li-rich", "anion redox"]
+        )
+        self.assertEqual(
+            [c for c in calls if c[0] == issn], [(issn, 429), (issn, 429), (issn, 200)]
+        )
+        self.assertIn(issn, {w["issn"] for w in works})  # 这本刊没丢
+        self.assertEqual(notes, [])  # 重试成功 ⇒ 不该吓用户
+
+    def test_persistent_rate_limiting_is_reported_upwards(self):
+        issn = config.JOURNALS["Joule"]
+        works, calls, notes = self._run_scripted(
+            {issn: [429] * 9}, [], ["li-rich", "anion redox"]
+        )
+        self.assertEqual(len([c for c in calls if c[0] == issn]), config.CROSSREF_RETRIES)
+        self.assertEqual(len(notes), 1)
+        self.assertIn(f"1/{len(config.JOURNALS)} 本刊查询失败", notes[0])
+        self.assertIn("Joule", notes[0])
+        self.assertEqual(works, [])
+
+    def test_client_errors_are_not_retried(self):
+        """404 重试多少次还是 404，白等只会拖慢整轮。"""
+        issn = config.JOURNALS["Joule"]
+        _, calls, _ = self._run_scripted({issn: [404] * 9}, [], ["li-rich", "anion redox"])
+        self.assertEqual([c for c in calls if c[0] == issn], [(issn, 404)])
+
+    def test_a_failing_journal_is_still_reported_when_the_rest_are_fine(self):
+        """最阴险的情形：源是 ok，页头上只是一个偏小的篇数。"""
+        items = [self._item(
+            doi="10.1002/adma.88",
+            title="Anion redox in Li-rich oxides",
+            abstract="<jats:p>Anion redox in Li-rich oxides.</jats:p>",
+        )]
+        works, _, notes = self._run_scripted(
+            {config.JOURNALS["Advanced Materials"]: [503] * 9},
+            items, ["li-rich", "anion redox"],
+        )
+        # 其余 14 本刊照旧有结果，只是没了 AM
+        self.assertTrue(works)
+        self.assertNotIn("Advanced Materials", {w["journal"] for w in works})
+        self.assertEqual(len(notes), 1)
+
+
+class TestPartialSourceFailureVisibility(unittest.TestCase):
+    """「源成功了但结果不完整」必须能进邮件页头，否则又是静默降级。"""
+
+    def setUp(self):
+        self._saved = dict(source_layer.ADAPTERS)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        source_layer.ADAPTERS.clear()
+        source_layer.ADAPTERS.update(self._saved)
+
+    def test_note_survives_into_the_report_and_the_notices(self):
+        def _partial(terms, lookback_days, max_works=None, notes=None):
+            if notes is not None:
+                notes.append("有 1/15 本刊查询失败（Joule），这几本刊本轮的结果缺失。")
+            return [source_base.make_work(doi="10.1/a", title="T", source="crossref")]
+
+        source_layer.ADAPTERS["crossref"] = _partial
+        result = source_layer.fetch_works(["anion redox"], 90, sources="crossref")
+
+        report = result.reports[0]
+        self.assertEqual(report.status, "ok")  # 源本身没失败
+        self.assertIn("本刊查询失败", report.describe())
+        self.assertIn("1/15", result.summary())
+        notices = result.notices()
+        self.assertEqual(len(notices), 1)
+        self.assertIn("Crossref 有 1/15 本刊查询失败", notices[0])
+
+    def test_adapters_without_the_notes_channel_are_untouched(self):
+        """测试桩/旧适配器没有 notes 参数 ⇒ 不能因为探测而报 TypeError。"""
+        source_layer.ADAPTERS["crossref"] = lambda *_a, **_k: [
+            source_base.make_work(doi="10.1/a", title="T", source="crossref")
+        ]
+        result = source_layer.fetch_works(["anion redox"], 90, sources="crossref")
+        self.assertEqual(result.reports[0].status, "ok")
+        self.assertEqual(result.reports[0].notes, [])
+        self.assertEqual(result.notices(), [])
 
 
 class TestSemanticScholarAdapter(unittest.TestCase):

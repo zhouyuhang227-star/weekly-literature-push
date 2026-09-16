@@ -283,6 +283,10 @@ class SourceReport:
     count: int = 0  # 该源返回并通过复核的篇数
     added: int = 0  # 合并后由它**独家带来**的篇数（用于判断它有没有白跑）
     error: str = ""
+    #: “源成功了、但结果不完整”的告警（如 Crossref 有 1/15 本刊查询失败）。
+    #: 它必须能进邮件：只报状态是看不出**少了一整本刊**的。
+    #: 约定：**不要重复写源名**，describe()/notices() 会自己拼上 label。
+    notes: list[str] = field(default_factory=list)
 
     @property
     def label(self) -> str:
@@ -295,6 +299,10 @@ class SourceReport:
             # 「跳过」的原因（topic 模式不支持字面词）对用户没意义，
             # 详情在日志里，页头只要表明它没参与
             return f"{self.label} 未参与"
+        if self.notes:
+            # 篇数后面加一小截告警：这个数字是「缺了一部分」的，
+            # 完整句子在 notices() 里（页头是一行设计，不能展开写）。
+            return f"{self.label} {self.count} 篇⚠️{_one_line(self.notes[0], 48)}"
         return f"{self.label} {self.count} 篇"
 
 
@@ -331,6 +339,10 @@ class FetchResult:
                 f"⚠️ 本轮有数据源不可用（{names}），结果由其余数据源合并而来，"
                 "可能比平时少。失败原因见运行日志。"
             )
+        for report in self.reports:
+            # 部分失败（如某几本刊查询失败）也要提示：源状态是 ok，
+            # 但少了一整本刊 ——— 而页头上只有一个偏小的数字。
+            out.extend(f"⚠️ {report.label} {note}" for note in report.notes)
         return out
 
 

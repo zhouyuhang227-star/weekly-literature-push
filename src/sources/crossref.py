@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -46,6 +47,10 @@ log = logging.getLogger(__name__)
 
 #: 逐刊端点。用 ISSN（不是刊名）定位，所以刊名归属不需要猜。
 _JOURNAL_URL = "https://api.crossref.org/journals/{issn}/works"
+
+#: 会重试的状态码：429 是限流（等一会儿就好），5xx 是服务端抖动。
+#: 其它 4xx 一律不重试 —— 404 重试多少次还是 404，只会拖慢整轮。
+_RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 
 #: 只取需要的字段，响应体能小一大截。
 _SELECT = (
@@ -106,6 +111,48 @@ def _to_work(item: dict, journal: str, issn: str) -> dict | None:
     )
 
 
+def _request_works(journal: str, issn: str, params: dict[str, object]) -> list[dict]:
+    """请求一本刊的 works，带 429 / 5xx 重试。
+
+    加重试的原因很具体：实测 5 并发时 Crossref 会回 429，而那一次的 429
+    等于**整本刊从本轮结果里消失**，且对外看起来完全正常（源状态仍是 ok）。
+    宁可多等几秒，也不能静默少一本刊。
+    """
+    attempts = max(1, int(config.CROSSREF_RETRIES))
+    last_error = ""
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = requests.get(
+                _JOURNAL_URL.format(issn=issn),
+                params=params,
+                headers=_headers(),
+                timeout=config.HTTP_TIMEOUT * 2,
+            )
+        except requests.RequestException as exc:  # 网络抖动也重试
+            last_error = f"{type(exc).__name__}: {exc}"
+        else:
+            if resp.status_code == 200:
+                return (resp.json().get("message") or {}).get("items") or []
+            last_error = f"HTTP {resp.status_code}"
+            if resp.status_code not in _RETRY_STATUS:
+                break
+
+        if attempt < attempts:
+            wait = max(0.0, float(config.CROSSREF_RETRY_WAIT)) * attempt
+            log.debug(
+                "Crossref《%s》第 %s/%s 次请求失败（%s），%s 秒后重试",
+                journal, attempt, attempts, last_error, wait,
+            )
+            if wait:
+                time.sleep(wait)
+
+    # attempt 在循环结束后仍有值（attempts 至少为 1），用它区分
+    # 「重试过还是失败」与「不可重试的错误」（如 404，一次就放弃）。
+    if attempt <= 1:
+        raise RuntimeError(last_error)
+    raise RuntimeError(f"{last_error}（已重试 {attempt - 1} 次）")
+
+
 def _fetch_one(
     journal: str, issn: str, query: str, iso_from: str, rows: int,
     terms: list[str], checkable: list[str],
@@ -121,16 +168,7 @@ def _fetch_one(
         # 带上邮箱就进 Crossref 的「礼貌池」，速度与稳定性都更好。
         params["mailto"] = config.CROSSREF_MAILTO
 
-    resp = requests.get(
-        _JOURNAL_URL.format(issn=issn),
-        params=params,
-        headers=_headers(),
-        timeout=config.HTTP_TIMEOUT * 2,
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"HTTP {resp.status_code}")
-
-    items = (resp.json().get("message") or {}).get("items") or []
+    items = _request_works(journal, issn, params)
     # ★ 这几本刊 Crossref 常不给摘要，复核只能看到标题（见 config 里的实测数据）。
     #   标题不含字面词但确实是本主题的论文会被误杀 ⇒ 这种残缺判据不如交给 AI。
     title_only = journal in config.CROSSREF_TITLE_ONLY_JOURNALS
@@ -157,12 +195,17 @@ def fetch(
     keywords: list[str] | None,
     lookback_days: int,
     max_works: int | None = None,
+    notes: list[str] | None = None,
     **_ignored,
 ) -> list[dict]:
     """按 15 本刊逐刊检索并汇总（并发）。
 
     ``max_works`` 只用于日志提示 —— 真正的总量截断在聚合器里统一做，
     否则各源各截一段会让合并结果难以预测。
+
+    ``notes`` 是**可选的向用户告警通道**：源返回 ``list`` 装不下「源成功了但
+    结果不完整」这类信息，而单刊查询失败恰恰属于这类（源状态仍是 ok，
+    邮件页头只能看到一个偏小的篇数）。聚合器会把它拼进邮件页头。
     """
     terms = [str(term).strip() for term in (keywords or []) if str(term).strip()]
     if not terms:
@@ -190,12 +233,13 @@ def fetch(
         )
 
     log.info(
-        "Crossref 检索：%s 本刊 / 起始日期 %s / 每刊上限 %s 条 / OR 词 %s 个",
-        len(journals), iso_from, rows, len(terms),
+        "Crossref 检索：%s 本刊 / 起始日期 %s / 每刊上限 %s 条 / OR 词 %s 个 / 并发 %s",
+        len(journals), iso_from, rows, len(terms), int(config.CROSSREF_CONCURRENCY),
     )
 
     works: list[dict] = []
     errors: list[str] = []
+    failed_journals: list[str] = []
     empty: list[str] = []
     relaxed_journals: list[str] = []
     relaxed_total = 0
@@ -216,6 +260,7 @@ def fetch(
             except Exception as exc:  # noqa: BLE001 - 单刊失败不该拖垮整轮
                 log.warning("Crossref 查询《%s》失败：%s", journal, exc)
                 errors.append(f"{journal}（{exc}）")
+                failed_journals.append(journal)
                 continue
             works.extend(got)
             if raw == 0:
@@ -233,8 +278,17 @@ def fetch(
             "Crossref 全部 %s 本刊都查询失败：%s" % (len(journals), "；".join(errors[:3]))
         )
     if errors:
+        # ★ 这是缺陷 B 的关键：单刊失败时源状态依然是 ok，邮件页头如果只写
+        #   「Crossref 27 篇」，用户就看不出**整本刊都缺失**（实测少过 
+        #   Angewandte 一本，就差 12 篇）。所以必须把这件事往上抛。
         log.warning("Crossref 有 %s/%s 本刊查询失败：%s",
                     len(errors), len(journals), "、".join(errors))
+        if notes is not None:
+            notes.append(
+                f"有 {len(errors)}/{len(journals)} 本刊查询失败"
+                f"（{'、'.join(failed_journals)}），这几本刊本轮的结果缺失，"
+                "总量可能比平时少。详见运行日志。"
+            )
     if empty:
         log.info(
             "Crossref 以下 %s 本刊在窗口期内没有命中：%s"

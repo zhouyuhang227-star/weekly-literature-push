@@ -767,8 +767,25 @@ DATA_SOURCES: tuple[str, ...] = ("openalex", "crossref", "semantic_scholar")
 # 它的默认排序是「相关度」，所以前 N 条已包住关键词命中，不必翻页。
 CROSSREF_ROWS = 100
 
-# Crossref：并发请求数。它对「礼貌池」（带 mailto）相当宽容，5 并发实测稳定。
-CROSSREF_CONCURRENCY = 5
+# Crossref：并发请求数。**这个值不能调高。**
+#
+# 实测教训：5 并发时 Crossref 会回 429，而且是**整本刊静默丢失** ——
+# 同一条命令连跑两次得到「命中 39 条」和「命中 27 条」，日志里只有一行
+# `Crossref 查询《Angewandte Chemie Int. Ed.》失败：HTTP 429`，
+# 而那本刊（正好是 15 本里用户最想看的顶刊之一）当轮**完全没有候选**。
+# 更坑的是源状态仍是 ok，邮件页头照旧写「Crossref 27 篇」，
+# 用户根本看不出少了整本刊 —— 这正是这个项目最怕的静默降级。
+# 3 并发 + 重试（见下）实测稳定；除非你确认 Crossref 放宽了限流，别无脑调高。
+CROSSREF_CONCURRENCY = 3
+
+# Crossref：单刊请求失败后的重试次数（含首次，所以 3 = 最多请求 3 次）。
+# 只对 429 与 5xx 重试 —— 404（ISSN 写错）重试多少次都是 404，
+# 白等只会拖慢整轮。
+CROSSREF_RETRIES = 3
+
+# Crossref：重试的基础等待秒数，实际等待 = 本值 × 第几次尝试（2s、4s…）。
+# 它是为了等 429 的限流窗口过去，所以宁可慢一点也不能丢掉整本刊。
+CROSSREF_RETRY_WAIT = 2.0
 
 # Crossref：联系邮箱（进入礼貌池，请求更快更稳）。留空也能用，只是没有优先级。
 # 想换邮箱就改这里，或在 GitHub 仓库 Secrets 里设 CROSSREF_MAILTO。

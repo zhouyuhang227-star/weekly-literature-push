@@ -67,7 +67,7 @@
 │   ├── dedup.py                        # DOI 去重 + 运行状态持久化（按主题分区）
 │   ├── mailer.py                       # HTML 渲染 + SMTP 发送
 │   └── main.py                         # 主流程编排（多主题循环）+ 命令行
-├── tests/test_core.py                  # 213 个单元测试（锁定高风险修复）
+├── tests/test_core.py                  # 219 个单元测试（锁定高风险修复）
 ├── data/
 │   ├── pushed_dois.json                # 去重状态（唯一需要提交的文件）
 │   ├── topics_cache.json               # 语义主题解析缓存（已 gitignore，自动重建）
@@ -452,13 +452,21 @@ DATA_SOURCES = ("openalex", "crossref", "semantic_scholar")   # 顺序即优先�
    Crossref 里也**查不到任何一条它的记录**（实测 `issn:1754-5706` → `total = 0`）。
    只跑备用源时，“EES 0 篇”是**正常现象**，日志里会专门写一句提醒。
 
-#### 出错时的行为（三种，都不会静默）
+#### 出错时的行为（四种，都不会静默）
 
 | 情况 | 行为 |
 |---|---|
 | 某一个源失败（429 / 超时 / HTTP 500） | 其余源照常合并发信；邮件**页头**出现 `⚠️ 本轮有数据源不可用（OpenAlex），结果由其余数据源合并而来，可能比平时少。`；日志里记具体原因 |
+| **源成功、但某几本刊查询失败**（Crossref 逐刊查询） | 源状态仍是 `ok`，但页头会写成 `Crossref 27 篇⚠️有 1/15 本刊查询失败（Angewandte Chemie Int. Ed.）…`，另外附一条 `⚠️` 提示。**“少了一整本顶刊”必须看得见** |
 | 源只支持关键词、但本轮是 `topic` 模式 | 该源标为“未参与”并说明原因，不算失败 |
 | **所有**源都失败 | 直接 `RuntimeError` 中断该主题（Actions 变红），不发明知道不完整的邮件 |
+
+> **为什么 Crossref 并发只有 3 而且带重试**：实测 5 并发会触发 429，而 Crossref 是按刊
+> 并发请求的 —— 一次 429 就等于**整本刊从本轮结果里消失**：同一条命令连跑两次
+> 得到“命中 39 条”和“命中 27 条”，而日志里只有一行 WARNING，邮件页头照旧写
+> “Crossref 27 篇”，完全看不出少了哪本刊。现在 3 并发 + 对 429/5xx 退避重试
+> （`CROSSREF_RETRIES` / `CROSSREF_RETRY_WAIT`），并且**单刊失败会写进邮件页头**。
+> 404 之类的 4xx 不重试 —— 白等只会拖慢整轮。
 
 > 页头提示不是装饰。**日志在手机上没人看，页头才看得见** ——
 > “这周只有 4 篇”和“这周三个源都正常，就是没几篇”是两件完全不同的事，
@@ -481,7 +489,8 @@ python -m src.main --dry-run --sources crossref,s2       # 主源挂了时的应
 | 参数 | 默认 | 作用 |
 |---|---|---|
 | `DATA_SOURCES` | 三个全开 | 启用哪些源 |
-| `CROSSREF_ROWS` / `CROSSREF_CONCURRENCY` | 100 / 5 | 每刊拉多少条、并发几个刊 |
+| `CROSSREF_ROWS` / `CROSSREF_CONCURRENCY` | 100 / **3** | 每刊拉多少条、并发几个刊（**别调高**，见上一段：5 并发会 429 丢整本刊） |
+| `CROSSREF_RETRIES` / `CROSSREF_RETRY_WAIT` | 3 / 2.0 | 单刊请求失败的重试次数与基础等待秒数（只对 429/5xx 生效） |
 | `CROSSREF_MAILTO` | 仓库邮箱 | Crossref polite pool，**建议改成你的邮箱** |
 | `S2_BULK_LIMIT` / `S2_MIN_INTERVAL` | 1000 / 1.1 | S2 单次上限、最小请求间隔（秒） |
 
@@ -741,7 +750,7 @@ python -m src.main --find-topic "solid-state battery"   # 只有 topic 模式下
 `push.cmd`（实际逻辑在 `push.ps1`）会依次做 5 件事：
 
 1. 检查待提交文件，**拦住 `.env` 等敏感文件**（推上去就泄露了，而且删掉也仍留在 git 历史里）
-2. 跑全部单元测试（当前 213 个），**不通过就中止**（配置改错了根本推不上去）
+2. 跑全部单元测试（当前 219 个），**不通过就中止**（配置改错了根本推不上去）
 3. `fetch` + `rebase` ← **关键，见下方说明**
 4. `push`，失败自动重试 4 次（`github.com` 在国内时通时不通）
 5. 校验远程 commit 和本地是否一致
@@ -1217,7 +1226,7 @@ on:
 ## 本地开发
 
 ```bash
-# 跑测试（213 个）
+# 跑测试（219 个）
 python -m unittest discover -s tests -v
 
 # 语法检查
@@ -1254,6 +1263,8 @@ python -m src.main --to your@email.com --lookback-days 7
 - 无 DOI 文献必须丢弃、期刊名可从 ISSN 表兜底
 - **多源并集不得退化成“自动降级”**：每个启用的源都必须真的被调用（回归测试）
 - **单源失败不得拖垮整轮**：其余源照常合并发信，并把故障写进邮件页头的 `notices`（回归测试）
+- **源部分失败也要进页头**：Crossref 单刊 429 不得表现为“本轮少了一本顶刊”——
+  优先重试；重试仍失败就把“N/15 本刊查询失败”写进页头；4xx 不重试（回归测试）
 - **全部源失败必须报错**，不得发出一封看似正常的“本周无新文献”心跳邮件（回归测试）
 - **Crossref 结果必须本地复核召回词**：`query.title=lithium-rich` 返回的
   “Lithium Metal Batteries” 必须被丢掉（回归测试）
