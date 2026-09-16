@@ -386,14 +386,34 @@ class TestResearchDirectionIsConfigurable(unittest.TestCase):
     def test_user_prompt_has_no_hardcoded_score_examples(self):
         """评分档位里的"固态电解质、锂金属负极"这类示例必须已经清除。
 
-        注意：这里也要把 ``GLOBAL_EXCLUDE_NOTE`` 清空 —— 那是用户能在 config 里改的
-        配置文本（会拼进 prompt），不是模板里写死的学科词。
+        注意：这里也要把 ``GLOBAL_EXCLUDE_NOTE`` / ``AI_ANODE_FREE_HINT`` /
+        ``AI_CATHODE_HINT`` 清空 —— 那些都是用户能在 config 里改的**配置文本**
+        （会拼进 prompt），不是模板里写死的学科词。
         """
         config.USER_KEYWORDS = ["perovskite solar cell"]
         config.GLOBAL_EXCLUDE_NOTE = ""
+        config.AI_ANODE_FREE_HINT = ""
+        config.AI_CATHODE_HINT = ""
         prompt = ai_matcher.build_prompt({"title": "T"}, None)
         for stale in ("固态电解质", "锂金属负极", "液态电解液", "钠离子电池"):
             self.assertNotIn(stale, prompt)
+
+    def test_user_prompt_asks_for_the_anode_free_judgement(self):
+        """★ AI 要能回答两个结构化问题，否则第二层保底无从谈起。"""
+        prompt = ai_matcher.build_prompt({"title": "T"}, None)
+        self.assertIn('"anode_free"', prompt)
+        self.assertIn('"cathode_system"', prompt)
+        self.assertIn("li-rich-mn", prompt)
+        self.assertIn("sodium", prompt)
+        # 判定为无负极时 takeaway 必须带这三个字，否则用户看不出它为什么被置顶
+        self.assertIn("无负极", prompt)
+
+    def test_user_prompt_carries_the_user_configurable_hints(self):
+        config.AI_ANODE_FREE_HINT = "自定义无负极口径"
+        config.AI_CATHODE_HINT = "自定义体系口径"
+        prompt = ai_matcher.build_prompt({"title": "T"}, None)
+        self.assertIn("自定义无负极口径", prompt)
+        self.assertIn("自定义体系口径", prompt)
 
     def test_global_exclude_note_reaches_the_prompt(self):
         """全局排除说明要真的进到 AI 的尺子里（不然 AI 不知道你要避开什么）。"""
@@ -792,7 +812,7 @@ class TestEvaluateWorksPartition(unittest.TestCase):
             doi = work["doi"]
             if doi == "10.1/boom":
                 raise RuntimeError("API 挂了")
-            return scores[doi], f"解读 {doi}", "理由"
+            return scores[doi], f"解读 {doi}", "理由", False, ""
 
         with patch.object(ai_matcher, "call_ai", side_effect=fake_call):
             passed, failed, rejected = ai_matcher.evaluate_works(
@@ -807,7 +827,7 @@ class TestEvaluateWorksPartition(unittest.TestCase):
 
     def test_passed_sorted_by_score_desc(self):
         def fake_call(work, keywords):
-            return (70 if work["doi"] == "10.1/low" else 95), "t", "r"
+            return (70 if work["doi"] == "10.1/low" else 95), "t", "r", False, ""
 
         works = [
             {"doi": "10.1/high", "pub_date": "2026-09-01"},
@@ -832,7 +852,7 @@ class TestEvaluateWorksForcedKeep(unittest.TestCase):
         return {"doi": "10.1/keep", "title": "Anode-free sodium metal battery", "pub_date": "2026-09-01"}
 
     def test_low_score_keep_bypasses_the_threshold(self):
-        with patch.object(ai_matcher, "call_ai", return_value=(20, "解读", "理由")):
+        with patch.object(ai_matcher, "call_ai", return_value=(20, "解读", "理由", False, "")):
             passed, failed, rejected = ai_matcher.evaluate_works([self._keep_work()], threshold=60)
 
         self.assertEqual([w["doi"] for w in passed], ["10.1/keep"])
@@ -854,7 +874,7 @@ class TestEvaluateWorksForcedKeep(unittest.TestCase):
 
     def test_low_score_non_keep_is_still_rejected(self):
         work = {"doi": "10.1/low", "title": "irrelevant work", "pub_date": "2026-09-01"}
-        with patch.object(ai_matcher, "call_ai", return_value=(20, "解读", "理由")):
+        with patch.object(ai_matcher, "call_ai", return_value=(20, "解读", "理由", False, "")):
             passed, failed, rejected = ai_matcher.evaluate_works([work], threshold=60)
         self.assertEqual(passed, [])
         self.assertEqual(failed, [])
@@ -868,9 +888,35 @@ class TestEvaluateWorksForcedKeep(unittest.TestCase):
         self.assertEqual(passed, [])
         self.assertEqual(rejected, [])
 
+    def test_real_li_s_paper_no_longer_rides_the_ai_keep_channel(self):
+        """★ 端到端复现那起事故（真实论文，DOI 10.1002/anie.2370748）。
+
+        它**确实是**无负极（AI 也这么判），但正极是 Li2S ⇒ `cathode_system="other"`。
+        Seg Q 之前，它会被保底无条件拉进"入选"并置顶；现在必须落回"低于阈值"
+        （AI 给 35 < 60），而且**不能**被写上 `keep_reason`。
+        """
+        work = li_s_anode_free_work(pub_date="2026-09-01")
+        with patch.object(ai_matcher, "call_ai", return_value=(35, "解读", "理由", True, "other")):
+            passed, failed, rejected = ai_matcher.evaluate_works([work], threshold=60)
+
+        self.assertEqual(passed, [])
+        self.assertEqual(failed, [])
+        self.assertEqual([w["doi"] for w in rejected], ["10.1002/anie.2370748"])
+        self.assertNotIn("keep_reason", rejected[0])
+
+    def test_ai_keep_channel_still_works_for_a_matching_system(self):
+        """反向对照：同一批 AI 判断，只要体系对口就必须保底 —— 别把整条通道关掉。"""
+        work = li_s_anode_free_work(pub_date="2026-09-01")
+        with patch.object(ai_matcher, "call_ai", return_value=(35, "解读", "理由", True, "sodium")):
+            passed, _, rejected = ai_matcher.evaluate_works([work], threshold=60)
+
+        self.assertEqual([w["doi"] for w in passed], ["10.1002/anie.2370748"])
+        self.assertEqual(passed[0]["keep_reason"], "无负极（AI 判定 · 钠电）")
+        self.assertEqual(rejected, [])
+
     def test_keep_paper_keeps_its_real_score_when_the_ai_worked(self):
         """保底只免掉阈值，不改分数 —— 分数照旧参与排序。"""
-        with patch.object(ai_matcher, "call_ai", return_value=(58, "解读", "理由")):
+        with patch.object(ai_matcher, "call_ai", return_value=(58, "解读", "理由", False, "")):
             passed, _, _ = ai_matcher.evaluate_works([self._keep_work()], threshold=60)
         self.assertEqual(passed[0]["ai_score"], 58)
         self.assertFalse(passed[0]["ai_error"])
@@ -937,6 +983,203 @@ class TestForcedKeepRanking(unittest.TestCase):
 
     def test_describe_mentions_the_pinning(self):
         self.assertIn("保底", ranking.describe())
+
+
+class TestAiDetectedAnodeFreeKeep(unittest.TestCase):
+    """第二层保底：关键词一个都没命中，但 AI 从摘要里读出了「无负极 + 体系对口」。
+
+    为什么必须有这一层：无负极是**电芯构型**，往往根本不是论文的研究重点
+    （比如“电解液工程 + 裸 Cu 集流体直接沉积”），标题里可能一个字都没写，
+    关键词表对这类论文完全无计可施。
+
+    风险同样明确：网上多写一句话就是凭空置顶一篇不相关的论文，
+    所以**只要体系认不出来就不保底**，宁可漏不可错。
+    """
+
+    @staticmethod
+    def _plain_work(doi: str = "10.1/ai-keep") -> dict:
+        return {"doi": doi, "title": "Non-aqueous cell chemistry", "pub_date": "2026-09-01"}
+
+    def test_ai_detected_anode_free_is_promoted(self):
+        def fake_call(work, keywords):
+            return 25, "无负极构型下的 Na 沉积行为", "摘要里写了裸 Cu 集流体", True, "sodium"
+
+        with patch.object(ai_matcher, "call_ai", side_effect=fake_call):
+            passed, failed, rejected = ai_matcher.evaluate_works([self._plain_work()], threshold=60)
+
+        self.assertEqual([w["doi"] for w in passed], ["10.1/ai-keep"])
+        self.assertEqual(failed, [])
+        self.assertEqual(rejected, [])
+        # 只免阈值，不改分数
+        self.assertEqual(passed[0]["ai_score"], 25)
+        self.assertEqual(passed[0]["keep_reason"], "无负极（AI 判定 · 钠电）")
+        self.assertTrue(passed[0]["anode_free"])
+
+    def test_ai_detected_anode_free_in_another_system_is_not_promoted(self):
+        """锂硫那种“顺带提一句无负极”必须卡在门槛外。"""
+
+        def fake_call(work, keywords):
+            return 25, "无负极锂硫电池", "锂硫", True, "other"
+
+        with patch.object(ai_matcher, "call_ai", side_effect=fake_call):
+            passed, failed, rejected = ai_matcher.evaluate_works([self._plain_work()], threshold=60)
+
+        self.assertEqual(passed, [])
+        self.assertEqual(failed, [])
+        self.assertEqual([w["doi"] for w in rejected], ["10.1/ai-keep"])
+
+    def test_ai_detected_anode_free_survives_an_ai_failure(self):
+        """AI 挂了就没有这个判断，不能凭空保底（这是可以接受的漏）。"""
+        with patch.object(ai_matcher, "call_ai", side_effect=RuntimeError("API 挂了")):
+            passed, failed, rejected = ai_matcher.evaluate_works([self._plain_work()], threshold=60)
+        self.assertEqual(passed, [])
+        self.assertEqual(rejected, [])
+        self.assertEqual([w["doi"] for w in failed], ["10.1/ai-keep"])
+
+    def test_ai_keep_reason_survives_the_ranking(self):
+        """置顶靠 ranking.annotate，它得认得出 AI 保底（不是只看关键词）。"""
+        work = {
+            "doi": "x",
+            "ai_score": 25,
+            "title": "Non-aqueous cell chemistry",
+            "anode_free": True,
+            "cathode_system": "sodium",
+        }
+        ranking.rank([work])
+        self.assertTrue(work["force_keep"])
+        self.assertEqual(work["keep_reason"], "无负极（AI 判定 · 钠电）")
+
+    def test_keyword_keep_wins_over_the_ai_reason(self):
+        """两条通道都命中时保留关键词那条理由（它更具体、也更早生效）。"""
+        work = {
+            "doi": "x",
+            "ai_score": 25,
+            "title": "Anode-free sodium metal batteries",
+            "anode_free": True,
+            "cathode_system": "sodium",
+        }
+        ranking.rank([work])
+        self.assertEqual(work["keep_reason"], "无负极")
+
+    def test_ai_keep_needs_a_recognised_system_string(self):
+        """认不出来的体系名一律不保底 —— 猜错就是凭空置顶一篇不相关的论文。"""
+        work = {"doi": "x", "ai_score": 25, "anode_free": True, "cathode_system": "lithium-sulfur"}
+        self.assertIsNone(content_rules.ai_keep_hit(work))
+        ranking.rank([work])
+        self.assertFalse(work["force_keep"])
+
+    def test_ai_keep_hit_needs_the_flag(self):
+        self.assertIsNone(content_rules.ai_keep_hit({"cathode_system": "sodium"}))
+        self.assertIsNone(content_rules.ai_keep_hit({"anode_free": False, "cathode_system": "sodium"}))
+        self.assertEqual(
+            content_rules.ai_keep_hit({"anode_free": True, "cathode_system": "li-rich-mn"}),
+            "无负极（AI 判定 · 富锂锰）",
+        )
+
+    def test_ai_keep_describe_is_not_polluted(self):
+        """describe_keeps 只描述词表规则；AI 那层写在 summary 里，别把两套词表混作一团。"""
+        self.assertNotIn("AI 判定", content_rules.describe_keeps())
+
+
+class TestNormalizeFlags(unittest.TestCase):
+    """AI 的结构化判断要能容错解析，而且**认不出来就不保底**。"""
+
+    def test_bool_and_system(self):
+        self.assertEqual(
+            ai_matcher.normalize_flags({"anode_free": True, "cathode_system": "sodium"}),
+            (True, "sodium"),
+        )
+
+    def test_string_true_and_alias_system(self):
+        self.assertEqual(
+            ai_matcher.normalize_flags({"anode_free": "true", "cathode_system": "Li-rich-Mn"}),
+            (True, "li-rich-mn"),
+        )
+
+    def test_chinese_true_is_accepted(self):
+        self.assertEqual(ai_matcher.normalize_flags({"anode_free": "是"})[0], True)
+
+    def test_false_and_missing_fields(self):
+        self.assertEqual(ai_matcher.normalize_flags({}), (False, ""))
+        self.assertEqual(ai_matcher.normalize_flags({"anode_free": False})[0], False)
+        self.assertEqual(ai_matcher.normalize_flags({"anode_free": "false"})[0], False)
+        self.assertEqual(ai_matcher.normalize_flags({"anode_free": 0})[0], False)
+
+    def test_garbage_values_do_not_raise(self):
+        """模型返回 None / 列表 / 数字都不能把整个流程搞崩。"""
+        self.assertEqual(ai_matcher.normalize_flags({"anode_free": None})[0], False)
+        self.assertEqual(ai_matcher.normalize_flags({"anode_free": []})[0], False)
+        self.assertEqual(ai_matcher.normalize_flags({"cathode_system": None})[1], "")
+        self.assertEqual(ai_matcher.normalize_flags({"cathode_system": 3})[1], "")
+
+    def test_unknown_system_is_blanked(self):
+        self.assertEqual(
+            ai_matcher.normalize_flags({"anode_free": True, "cathode_system": "谁知道呢"}),
+            (True, ""),
+        )
+
+    def test_off_topic_systems_are_other_never_a_kept_system(self):
+        """锂硫这类体系写明是 "other"（比留空更能表达意图），关键是**绝不能**落到保底档。"""
+        for raw in ("锂硫", "Li-S", "lithium sulfur", "三元", "磷酸铁锂"):
+            with self.subTest(raw=raw):
+                resolved = ai_matcher.normalize_flags({"cathode_system": raw})[1]
+                self.assertEqual(resolved, "other", raw)
+                self.assertNotIn(resolved, config.KEEP_CATHODE_SYSTEMS)
+
+    def test_aliases_resolve_to_the_canonical_id(self):
+        for raw, expected in (
+            ("lrlo", "li-rich-mn"),
+            ("LMR", "li-rich-mn"),
+            ("富锂锰", "li-rich-mn"),
+            ("Na", "sodium"),
+            ("钠离子", "sodium"),
+            ("其它", "other"),
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(ai_matcher.normalize_flags({"cathode_system": raw})[1], expected, raw)
+
+    def test_multi_word_aliases_survive_the_key_normalisation(self):
+        """★ 真实 bug 的回归：别名表的键必须和查表用的是**同一套**归一化。
+
+        以前手写键用空格（``"lithium rich manganese"``），而查表前空格已经换成了连字符
+        （``"lithium-rich-manganese"``）⇒ **所有多词别名静默失效**：
+        AI 明明认出了体系、代码却当作"没答"，于是一篇该保底的论文没被保底。
+        这个 bug 单看代码完全看不出来，所以每次改别名表都得跑这组用例。
+        """
+        for raw in (
+            "Li-rich",
+            "li rich",
+            "lithium-rich",
+            "lithium rich",
+            "lithium rich manganese",
+            "Li-excess",
+            "Mn-rich",
+            "Na-ion",
+            "na ion",
+            "sodium metal",
+            "sodium-ion battery",
+            "prussian blue analogue",
+        ):
+            with self.subTest(raw=raw):
+                self.assertNotEqual(ai_matcher.normalize_flags({"cathode_system": raw})[1], "", raw)
+
+    def test_trailing_generic_words_are_trimmed_before_giving_up(self):
+        """模型常把体系名写成一整段（``"OLO cathode"``），剥掉尾部通用词后要能落回标准值。"""
+        for raw, expected in (
+            ("OLO cathode", "li-rich-mn"),
+            ("LMR cathode", "li-rich-mn"),
+            ("LRLO oxide", "li-rich-mn"),
+            ("Li-rich layered oxide cathode", "li-rich-mn"),
+            ("sodium layered oxide", "sodium"),
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(ai_matcher.normalize_flags({"cathode_system": raw})[1], expected, raw)
+
+    def test_trailing_trim_never_guesses_from_a_meaningless_stub(self):
+        """剥词只能在剥完之后**仍然命中别名**时才算数：不能把 ``"li-rich"`` 削成 ``"li"``。"""
+        for raw in ("li", "rich", "cathode", "layered", "NCM811", "材料"):
+            with self.subTest(raw=raw):
+                self.assertEqual(ai_matcher.normalize_flags({"cathode_system": raw})[1], "", raw)
 
 
 class TestMailerKeepNotice(unittest.TestCase):
@@ -1807,7 +2050,11 @@ class TestContentBonusRules(unittest.TestCase):
         self.assertEqual(content_rules.bonus_score(work), 10)
 
     def test_anode_free_spellings_are_all_recognised(self):
-        """连字符/有无连字符/"free anode"倒装/常见缩写都要能命中。"""
+        """连字符/有无连字符/"free anode"倒装/常见缩写都要能命中。
+
+        注意这里只查**加分**：加分只管排序，不看体系（体系闸门在 KEEP_RULES 那边，
+        见 TestKeepRules），所以这 8 个写法不管体系都要 +10。
+        """
         for title in (
             "Anode-free lithium metal batteries",
             "Anodeless sodium battery",
@@ -1819,7 +2066,6 @@ class TestContentBonusRules(unittest.TestCase):
             "AFLMB with a high-voltage cathode",
         ):
             with self.subTest(title=title):
-                self.assertEqual(content_rules.keep_hit({"title": title}), "无负极", title)
                 self.assertEqual(content_rules.bonus_score({"title": title}), 10, title)
 
     def test_anode_free_stacks_on_top_of_other_bonuses(self):
@@ -1858,6 +2104,22 @@ class TestContentBonusRules(unittest.TestCase):
         self.assertFalse(
             content_rules.rule_matches(rule, content_rules.normalize("sodium layered prussian blue"))
         )
+
+    def test_rule_matching_supports_require_groups(self):
+        """``require`` 是"必须命中"的短语**组**：组间 AND、组内 OR。
+
+        为什么需要它：``all`` 表达不了"A 或 B 至少命中一个"，而保底恰恰要的是
+        无负极 **且**（富锂锰 **或** 钠电）。
+        """
+        rule = {"any": ["anode free"], "require": [["li rich", "lithium rich"], ["solid"]]}
+        norm = content_rules.normalize
+        self.assertTrue(content_rules.rule_matches(rule, norm("anode-free Li-rich solid cells")))
+        # 组内 OR：换成同组另一个写法照样命中
+        self.assertTrue(content_rules.rule_matches(rule, norm("anode-free lithium rich solid cells")))
+        # 组间 AND：第二组（solid）没命中 → 不匹配
+        self.assertFalse(content_rules.rule_matches(rule, norm("anode-free Li-rich cells")))
+        # require 为空 = 不限制
+        self.assertTrue(content_rules.rule_matches({"any": ["anode free"]}, norm("anode-free")))
 
 
 class TestContentExclusions(unittest.TestCase):
@@ -1901,6 +2163,38 @@ class TestContentExclusions(unittest.TestCase):
         self.assertIsNone(content_rules.exclusion_hit(work))
 
 
+# ★ Seg Q 事故的**原始论文**（用户提供，不是编的）：无负极锂硫被保底规则无条件置顶。
+#   Chao Ding et al., Angewandte Chemie Int. Ed., DOI 10.1002/anie.2370748。
+#   它的价值在于：`anode free` 词表**真的命中**（所以光靠词表必漏），
+#   拦住它的是后来加的**体系闸门**（正极是 Li2S 锂硫，不是富锂锰/钠电）。
+LI_S_ANODE_FREE_TITLE = (
+    "A Sphere-Sheet Hetero-Interlayer With Mechanoadaptivity and Li+ Selectivity "
+    "for High Performance Anode Free Lithium Sulfur Batteries"
+)
+LI_S_ANODE_FREE_ABSTRACT = (
+    "Anode-free lithium sulfur batteries pair a Li2S cathode with a bare copper current "
+    "collector. The sphere-sheet hetero-interlayer provides mechanoadaptivity and Li+ "
+    "selectivity, suppressing dendrite growth and polysulfide shuttling."
+)
+LI_S_ANODE_FREE_WORK = {
+    "title": LI_S_ANODE_FREE_TITLE,
+    "abstract": LI_S_ANODE_FREE_ABSTRACT,
+    "doi": "10.1002/anie.2370748",
+}
+
+
+def li_s_anode_free_work(**extra) -> dict:
+    """真实锂硫无负极论文的 work dict（``**extra`` 用来叠加 AI 判定字段）。"""
+    return dict(LI_S_ANODE_FREE_WORK, **extra)
+
+
+#: 故意**只**在召回层、不进保底闸门的词（见
+#: ``TestKeepRules.test_every_recall_term_can_also_pass_the_gate``）。
+#:   * ``anode-free lithium``：它是「构型词」不是「体系词」，闸门的职责正是筛体系；
+#:   * ``voltage hysteresis``：锂硫论文篇篇都写，当体系证据会把锂硫放回置顶。
+GATE_EXEMPT_RECALL_TERMS = {"anode-free lithium", "voltage hysteresis"}
+
+
 class TestKeepRules(unittest.TestCase):
     """硬保底：命中即强制进邮件 —— 免于剔除规则、也免于 AI 入选线。
 
@@ -1921,7 +2215,7 @@ class TestKeepRules(unittest.TestCase):
 
     def test_keep_can_be_triggered_by_the_abstract(self):
         """保底范围是标题+摘要（KEEP_SCOPE）：摘要里提到同样算这个方向。"""
-        work = {"title": "A new cathode design", "abstract": "cycled in an anode-free cell"}
+        work = {"title": "A new cathode design", "abstract": "cycled in an anode-free sodium cell"}
         self.assertEqual(content_rules.keep_hit(work), "无负极")
 
     def test_keep_scope_can_be_narrowed_to_the_title(self):
@@ -1974,6 +2268,154 @@ class TestKeepRules(unittest.TestCase):
         text = content_rules.describe_keeps()
         self.assertIn("无负极", text)
         self.assertIn("anode free", text)
+        # ★ 体系闸门也要回显："保底为什么不触发"最常见的原因就是闸门没命中
+        self.assertIn("且须命中", text)
+
+    def test_anode_free_spellings_are_all_recognised_on_the_keep_path(self):
+        """保底这条通道上，各种写法同样都要能命中（题目都带体系词）。"""
+        for title in (
+            "Anode-free sodium metal batteries",
+            "Anodeless Na-ion battery",
+            "Anode less configuration for Na metal",
+            "Li-free anode for Li-rich cathodes",
+            "Na-free anode in sodium cells",
+            "Zero-excess sodium metal battery",
+            "Hostless sodium deposition",
+            "AFLMB with a Li-rich cathode",
+        ):
+            with self.subTest(title=title):
+                self.assertEqual(content_rules.keep_hit({"title": title}), "无负极", title)
+
+    def test_anode_free_without_a_matching_cathode_system_is_not_kept(self):
+        """★ 核心回归（Seg Q）：只看「无负极」会把**不属于本课题**的论文也强推进邮件。
+
+        起因：一篇锂硫论文的摘要里只有一句 "comparable to anode-free lithium metal
+        batteries"，就命中了保底 → 免剔除 + 免 AI 阈值 + **排到邮件最上面**，
+        而锂硫跟富锂锰 / 钠电正极毫无关系。
+        """
+        work = {
+            "title": "High areal capacity lithium-sulfur batteries",
+            "abstract": "performance comparable to anode-free lithium metal batteries",
+        }
+        self.assertIsNone(content_rules.keep_hit(work))
+        self.assertFalse(content_rules.is_kept(work))
+        # 加分照给：加分只管排序，体系闸门只在"放不放它进来"这一层
+        self.assertEqual(content_rules.bonus_score(work), 10)
+
+    def test_anode_free_plus_each_cathode_system_is_kept(self):
+        """两个体系（富锂锰 / 钠电）任一对口都要保底 —— 闸门是 OR 不是 AND。"""
+        for title in (
+            "Anode-free Li-rich layered oxide cathodes",
+            "Zero-excess sodium metal batteries",
+            "Anode-free Na-ion full cells",
+            "Anode-free batteries with Li2MnO3-based cathodes",
+            "Hostless deposition in LMR cathodes",
+        ):
+            with self.subTest(title=title):
+                self.assertEqual(content_rules.keep_hit({"title": title}), "无负极", title)
+
+    def test_the_gate_does_not_fire_on_an_off_topic_system(self):
+        """锂硫 / 磷酸铁锂 / 富镍这些体系不进保底。"""
+        for title in (
+            "Anode-free lithium-sulfur batteries",
+            "Anode-free LiFePO4 batteries",
+            "Anode-free nickel-rich NCM cathodes",
+        ):
+            with self.subTest(title=title):
+                self.assertIsNone(content_rules.keep_hit({"title": title}), title)
+
+    def test_gate_recognises_li_rich_papers_that_never_say_li_rich(self):
+        """★ 闸门的**漏报**方向（比误招更严重）。
+
+        富锂锰论文经常一个 "Li-rich" 都不写：只写 OLO / 化学式 / 机理词。
+        以前这些写法闸门全都认不出 → 召回捞进来了、保底却失效，
+        正好漏掉最该留的论文。用户口径：宁可多留，绝不能漏。
+        """
+        for title in (
+            "Anode-free cells with an over-lithiated layered oxide cathode",
+            "Anode-free batteries based on Li1.2Mn0.54Ni0.13Co0.13O2",
+            "Anode-free full cell using an OLO cathode",
+            "Zero-excess cell showing reversible oxygen redox",
+            "Hostless configuration with an anionic redox cathode",
+            "Anode-free cells with suppressed voltage decay",
+            "Anode-free cell with excess lithium in the cathode",
+            "Anode-free cell with a cation-disordered Li-excess oxide",
+        ):
+            with self.subTest(title=title):
+                self.assertEqual(content_rules.keep_hit({"title": title}), "无负极", title)
+
+    def test_gate_recognises_sodium_papers_written_with_the_na_prefix(self):
+        """钠电同上：摘要里常把 sodium 写成 Na（化学式 / Na layered oxide）。"""
+        for title in (
+            "Anode-free cell with a Na0.67MnO2 cathode",
+            "Anode-free cell with a Na layered oxide",
+            "Anode-free cell with a Na excess cathode",
+            "Anodeless configuration using a prussian blue analogue",
+        ):
+            with self.subTest(title=title):
+                self.assertEqual(content_rules.keep_hit({"title": title}), "无负极", title)
+
+    def test_voltage_hysteresis_alone_still_does_not_keep_a_lithium_sulfur_paper(self):
+        """⚠️ ``voltage hysteresis`` 是富锂锰的召回词，却**故意**不进闸门。
+
+        锂硫论文几乎篇篇都把 "severe voltage hysteresis" 当缺点写，
+        一旦把它当体系证据，锂硫 + 无负极就会重新混进置顶（正是要拦住的那一类）。
+        """
+        work = {
+            "title": "Anode free lithium sulfur batteries with severe voltage hysteresis"
+        }
+        self.assertIsNone(content_rules.keep_hit(work))
+        self.assertNotIn("voltage hysteresis", config.ANODE_FREE_KEEP_CATHODES)
+
+    def test_every_recall_term_can_also_pass_the_gate(self):
+        """★ 自维护的「不漏」保险：召回层能捞到的词，闸门必须也认。
+
+        两层词表指向同一批论文：**召回层捞得到的，就是闸门该保底的**。
+        如果新加了一个召回词却没加进闸门，就会出现最隐蔽的漏报 ——
+        论文进了候选池、AI 也打了分，却拿不到保底（日志里看不出任何异常）。
+        这里逐词测：``Anode-free cell with <召回词>`` 必须能保底。
+        例外只能写在 ``GATE_EXEMPT_RECALL_TERMS`` 里，改一处就必须改这里。
+        """
+        for topic in config.active_research_topics():
+            for term in topic.search_terms:
+                if term in GATE_EXEMPT_RECALL_TERMS:
+                    continue
+                with self.subTest(topic=topic.name, term=term):
+                    work = {"title": f"Anode-free cell with {term}"}
+                    self.assertEqual(content_rules.keep_hit(work, topic), "无负极", term)
+
+    def test_real_li_s_anode_free_paper_is_blocked_by_the_gate(self):
+        """★ 核心回归（Seg Q 的**真实**触发案例，标题与 DOI 是用户给的原文）。
+
+        这篇论文的标题里明明白白写着 `Anode Free Lithium Sulfur`：
+        词表那侧的 `anode free` **确实命中** —— 也就是说，只写「无负极」的保底
+        会把一篇跟富锂锰 / 钠电正极毫无关系的锂硫论文**免剔除 + 免阈值 + 置顶**。
+        拦住它的是**体系闸门**，不是词没写全。
+        """
+        work = li_s_anode_free_work()
+        self.assertIsNone(content_rules.keep_hit(work))
+        self.assertFalse(content_rules.is_kept(work))
+
+        # 证明拦住它的**确实是闸门**：把闸门摘掉，同一篇立刻被保底
+        mine = [dict(rule, require=None) for rule in config.KEEP_RULES]
+        with patch.object(config, "KEEP_RULES", mine):
+            self.assertEqual(content_rules.keep_hit(work), "无负极")
+
+    def test_real_li_s_paper_still_gets_the_sorting_bonus(self):
+        """加分只挂「无负极」、故意不带闸门 —— 所以它照拿 +10，只是不会被置顶/免阈值。"""
+        work = li_s_anode_free_work()
+        self.assertEqual(content_rules.bonus_score(work), 10)
+        self.assertEqual(content_rules.matched_bonuses(work), [("无负极", 10)])
+
+    def test_real_li_s_paper_is_not_kept_by_the_ai_channel_either(self):
+        """AI 通道同样拦住它：它**确实是**无负极，但正极是 Li2S ⇒ `cathode_system="other"`。
+
+        这就是那条「宁可漏、不能错」的纪律：认不出来 / 对不上体系，一律不保底。
+        """
+        work = li_s_anode_free_work(anode_free=True, cathode_system="other")
+        self.assertIsNone(content_rules.ai_keep_hit(work))
+        # 缺字段（AI 挂了 / 没返回）也只失去这条路，不会误保底
+        self.assertIsNone(content_rules.ai_keep_hit(li_s_anode_free_work(anode_free=True)))
 
     def test_summary_mentions_the_keep_layer(self):
         self.assertIn("硬保底", content_rules.summary())
@@ -2006,6 +2448,33 @@ class TestContentRuleValidation(unittest.TestCase):
         with patch.object(config, "KEEP_RULES", [{"label": "坏的", "any": []}]):
             problems = config.validate_content_rules()
         self.assertTrue(any("KEEP_RULES" in p and "永远不会生效" in p for p in problems), problems)
+
+    def test_broken_require_shape_is_reported(self):
+        """``require`` 写成字符串（漏一层方括号）会让规则**永久不命中**，必须报出来。"""
+        broken = [{"label": "坏的", "any": ["x"], "require": "sodium"}]
+        with patch.object(config, "KEEP_RULES", broken):
+            problems = config.validate_content_rules()
+        self.assertTrue(any('"require"' in p for p in problems), problems)
+
+    def test_empty_require_group_is_reported(self):
+        """空组 = 这一组永远不满足 → 整条规则永远不生效。"""
+        broken = [{"label": "坏的", "any": ["x"], "require": [["sodium"], []]}]
+        with patch.object(config, "KEEP_RULES", broken):
+            problems = config.validate_content_rules()
+        self.assertTrue(any("永远不会生效" in p for p in problems), problems)
+
+    def test_live_keep_rule_carries_the_cathode_gate(self):
+        """体系闸门是这个项目的核心防线，配置里不能悄悄丢掉。"""
+        self.assertTrue(config.KEEP_RULES[0].get("require"))
+        for rule in config.KEEP_RULES:
+            self.assertTrue(rule["require"][0], rule.get("label"))
+
+    def test_gate_terms_actually_match_the_live_config(self):
+        """闸门里的词得真能命中文字（改错字就会静默失效）。"""
+        for phrase in ("Li-rich layered oxide cathode", "sodium metal battery"):
+            with self.subTest(phrase=phrase):
+                work = {"title": f"Anode-free cell with {phrase}"}
+                self.assertEqual(content_rules.keep_hit(work), "无负极", phrase)
 
     def test_topic_keep_rule_is_validated(self):
         broken = config.ResearchTopic(name="A", keywords=["x"], keep=[{"label": "坏的", "any": []}])
@@ -2070,7 +2539,7 @@ class TestMailerContentTags(unittest.TestCase):
     def test_card_shows_content_tags_and_final_score(self):
         work = {
             "doi": "10.1/x",
-            "title": "Anode-free solid-state battery with a polymer electrolyte",
+            "title": "Anode-free solid-state battery with a sodium cathode and a polymer electrolyte",
             "journal": "Joule",
             "issn": "2542-4351",
             "pub_date": "2026-09-01",
@@ -2124,6 +2593,58 @@ class TestLiveResearchConfig(unittest.TestCase):
         self.assertTrue(config.GLOBAL_EXCLUDE_NOTE.strip())
         for topic in config.active_research_topics():
             self.assertIn(config.GLOBAL_EXCLUDE_NOTE.split("；")[0], topic.brief())
+
+    def test_keep_rule_has_the_cathode_gate(self):
+        """★ Seg Q：无负极保底必须带体系闸门（锂硫事件后加的）。"""
+        self.assertEqual(config.KEEP_RULES[0]["label"], "无负极")
+        gate = config.KEEP_RULES[0]["require"][0]
+        for term in ("li rich", "sodium"):
+            self.assertIn(term, gate)
+        # 加分规则**故意**不带闸门（加分只管排序，管不了入选）
+        bonus = next(rule for rule in config.BONUS_RULES if rule["label"] == "无负极")
+        self.assertNotIn("require", bonus)
+
+    def test_ai_hints_name_the_kept_systems(self):
+        """AI 口径提示词里要同时点名两个体系，否则模型不会往那里想。"""
+        self.assertIn("无负极", config.AI_ANODE_FREE_HINT)
+        self.assertIn("富锂锰", config.AI_CATHODE_HINT)
+        self.assertIn("钠", config.AI_CATHODE_HINT)
+        self.assertEqual(config.KEEP_CATHODE_SYSTEMS["li-rich-mn"], "富锂锰")
+        self.assertEqual(config.KEEP_CATHODE_SYSTEMS["sodium"], "钠电")
+
+    def test_lithium_topic_recalls_anode_free_lithium_papers(self):
+        """召回层补词：无负极论文的标题里往往一个原召回词都没有。"""
+        lithium = next(t for t in config.active_research_topics() if t.name == "富锂锰正极")
+        self.assertIn("anode-free lithium", lithium.search_terms)
+
+    def test_real_li_s_paper_is_recalled_but_never_kept(self):
+        """★ 真实案例（DOI 10.1002/anie.2370748，用户提供）：
+
+        `anode-free lithium` 这个词**会把锂硫也捞进候选池** —— 这是召回层
+        「宁滥勿缺」的已知代价（多花一次 AI 调用，AI 给低分就淘汰了）。
+        所以真正必须钉住的不是召回层的精度，而是**保底的体系闸门**：
+        进了池子也绝不能被置顶。
+        """
+        work = li_s_anode_free_work()
+        lithium = next(t for t in config.active_research_topics() if t.name == "富锂锰正极")
+        self.assertIn(
+            "anode-free lithium", source_base.matches_recall_terms(work, lithium.search_terms)
+        )
+        self.assertIsNone(content_rules.keep_hit(work, lithium))
+        self.assertEqual(content_rules.exclusion_hit(work, lithium), None)
+
+    def test_sodium_topic_recalls_anode_free_sodium_papers(self):
+        """★ 真实例子：《Anode-free sodium metal batteries enabled by electrolyte
+        engineering》—— 在这批补词之前，它在**召回阶段**就被丢了（一个词都不命中）。
+        """
+        sodium = next(t for t in config.active_research_topics() if t.name == "钠离子正极")
+        for term in ("sodium metal battery", "anode-free sodium"):
+            self.assertIn(term, sodium.search_terms)
+
+    def test_topic_descriptions_mention_the_anode_free_configuration(self):
+        """描述会拼进 AI 的判据，无负极构型得写进去（否则 AI 不会往那儿看）。"""
+        sodium = next(t for t in config.active_research_topics() if t.name == "钠离子正极")
+        self.assertIn("无负极", sodium.description)
 
 
 class TestSourceRegistry(unittest.TestCase):

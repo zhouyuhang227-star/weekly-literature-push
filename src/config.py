@@ -218,6 +218,81 @@ ANODE_FREE_TERMS: list[str] = [
     "aflmb",  # anode-free lithium metal battery（文献里常见的缩写）
 ]
 
+#: 「富锂锰基」正极体系的证据词 —— **只用于保底的体系闸门**（见 ``KEEP_RULES``），
+#: 不参与加分。分工是：``BONUS_RULES`` 只认「无负极」这一个方向，
+#: 体系在保底那边是"资格条件"（无负极 **且** 体系对口才保底）。
+#:
+#: ⚠️ 这里**故意混装了体系名与机理名**（``oxygen redox`` / ``voltage decay`` 等）。
+#:    原先只放体系名，理由是「钠电层状正极也讲阴离子氧化还原，机理词区分不开两种体系」。
+#:    但那个理由只对「用机理词**替代**体系名」成立：闸门是**一组 OR**，
+#:    多列机理词只会把闸门**放宽**、不会把任何体系名挤掉，而放宽正是我们要的方向。
+#:    真实代价（实测漏报）：一篇富锂锰的无负极论文如果全文只写
+#:    「reversible oxygen redox」「suppressed voltage decay」而不写 Li-rich 四个字，
+#:    原来的词表**一个都不命中** → 召回捞进来了、保底却失效，正好漏掉最该留的论文。
+#:    用户口径很明确：宁滥勿缺，漏一篇比多发十篇严重。
+#: ⚠️ 这些词只做**本地匹配**（标题+摘要），不走 OpenAlex 短语检索，
+#:    所以像 ``li2mno3`` / ``lrlo`` 这种"检索命中 0 篇"的写法在这里仍然有用 ——
+#:    摘要里常写「Li2MnO3-like domains」「LRLO cathodes」，本地匹配照样命中。
+LMR_CATHODE_TERMS: list[str] = [
+    # —— 体系 / 材料名 ——
+    "li rich",
+    "lithium rich",
+    "li excess",
+    "lithium excess",
+    "excess lithium",  # 同义的另一种语序（"excess lithium content"），词首匹配的 ``lithium excess`` 盖不住
+    "manganese rich",
+    "mn rich",
+    "over lithiated",  # OLO = Over-Lithiated Oxide，富锂锰的正式学名
+    "overlithiated",
+    "li2mno3",  # 富锂锰的标志性组分
+    "li1 2mn",  # 化学式写法（Li1.2Mn0.54Ni0.13Co0.13O2 归一化后为 "li1 2mn0 54..."）
+    "lrlo",  # Li-rich layered oxide，文献缩写
+    "lmr",  # Li- and Mn-rich，文献缩写
+    "olo",  # Over-Lithiated Oxide，富锂锰的正式学名（摘要里常只写 "an OLO cathode"）
+    #  ↑ 上面两个 3 字符短词是本项目**仅有的**破例：那段"短语别写太短"的告警
+    #    针对的是 "na"（会命中 nanowire）这类通用词；"lmr" / "olo" 几乎只出现在这个方向。
+    # —— 机理词（富锂锰的"身份词"，见上面 ⚠️）——
+    "oxygen redox",
+    "anionic redox",
+    "anion redox",
+    "oxygen release",
+    "lattice oxygen",
+    "cation migration",
+    "voltage decay",
+    "voltage fade",
+    #  ↑ 刻意**不收** ``voltage hysteresis``：锂硫论文几乎篇篇都拿它当缺点提，
+    #    而锂硫 + 无负极正是我们要拦住的那一类（真实事故见 ANODE_FREE_KEEP_CATHODES）。
+]
+
+#: 「钠电」正极体系的证据词 —— 体系闸门的另一半。
+#: ``"sodium"`` 一个词就覆盖 sodium-ion / sodium metal / sodium layered oxide；
+#: 这里所有词都在**同一个组**里（组内 OR），所以多列几个不会互相收窄。
+#: 补 ``na`` 开头的写法是因为摘要里常把 sodium 写成 ``Na``（``Na0.67MnO2``、
+#: ``Na layered oxide``），而 ``na`` 本身太短（会命中 nanowire）不能单列。
+SODIUM_CATHODE_TERMS: list[str] = [
+    "sodium",
+    "na ion",
+    "na metal",
+    "na layered oxide",
+    "na0 67mno2",  # P2 型层状钠正极的常用化学式（Na0.67MnO2 归一化后）
+    "na excess",  # 钠电版"无负极"：正极过量钠、负极无活性材料
+    "prussian blue",
+    "nasicon",
+]
+
+#: 无负极保底的**体系闸门**：命中 ``ANODE_FREE_TERMS`` 之后，还必须命中这里任一个。
+#:
+#: 为什么必需（**真实事故**）：只看「无负极」三个字会把**不属于本课题**的论文强推进邮件。
+#: 实测（Angew. Chem. Int. Ed.，DOI 10.1002/anie.2370748）：
+#: 《A Sphere-Sheet Hetero-Interlayer ... Anode Free Lithium Sulfur Batteries》——
+#: 标题就写明了 ``Anode Free``，词表**真的命中了**，于是免剔除 + 免 AI 阈值 +
+#: **排到邮件最上面**；但它的正极是 Li2S（锂硫），跟富锂锰 / 钠电正极毫无关系。
+#: 加闸门后才写成"无负极 **且** 体系对口"：锂硫一类仍然可以被 AI 正常打高分进邮件，
+#: 只是不再享受免阈值与置顶。
+#: ⚠️ 另一半方向的失效同样要防（见 ``LMR_CATHODE_TERMS`` 的注释）：
+#:    闸门**过窄**会让真正该保底的富锂锰/钠电论文漏掉 —— 而漏是用户最不能接受的。
+ANODE_FREE_KEEP_CATHODES: list[str] = LMR_CATHODE_TERMS + SODIUM_CATHODE_TERMS
+
 #: 所有主题共用的内容加分。
 BONUS_RULES: list[dict] = [
     {
@@ -259,6 +334,12 @@ BONUS_RULES: list[dict] = [
         # 权重定得比其它加分高一个数量级是有意的：老板要求盯这个方向，
         # 而期刊加成最高也就 +9（大子刊），AI 分满打满算 100 —— +10 足以把
         # 一篇「AI 只给了 55 分」的无负极论文顶到能和顶刊论文并排的位置。
+        #
+        # ⚠️ 这里**故意不加体系闸门**（与下面的 ``KEEP_RULES`` 不同）：
+        #   加分只管排序，管不了入选；能进到排序这一步的论文已经过了 AI 阈值，
+        #   而 AI 是看着「富锂锰 / 钠电」的判据打的分。锂硫之类的无负极论文
+        #   就算蹭到 +10 也得先过 AI 那一关，加闸门反而会漏掉一些体系写法陌生的
+        #   好论文。真正需要闸门的是"免阈值 + 置顶"那一层，见下面 KEEP_RULES。
         "label": "无负极",
         "score": 10,
         "any": ANODE_FREE_TERMS,
@@ -277,10 +358,21 @@ BONUS_RULES: list[dict] = [
 #: 是 ``EXCLUDE_RULES`` 里的硬剔除项 —— 在**还没进 AI 打分**时就被丢掉了，
 #: 加分规则根本来不及生效。老板要盯的方向不能这样丢，所以单开这一层。
 #:
+#: 另有一条**AI 侧保底**（口径见 ``AI_ANODE_FREE_HINT``）：AI 从摘要里判定"这篇就是
+#: 无负极"且体系对口时，同样按保底处理。因为上面这套词表只能做字面匹配，
+#: 而"是不是无负极"经常要靠读懂**电芯构型**才能判断（「裸 Cu 集流体」「负极过量≈0」）——
+#: 那类论文的关键词可能一个都不命中，光靠词表必定漏。
+#:
 #: ⚠️ 代价：命中即强推，所以 ``scope`` 别乱放。默认 ``all``（标题+摘要），
 #:    因为"只在摘要里提到无负极"的论文同样算这个方向；想收紧成"标题必须写明"
 #:    就显式写 ``"scope": "title"``。
-#: 字段与 ``BONUS_RULES`` 相同，只是 ``score`` 无意义（可省略）。
+#:
+#: ``require`` 字段（保底专用，加分/剔除也用得上）
+#:    形状：``[[短语, 短语], [短语]]`` —— 组之间是 **AND**（每一组都必须满足），
+#:    组内是 **OR**（任一命中即可）。等价于 all 的多选一版本。
+#:    ``all`` 表达不了"A 或 B 至少命中一个"，而保底恰恰需要：
+#:    无负极 **且**（富锂锰 **或** 钠电）。
+#: 其余字段与 ``BONUS_RULES`` 相同，只是 ``score`` 无意义（可省略）。
 KEEP_RULES: list[dict] = [
     {
         # label 只写方向名：邮件卡片/日志会自己在前面加「硬保底 · 」，
@@ -288,6 +380,10 @@ KEEP_RULES: list[dict] = [
         "label": "无负极",
         "score": 0,
         "any": ANODE_FREE_TERMS,
+        # ★ 体系闸门：只放**一组**是有意的 —— 富锂锰 **或** 钠电，命中之一即可。
+        #   没有它的话，"摘要里顺口提一句无负极"的锂硫/其它体系论文也会被置顶
+        #   （真实事故见 ANODE_FREE_KEEP_CATHODES 上面的注释）。
+        "require": [ANODE_FREE_KEEP_CATHODES],
     },
 ]
 
@@ -346,12 +442,55 @@ EXCLUDE_RULES: list[dict] = [
 #: ⚠️ 末尾那句例外是必需的：无负极构型的论文常常正是"电解液工程"，
 #:    如果不告诉 AI，AI 会照着"不看电解液工程"给低分、并写一段负面的理由 ——
 #:    那样硬保底虽然还能把它捞进邮件，但卡片上的解读和理由是反的。
+#: ⚠️ 例外里的"体系条件"也必须写上：这条例外只对富锂锰 / 钠电成立，
+#:    写漏了 AI 会把锂硫之类的无负极论文也当成本课题的例外而给高分。
 GLOBAL_EXCLUDE_NOTE = (
     "不看电解液工程（液态电解液添加剂 / 溶剂化结构 / 配方优化）与隔膜改性；"
     "不计入凝胶电解质。"
-    "**例外：只要涉及无负极构型（anode-free / anodeless / hostless / zero-excess，"
-    "含锂与钠体系），一律保留并给高分，即使它属于电解液工程** —— 这是重点关注方向。"
+    "**例外：涉及无负极构型（anode-free / anodeless / hostless / zero-excess、"
+    "负极过量≈0、直接在裸集流体上沉积）的论文，只要正极是富锂锰基或钠电体系，"
+    "一律保留并给高分，即使它属于电解液工程** —— 这是重点关注方向。"
+    "⚠️ 无负极是**电芯构型**，常常并不是论文的研究重点，标题里可能一个字都没写，"
+    "请从摘要所描述的电芯结构自行判断，不要只在标题里找关键词。"
 )
+
+#: 让 AI 自己判断"是不是无负极构型"的口径（拼进给 AI 的提示词）。
+#:
+#: 为什么要把这件事交给 AI：无负极是一种**电芯构型**，而且往往不是论文的研究重点 ——
+#: 标题里可能一个字都不写（关键词规则只能干看着），摘要里才以"负极过量≈0"
+#: "直接在裸集流体上沉积"这类描述出现。AI 本来就通读了摘要，让它顺手判一下，
+#: 等于给关键词规则补了一双眼睛（见 :func:`src.content_rules.ai_keep_hit`）。
+AI_ANODE_FREE_HINT = (
+    "无负极（anode-free / anodeless / hostless / zero-excess）指的是：电芯里"
+    "**没有负极活性材料**，充电时钠/锂直接沉积到裸集流体（Cu 箔 / Al 箔）上；"
+    "等价说法有「负极过量≈0」「Na-free / Li-free 负极」「在 bare Cu current "
+    "collector 上直接沉积」。⚠️ 这个构型常常**不是论文的重点**、标题里也可能完全没提，"
+    "所以必须自己从摘要描述的电芯结构里读出来：只要电芯是这样装的，就必须判 true。"
+)
+
+#: 让 AI 判断"正极体系"的口径。只能取三个固定值，代码按它决定要不要保底。
+#:
+#: ⚠️ 这里要和 ``LMR_CATHODE_TERMS`` / ``SODIUM_CATHODE_TERMS`` 保持同一套口径：
+#:    词表认不出的写法（化学式、OLO、层状钠氧化物…）正是要靠 AI 兜住的那一批，
+#:    所以提示词里必须把这些写法一个个点名，否则 AI 会保守地填 "other" → 漏文献。
+AI_CATHODE_HINT = (
+    "正极体系只分三档，请**原样**返回下面其中一个字符串（不要自创第三个词、不要加空格）："
+    '"li-rich-mn"（富锂锰基层状氧化物正极：Li-rich / Li-excess / LRLO / LMR / OLO / '
+    "过锂化层状氧化物 / 含 Li2MnO3 组分，以及只写化学式 Li1.2Mn… 的情况）、"
+    '"sodium"（钠离子电池或钠金属电池的正极：Na-ion / Na metal / 层状钠氧化物 / '
+    "普鲁士蓝类 / NASICON / Na0.67MnO2 等）、"
+    '"other"（其它一切：锂硫、磷酸铁锂、三元 NCM、富镍、以及纯负极/纯电解液工作）。'
+    "⚠️ 摘要里用的是缩写、化学式或中文写法都算，只要你读得出正极属于哪一档就填那一档 —— "
+    "这一项决定这篇论文要不要**免阈值保底**，填错会漏掉该留的文献。"
+)
+
+#: AI 判定为「无负极」且正极体系属于这两个档位时 → **视同命中硬保底**
+#: （免 AI 阈值 + 置顶），理由取这里的显示名。
+#: 键必须与 ``AI_CATHODE_HINT`` 里给出的字符串逐字一致 —— 代码就是拿它查表的。
+KEEP_CATHODE_SYSTEMS: dict[str, str] = {
+    "li-rich-mn": "富锂锰",
+    "sodium": "钠电",
+}
 
 
 def validate_rule_list(rules: object, group_name: str) -> list[str]:
@@ -381,6 +520,25 @@ def validate_rule_list(rules: object, group_name: str) -> list[str]:
             value = rule.get(key)
             if value is not None and not isinstance(value, (list, tuple)):
                 problems.append(f'{label} 的 "{key}" 必须是列表')
+        # "require" 是"必须命中"的短语**组**：每组内 OR、组之间 AND，
+        # 形状比 all/unless 深一层，少写一层方括号（把组写成字符串）会让规则**永远不命中**，
+        # 而这正是本项目最怕的失效方式（静默丢文献），所以形状要一条条查。
+        groups = rule.get("require")
+        if groups is not None:
+            if not isinstance(groups, (list, tuple)) or not groups:
+                problems.append(f'{label} 的 "require" 必须是非空的组列表（每个组是短语列表）')
+            else:
+                for index, group in enumerate(groups, start=1):
+                    where_group = f'{label} 的 "require" 第 {index} 组'
+                    if isinstance(group, str):
+                        problems.append(
+                            f'{where_group}写成了字符串 → 应该写成列表（["{group}"]），'
+                            "否则这一组永远不命中"
+                        )
+                    elif not isinstance(group, (list, tuple)):
+                        problems.append(f"{where_group}必须是短语列表")
+                    elif not [str(p).strip() for p in group if str(p).strip()]:
+                        problems.append(f"{where_group}是空的 → 这条规则永远不会生效")
         try:
             int(rule.get("score") or 0)
         except (TypeError, ValueError):
@@ -587,6 +745,13 @@ RESEARCH_TOPICS: list[dict] = [
             "voltage decay",
             "voltage fade",
             "voltage hysteresis",
+            # —— 无负极富锂（★ 补于 Seg Q）——
+            # 富锂锰 + 无负极是重点关注方向，但这类论文标题常常只写
+            # "anode-free lithium metal batteries"，不含任何上面的召回词，
+            # 于是连候选池都进不了（"保底规则再准也没用，因为根本没看到它"）。
+            # ⚠️ 这一条必然会顺带捞到锂硫 / 三元体系的阳极无负极论文 ——
+            #    故意交给 AI 筛（进不了候选池才是真丢文献）。
+            "anode-free lithium",
         ],
         "keywords": [
             # —— 材料本体 ——
@@ -631,6 +796,14 @@ RESEARCH_TOPICS: list[dict] = [
             "prussian blue",
             "na0.67mno2",
             "sodium cathode",
+            # —— 无负极钠电（★ 补于 Seg Q）——
+            # 真实例子：《Anode-free sodium metal batteries enabled by electrolyte
+            # engineering》（JACS）—— 标题里**一个现有召回词都没有**，
+            # 所以它在"多源并集检索"阶段就被丢了，后面的保底规则根本没机会看到它。
+            "sodium metal battery",
+            "sodium metal batteries",
+            "na metal battery",
+            "anode-free sodium",
         ],
         "keywords": [
             # —— 材料体系（层状是重点，另有普鲁士蓝 / 聚阴离子）——
@@ -653,8 +826,8 @@ RESEARCH_TOPICS: list[dict] = [
             "只看钠离子电池**正极**材料：层状过渡金属氧化物（P2/O3 型）、"
             "普鲁士蓝类似物、聚阴离子化合物。关注相变与循环稳定性、空气/水分稳定性、"
             "阴离子氧化还原、Na+ 扩散动力学。不含硬碳等负极、不含电解液与隔膜工作。"
-            "**例外：涉及无负极构型（anode-free）的钠电论文一律保留并给高分，"
-            "即使它做的是电解液工程**。"
+            "**例外：涉及无负极构型（anode-free / 负极过量≈0 / 直接在裸集流体上沉积）"
+            "的钠电论文一律保留并给高分，即使它做的是电解液工程**。"
         ),
         # 层状钠离子正极是本主题的重点方向，额外加分
         "bonuses": [

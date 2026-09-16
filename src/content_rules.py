@@ -8,8 +8,8 @@
 ``AI_THRESHOLD``。这样"蹭到热词"或"发在顶刊"的论文不会被硬塞进邮件，
 只是在同样相关时排得更靠前。
 
-**唯一能改变"入选"的是保底规则**（``config.KEEP_RULES`` + 主题自己的 ``keep``），
-见下面第三个方向。
+**唯一能改变"入选"的是保底**（``config.KEEP_RULES`` + 主题自己的 ``keep``，
+外加一条 AI 侧保底 :func:`ai_keep_hit`），见下面第三个方向。
 
 三个方向
 --------
@@ -23,6 +23,11 @@
   确实想看摘要，在规则里显式写 ``"scope": "all"``。
 * **硬保底**（``config.KEEP_RULES`` + 主题自己的 ``keep``）
   命中就**强制进邮件**，且**免于上面所有剔除规则**。
+  还有一条**AI 侧保底**（:func:`ai_keep_hit`）走的是同一条通道：
+  AI 从摘要里判定"这篇就是无负极、而且正极是富锂锰/钠电"时同样强推。
+  为什么词表之外还需要它：无负极是一种**电芯构型**，往往不是论文的研究重点，
+  标题里可能一个字都不写，摘要里才以「裸 Cu 集流体」「负极过量≈0」的形式出现 ——
+  关键词表对这种写法无计可施。
 
 为什么需要保底这一层
 --------------------
@@ -41,7 +46,8 @@ enabled by electrolyte engineering》命中「电解液工程」，在**还没�
 2. 再按**词首对齐**匹配短语：``"solid state batter"`` 能命中 ``"solid-state batteries"``。
    ⚠️ 也因此短语别写太短（< 4 个字符），否则容易误伤（``"na"`` 会命中 ``"nanowire"``）。
 3. 规则字段：``label`` / ``score`` / ``any``（必填，命中任一即可）/ ``all``（选填，必须全中）
-   / ``unless``（选填，命中任一则**不算**命中）/ ``scope``（选填）。
+   / ``unless``（选填，命中任一则**不算**命中）/ ``require``（选填，"必须命中"的短语**组**：
+   组之间 AND、组内 OR）/ ``scope``（选填）。
 """
 
 from __future__ import annotations
@@ -110,11 +116,29 @@ def _hit_all(text: str, patterns: object) -> bool:
     return True
 
 
+def _hit_required(text: str, groups: object) -> bool:
+    """``groups`` 是"必须命中"的短语**组**列表：**每一组**都要命中，组内任意一个即可。
+
+    ``all`` 表达不了"A 或 B 至少命中一个"，而保底恰恰需要：
+    无负极 **且**（富锂锰 **或** 钠电）。见 ``config.KEEP_RULES`` 的 ``require``。
+    形状写错（例如组写成了字符串）只会"永远不命中"，所以 ``config.validate_rule_list``
+    会专门查它。
+    """
+    if not groups:
+        return True
+    for group in groups:  # type: ignore[union-attr]
+        if not _hit(text, group):
+            return False
+    return True
+
+
 def rule_matches(rule: object, text: str) -> bool:
     """判断一条规则是否命中 ``text``（``text`` 必须已归一化）。"""
     if not isinstance(rule, dict) or not text:
         return False
     if not _hit(text, rule.get("any")):
+        return False
+    if not _hit_required(text, rule.get("require")):
         return False
     if not _hit_all(text, rule.get("all")):
         return False
@@ -241,6 +265,28 @@ def is_kept(work: dict, topic=None) -> bool:
     return bool(keep_matched(work, topic))
 
 
+def ai_keep_hit(work: dict) -> str | None:
+    """AI 判定「无负极 + 体系对口」时返回保底理由，否则 ``None``。
+
+    这是**关键词保底之外的补充**（是一条独立的保底通道，与 ``KEEP_RULES`` 并列）。
+    为什么需要：``ANODE_FREE_TERMS`` 只能做字面匹配，而"是不是无负极"经常要靠读懂
+    **电芯构型**才能判断（「裸 Cu 集流体」「负极过量≈0」）—— 那类论文的关键词可能
+    一个都不命中。AI 本来就通读了摘要（口径见 ``config.AI_ANODE_FREE_HINT``），
+    让它顺手判一下即可：判为无负极 **且** 正极体系是富锂锰/钠电 → 视同命中保底
+    （免 AI 阈值 + 置顶），且解读里会点名「无负极」。
+
+    ⚠️ 前提是那篇论文**过了剔除、并且已经送给 AI 打过分**：被剔除规则丢掉的论文
+    根本走不到 AI，AI 也就没机会捞它 —— 那条路仍然只能靠关键词保底兜。
+    """
+    if not work.get("anode_free"):
+        return None
+    system = str(work.get("cathode_system") or "").strip().lower()
+    label = config.KEEP_CATHODE_SYSTEMS.get(system)
+    if not label:
+        return None
+    return f"无负极（AI 判定 · {label}）"
+
+
 def mark_kept(works: list[dict], topic=None) -> list[dict]:
     """就地给命中保底的论文写上 ``keep_reason``，并返回命中保底的那些。
 
@@ -320,7 +366,7 @@ def describe_excludes(topic=None) -> str:
 
 
 def describe_keeps(topic=None) -> str:
-    """一行文字列出生效的硬保底规则（带命中的短语，方便核对词表）。"""
+    """一行文字列出生效的硬保底规则（带命中短语 + 体系闸门，方便核对词表）。"""
     rules = keep_rules(topic)
     if not rules:
         return "（未配置任何保底规则）"
@@ -328,7 +374,17 @@ def describe_keeps(topic=None) -> str:
     for rule in rules:
         terms = "、".join(str(p) for p in (rule.get("any") or [])[:3])
         more = " 等" if len(rule.get("any") or []) > 3 else ""
-        parts.append(f"{_label_of(rule)}（命中：{terms}{more}）")
+        text = f"{_label_of(rule)}（命中：{terms}{more}"
+        # 体系闸门也要回显："保底为什么不触发"最常见的原因就是闸门没命中
+        #（例如一篇锂硫的阳极无负极）。
+        gates = [group for group in (rule.get("require") or []) if group]
+        if gates:
+            shown: list[str] = []
+            for group in gates:
+                words = " / ".join(str(p) for p in list(group)[:3])
+                shown.append(words + (" 等" if len(group) > 3 else ""))
+            text += "；且须命中：" + "、".join(shown)
+        parts.append(text + "）")
     return " ｜ ".join(parts)
 
 

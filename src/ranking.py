@@ -8,8 +8,9 @@
 ``AI_THRESHOLD``。这样"顶刊的低相关论文"和"蹭到热词的论文"都不会挤掉
 "普通刊的高相关论文"，只是同样相关时排得更靠前。
 
-（唯一能改变"入选"的是 ``config.KEEP_RULES``，那一条不在本模块，
-而在 :mod:`src.ai_matcher` 里生效 —— 本模块只负责把它置顶。）
+（唯一能改变"入选"的是两条**保底**通道：``config.KEEP_RULES`` 的关键词保底，
+以及 AI 判定「无负极 + 体系对口」的保底。它们的生效点在 :mod:`src.ai_matcher`，
+本模块只负责把它们置顶。）
 
 两类加成的分工：
 * **期刊档次加成**（``JOURNAL_TIERS``）：这篇发在哪本刊。
@@ -94,14 +95,22 @@ def annotate(works: list[dict], topic=None) -> list[dict]:
         work["content_bonus"] = content_bonus
         work["content_bonus_detail"] = [[label, score] for label, score in hits]
         work["final_score"] = int(work.get("ai_score") or 0) + journal_bonus + content_bonus
-        # 硬保底：命中 KEEP_RULES 的论文置顶（排序里再抬一手，保证不仅"留下"
+        # 硬保底：命中保底的论文置顶（排序里再抬一手，保证不仅"留下"
         # 而且第一眼就看得见）。邮件卡片上会打一个绿色保底标签解释为什么它在最上面，
         # 否则"AI 55 分排在 AI 98 分前面"看起来就像个 bug。
         #
+        # 保底理由有三个来源，按"谁先写谁优先"取：
+        #   1. 已经写在 work 上的（主流程 content_rules.mark_kept、或 ai_matcher 的 AI 判定）
+        #   2. 关键词保底 keep_hit
+        #   3. AI 判定保底 ai_keep_hit（关键词一个都没命中、靠 AI 读摘要读出来的）
         # 顺手把 keep_reason 也写上：主流程里 content_rules 早就写过了，
         # 但只调 ranking.rank() 时（测试、将来可能的单独重排）没有，
         # 而邮件/PDF 标签要显示这个规则名，缺了就只能显示一句无信息量的兜底文案。
-        keep_reason = content_rules.keep_hit(work, topic)
+        keep_reason = (
+            work.get("keep_reason")
+            or content_rules.keep_hit(work, topic)
+            or content_rules.ai_keep_hit(work)
+        )
         if keep_reason:
             work["keep_reason"] = keep_reason
         work["force_keep"] = bool(keep_reason)

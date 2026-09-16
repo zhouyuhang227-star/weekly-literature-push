@@ -80,8 +80,15 @@ USER_TEMPLATE = """请判断以下论文与用户研究方向的**相关性**。
 {{
   "relevance": 0 到 100 的整数，表示与用户研究方向的相关程度,
   "takeaway": "一句话中文解读，说明这篇论文做了什么、结论是什么，60 字以内",
-  "reason": "一句话中文理由，说明为什么给这个分数，60 字以内"
+  "reason": "一句话中文理由，说明为什么给这个分数，60 字以内",
+  "anode_free": true 或 false —— 这篇论文的电池是不是「无负极」构型,
+  "cathode_system": "li-rich-mn" / "sodium" / "other" 三者之一
 }}
+
+**两个结构化判断**（与 relevance 各自独立，不要因为分数低就随手写 false）：
+- `anode_free`：{anode_free_hint}
+- `cathode_system`：{cathode_hint}
+- 若 `anode_free` 为 true，`takeaway` 里**必须出现「无负极」三个字**。
 
 评分参考（判定基准就是上面给出的那份「用户研究方向」，不要自行假设学科）：
 - 90-100：论文正面解决上述方向的核心问题，读完可直接用于该方向的研究
@@ -145,6 +152,162 @@ def normalize_result(data: dict) -> tuple[int, str, str]:
     return score, takeaway, reason
 
 
+#: 归一化体系名时要去掉的**首尾**标点（模型偶尔会把值写成 ``"sodium".`` / ``sodium,``）
+_SYSTEM_STRIP_CHARS = " \t\r\n._-。，、；;:：!！?？\"'“”‘’()（）[]【】"
+
+
+def _system_key(raw: object) -> str:
+    """把任意"体系名"写法归一成**查表用的键**：小写、空白/下划线→连字符、去首尾标点。
+
+    别名表的键与查表的键**必须**由同一个函数生成 —— 否则就会重演那个真实 bug：
+    手写的键 ``"lithium rich manganese"`` 被查成了 ``"lithium-rich-manganese"``，
+    多词别名全部静默失效（AI 认出了体系，代码却当作"没答"）。
+    """
+    text = re.sub(r"[\s_]+", "-", str(raw or "").strip().lower())
+    return text.strip(_SYSTEM_STRIP_CHARS)
+
+
+#: ``cathode_system`` 的**同义写法** → 标准值。模型多数时候会原样回传提示词里的
+#: ``"li-rich-mn" / "sodium" / "other"``，但偶尔会自作主张换个说法，
+#: 认出就拿标准值，认不出就当**没答**（= 不保底）—— **绝不猜**：
+#: 猜错意味着凭空置顶一篇不相关的论文。
+#:
+#: ⚠️ 键**必须**经 :func:`_system_key` 归一化（见下面字典推导式）。
+#:    这里踩过一次坑：手写的键用空格（``"lithium rich manganese"``），
+#:    而查表前已经把空格换成了连字符（``"lithium-rich-manganese"``），
+#:    于是**所有多词别名全部查不到**、静默失效 —— 表现为"AI 明明认出了体系却仍然不保底"，
+#:    而单看代码完全看不出问题。现在键由同一个函数生成，从根上不可能再漂移。
+_CATHODE_SYSTEM_ALIASES = {
+    # —— 富锂锰基 ——
+    "li-rich": "li-rich-mn",
+    "lirich": "li-rich-mn",
+    "li rich mn": "li-rich-mn",
+    "lirichmn": "li-rich-mn",
+    "lithium-rich": "li-rich-mn",
+    "lithium rich": "li-rich-mn",
+    "lithium rich manganese": "li-rich-mn",
+    "li-excess": "li-rich-mn",
+    "lithium-excess": "li-rich-mn",
+    "mn-rich": "li-rich-mn",
+    "manganese-rich": "li-rich-mn",
+    "manganese rich": "li-rich-mn",
+    "lmr": "li-rich-mn",
+    "lrlo": "li-rich-mn",
+    "olo": "li-rich-mn",
+    "over-lithiated": "li-rich-mn",
+    "over-lithiated oxide": "li-rich-mn",
+    "overlithiated": "li-rich-mn",
+    "overlithiated oxide": "li-rich-mn",
+    "li2mno3": "li-rich-mn",
+    "富锂": "li-rich-mn",
+    "富锂锰": "li-rich-mn",
+    "富锂锰基": "li-rich-mn",
+    "富锂锰基层状氧化物": "li-rich-mn",
+    "富锂锰基正极": "li-rich-mn",
+    # —— 钠电 ——
+    "sodium": "sodium",
+    "sodium-ion": "sodium",
+    "sodium ion": "sodium",
+    "sodium ion battery": "sodium",
+    "sodium battery": "sodium",
+    "sodium metal": "sodium",
+    "sodium metal battery": "sodium",
+    "na-ion": "sodium",
+    "na ion": "sodium",
+    "na metal": "sodium",
+    "na battery": "sodium",
+    # ⚠️ ``"na"`` 本义也可能是"不适用"，但按用户口径（宁可多留不可漏）取"钠电"。
+    "na": "sodium",
+    "prussian blue": "sodium",
+    "prussian blue analogue": "sodium",
+    "nasicon": "sodium",
+    "sodium layered oxide": "sodium",
+    "layered sodium oxide": "sodium",
+    "na0.67mno2": "sodium",
+    "na0 67mno2": "sodium",
+    "钠": "sodium",
+    "钠电": "sodium",
+    "钠离子": "sodium",
+    "钠离子电池": "sodium",
+    "钠金属电池": "sodium",
+    "钠基层状氧化物": "sodium",
+    # —— 其它（明确列出**不是**本课题的体系，省得以后误加进来）——
+    "other": "other",
+    "others": "other",
+    "none": "other",
+    "unknown": "other",
+    "not-applicable": "other",
+    "n/a": "other",
+    "li-s": "other",
+    "lithium-sulfur": "other",
+    "lithium sulfur": "other",
+    "lifepo4": "other",
+    "lfp": "other",
+    "ncm": "other",
+    "nickel-rich": "other",
+    "其它": "other",
+    "其他": "other",
+    "锂硫": "other",
+    "三元": "other",
+    "磷酸铁锂": "other",
+}
+
+#: 查表用的最终别名表（键已归一化，与 ``_normalize_cathode_system`` 同一套变换）。
+_CATHODE_ALIASES: dict[str, str] = {
+    _system_key(alias): target for alias, target in _CATHODE_SYSTEM_ALIASES.items()
+}
+
+#: 查表查不到时可以**从尾部剥掉**的通用词。模型偶尔把体系名写成一整段
+#: （``"OLO cathode"`` / ``"sodium layered oxide"``），剥掉这些词就能落到别名上。
+#: ⚠️ 只剥**尾部**且只剥这类没有判别力的词：一旦尾部是实词（如 ``li-rich`` 的 ``rich``）
+#:    就立刻停手，继续剥会把 ``"li-rich"`` 削成 ``"li"`` 这种毫无意义的键。
+_SYSTEM_TAIL_WORDS = frozenset(
+    {
+        "cathode", "cathodes", "positive", "electrode", "electrodes",
+        "material", "materials", "based", "oxide", "oxides", "layered",
+        "system", "systems", "battery", "batteries", "cell", "cells",
+    }
+)
+
+
+def _lookup_alias(key: str) -> str:
+    """先精确查别名表；查不到就逐步剥掉尾部通用词再查（见 ``_SYSTEM_TAIL_WORDS``）。"""
+    parts = key.split("-")
+    while parts:
+        hit = _CATHODE_ALIASES.get("-".join(parts))
+        if hit:
+            return hit
+        if parts[-1] not in _SYSTEM_TAIL_WORDS:
+            break
+        parts.pop()
+    return ""
+
+
+def _normalize_cathode_system(raw: object) -> str:
+    """把模型给的体系名归一成标准值；认不出返回 ``""``（= 不参与保底）。"""
+    text = _system_key(raw)
+    if text in config.KEEP_CATHODE_SYSTEMS:
+        return text
+    return _lookup_alias(text)
+
+
+def normalize_flags(data: dict) -> tuple[bool, str]:
+    """解析 AI 的「无负极 / 正极体系」两个结构化判断，返回 ``(anode_free, cathode_system)``。
+
+    单独一个函数（而不是塞进 :func:`normalize_result`）是有意的：``normalize_result``
+    的 3 元返回值是既有契约（调用点与测试 mock 都在用），而这两个字段只有保底用得到。
+
+    ⚠️ 容错方向是**认不出来就不保底**：漏了还能靠关键词保底兜，
+    猜错了就是凭空把一篇不相关的论文置顶。
+    """
+    raw = data.get("anode_free")
+    if isinstance(raw, str):
+        anode_free = raw.strip().lower() in {"true", "yes", "y", "1", "是", "无负极"}
+    else:
+        anode_free = bool(raw)
+    return anode_free, _normalize_cathode_system(data.get("cathode_system") or data.get("cathode"))
+
+
 # ---------------------------------------------------------------------------
 # 单篇调用
 # ---------------------------------------------------------------------------
@@ -179,6 +342,9 @@ def build_prompt(work: dict, keywords: list[str] | None = None, topic=None) -> s
         title=work.get("title") or "",
         abstract=abstract_block,
         abstract_note=note,
+        # 两个结构化判断的口径（学科知识，所以写在 config 里而不是这里）
+        anode_free_hint=config.AI_ANODE_FREE_HINT,
+        cathode_hint=config.AI_CATHODE_HINT,
     )
 
 
@@ -198,10 +364,16 @@ def _post_chat(payload: dict) -> str:
     return resp.json()["choices"][0]["message"]["content"]
 
 
-def call_ai(work: dict, keywords: list[str] | None = None, topic=None) -> tuple[int, str, str]:
-    """调用 AI 并返回 ``(score, takeaway, reason)``。失败时抛出异常由上层处理。
+def call_ai(
+    work: dict, keywords: list[str] | None = None, topic=None
+) -> tuple[int, str, str, bool, str]:
+    """调用 AI 并返回 ``(score, takeaway, reason, anode_free, cathode_system)``。
 
-    ``keywords=None`` 表示使用 ``topic``（或 config）的完整研究方向描述。
+    失败时抛出异常由上层处理。``keywords=None`` 表示使用 ``topic``（或 config）的
+    完整研究方向描述。
+
+    后两项是 AI 的**结构化判断**（是不是无负极 / 正极属哪一类），只有保底逻辑用得到，
+    但和分数来自同一次调用 —— 再单独发一次请求既贵又可能不一致。
     """
     global _json_mode_supported
 
@@ -225,7 +397,9 @@ def call_ai(work: dict, keywords: list[str] | None = None, topic=None) -> tuple[
             data = parse_ai_json(content)
             if data is None:
                 raise ValueError(f"无法解析 AI 返回的 JSON: {(content or '')[:120]!r}")
-            return normalize_result(data)
+            score, takeaway, reason = normalize_result(data)
+            anode_free, cathode_system = normalize_flags(data)
+            return score, takeaway, reason, anode_free, cathode_system
         except requests.HTTPError as exc:
             status = exc.response.status_code if exc.response is not None else None
             if status == 400 and _json_mode_supported:
@@ -247,7 +421,9 @@ def call_ai(work: dict, keywords: list[str] | None = None, topic=None) -> tuple[
     raise RuntimeError(f"AI 调用失败: {last_error}")
 
 
-def _dispatch_call(work: dict, keywords: list[str] | None, topic) -> tuple[int, str, str]:
+def _dispatch_call(
+    work: dict, keywords: list[str] | None, topic
+) -> tuple[int, str, str, bool, str]:
     """单方向模式下只传两个参数调 ``call_ai``（保持向后兼容），有主题时再传第三个。"""
     if topic is None:
         return call_ai(work, keywords)
@@ -257,13 +433,24 @@ def _dispatch_call(work: dict, keywords: list[str] | None, topic) -> tuple[int, 
 def evaluate_one(work: dict, keywords: list[str] | None = None, topic=None) -> dict:
     """给单篇文献打分，返回带 ``ai_score`` / ``ai_takeaway`` / ``ai_reason`` 的副本。
 
+    ``anode_free`` / ``cathode_system`` 是 AI 的结构化判断，供保底逻辑使用
+    （见 :func:`src.content_rules.ai_keep_hit`）。
     即使 AI 失败也会返回结果（``ai_error=True`` + 保守分 0），
     由上层决定是否展示，绝不静默丢稿。
     """
     result = dict(work)
     try:
-        score, takeaway, reason = _dispatch_call(work, keywords, topic)
-        result.update(ai_score=score, ai_takeaway=takeaway, ai_reason=reason, ai_error=False)
+        score, takeaway, reason, anode_free, cathode_system = _dispatch_call(
+            work, keywords, topic
+        )
+        result.update(
+            ai_score=score,
+            ai_takeaway=takeaway,
+            ai_reason=reason,
+            ai_error=False,
+            anode_free=anode_free,
+            cathode_system=cathode_system,
+        )
     except Exception as exc:
         log.error("AI 打分失败 %s: %s", work.get("doi"), exc)
         result.update(
@@ -295,9 +482,13 @@ def evaluate_works(
     之所以要把"低于阈值"单独返回：候选量有近 200 篇而邮件只发 20 篇，
     若不记录这些已判定过的文献，下周它们会被原封不动地重新打分一遍。
 
-    **硬保底**：命中 ``config.KEEP_RULES``（或主题自己的 ``keep``）的论文无论分数
-    多低都进"入选"，**并且**即使 AI 调用失败也照样入"入选"（分数记 0）——
-    这是"老板要盯的方向不能丢"的最后一层保险，代价最大可以接受。
+    **硬保底（两条通道）**：
+      * 命中 ``config.KEEP_RULES``（或主题自己的 ``keep``）的论文，无论分数
+        多低都进"入选"，**并且**即使 AI 调用失败也照样入"入选"（分数记 0）——
+        这是"老板要盯的方向不能丢"的最后一层保险，代价最大可以接受。
+      * AI 自己在摘要里判定"这篇就是无负极、而且正极是富锂锰/钠电"时同样直接入"入选"
+        （免阈值、后面会被置顶）。关键词表只能做字面匹配，而"是不是无负极"经常
+        要靠读懂电芯构型才能判断（「裸 Cu 集流体」「负极过量≈0」），光靠词表必定漏。
     判断逻辑在 :func:`_partition_forced`。
 
     :param keywords: 打分判据；``None`` 表示用 ``topic``（或 config）的研究方向描述。
@@ -354,6 +545,11 @@ def _partition_forced(
     只在**非保底**的论文里挑，否则保底论文会因为 AI 挂了而进"失败"堆，
     同样进不了邮件（而且"失败"堆不写已读标记，下周还会重跑一遍）。
 
+    保底有**两条通道**，顺序是先关键词后 AI：
+      1. ``content_rules.keep_hit``  —— 词表命中（在进 AI 之前就已经生效）
+      2. ``content_rules.ai_keep_hit`` —— AI 判定无负极 + 体系对口
+    第二条只能在这里判：AI 的结论要到打分完成后才存在。
+
     ⚠️ 这里用的是**函数内**导入 ``content_rules``：模块顶层导入会绕成
     ``ai_matcher → content_rules → config``，而 ``content_rules`` 本身是干净的，
     问题在于 ``ai_matcher`` 被 ``main`` 和 ``content_rules`` 间接引用，
@@ -364,12 +560,19 @@ def _partition_forced(
     passed: list[dict] = []
     failed: list[dict] = []
     rejected: list[dict] = []
-    forced_count = 0
+    keyword_forced = 0
+    ai_forced: list[tuple[str, dict]] = []
     for work in scored:
         reason = content_rules.keep_hit(work, topic)
         if reason:
+            keyword_forced += 1
+        else:
+            # 第二条保底通道：关键词一个都没命中，但 AI 从摘要里读出了「无负极」。
+            reason = content_rules.ai_keep_hit(work)
+            if reason:
+                ai_forced.append((reason, work))
+        if reason:
             work["keep_reason"] = reason
-            forced_count += 1
             if work.get("ai_error"):
                 # AI 挂了也要发出去：不给分数，但给出足够判断的信息。
                 work["ai_score"] = 0
@@ -385,6 +588,12 @@ def _partition_forced(
             passed.append(work)
         else:
             rejected.append(work)
-    if forced_count:
-        log.info("保底规则强制保留 %s 篇（免剔除、免 AI 阈值）", forced_count)
+    if keyword_forced:
+        log.info("保底规则强制保留 %s 篇（免剔除、免 AI 阈值）", keyword_forced)
+    if ai_forced:
+        # 与 content_rules.log_kept 一样用 INFO：这是"靠 AI 读出来的漏网之鱼"，
+        # 日志里必须看得见，否则词表该补哪里永远不知道。
+        log.info("AI 判定无负极且体系对口，额外强制保留 %s 篇：", len(ai_forced))
+        for reason, work in ai_forced:
+            log.info("  [保底·%s] %s", reason, work.get("title"))
     return passed, failed, rejected
