@@ -30,6 +30,10 @@ Set-Location -LiteralPath $PSScriptRoot
 
 $Branch = 'main'
 
+# 网络参数：默认空（走 git 全局配置）。若探测到代理不可用，会在下面改成
+# @('-c','http.proxy=','-c','https.proxy=') 强制本次运行直连。
+$script:GitNetArgs = @()
+
 # 必须挡住的文件：一旦推上去，密钥就泄露了（删掉也会留在 git 历史里）
 $Forbidden = @('.env', '.venv/', 'data/logs/', 'data/topics_cache.json', 'data/outbox/', '__pycache__')
 
@@ -85,7 +89,11 @@ function Invoke-Git {
     # 注意：PowerShell 5.1 会把原生命令的 stderr 包装成 ErrorRecord，
     # 直接 Out-String 会得到一串 “+ FullyQualifiedErrorId : NativeCommandError” 噪音。
     # 这里把 ErrorRecord 拆回它的原始文本，才能看到 git 真正的报错。
-    $output = & $script:GitPath @Arguments 2>&1
+    #
+    # $script:GitNetArgs 由「网络模式探测」决定：代理可用时为空（走全局配置），
+    # 代理不可用时为 @('-c','http.proxy=','-c','https.proxy=')（本次运行强制直连）。
+    $allArgs = @($script:GitNetArgs) + @($Arguments)
+    $output = & $script:GitPath @allArgs 2>&1
     $code = $LASTEXITCODE
     $text = ($output | ForEach-Object {
         if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message }
@@ -96,6 +104,28 @@ function Invoke-Git {
         throw "git $($Arguments -join ' ') 执行失败（退出码 $code）：`n$text"
     }
     return [pscustomobject]@{ Code = $code; Text = $text }
+}
+
+function Test-ProxyAlive {
+    # 探测 git 全局配置里的 http(s).proxy 是否真的能连上。
+    # 返回 $true 表示代理可用（保持原样），$false 表示应改用直连。
+    $proxy = (Invoke-Git -Arguments @('config', '--global', '--get', 'http.proxy') -AllowFail).Text
+    if ([string]::IsNullOrWhiteSpace($proxy)) { return $true }  # 没配代理，无需处理
+
+    # 从 http://127.0.0.1:7877 里抠出主机和端口
+    $m = [regex]::Match($proxy, '^(?:https?://)?([^:/]+):(\d+)')
+    if (-not $m.Success) { return $true }  # 解析不了就交给 git 自己处理
+    $host_ = $m.Groups[1].Value
+    $port  = [int]$m.Groups[2].Value
+
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $iar = $client.BeginConnect($host_, $port, $null, $null)
+        $ok = $iar.AsyncWaitHandle.WaitOne(1500, $false) -and $client.Connected
+        $client.Close()
+        return $ok
+    }
+    catch { return $false }
 }
 
 function Invoke-GitRetry {
@@ -137,6 +167,16 @@ if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot '.git'))) {
 }
 Write-Host "`n  git    : $script:GitPath" -ForegroundColor Gray
 Write-Host "  仓库   : $PSScriptRoot" -ForegroundColor Gray
+
+# ---------- 网络模式探测 ----------
+# git 全局配置里可能写死了代理（如 http://127.0.0.1:7877）。代理软件没开时，
+# 所有 git 网络操作都会失败。这里先探一下：代理不通就本次运行强制直连，
+# 不改动全局配置（下次代理开了照样能用）。
+$script:GitNetArgs = @()
+if (-not (Test-ProxyAlive)) {
+    $script:GitNetArgs = @('-c', 'http.proxy=', '-c', 'https.proxy=')
+    Write-Warn "检测到 git 代理不可用，本次运行将直连 GitHub（不改全局配置）"
+}
 
 $current = (Invoke-Git -Arguments @('rev-parse', '--abbrev-ref', 'HEAD')).Text
 if ($current -ne $Branch) {
