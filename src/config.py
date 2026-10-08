@@ -1130,6 +1130,20 @@ SMTP_USER = os.getenv("SMTP_USER") or ""
 SMTP_PASS = os.getenv("SMTP_PASS") or ""  # 授权码 / App Password，不是登录密码
 MAIL_TO = os.getenv("MAIL_TO") or ""
 
+# 备用发件通道（**可选**）。
+#
+# 背景：主通道若是校园/单位邮箱（如 mail.ustc.edu.cn），其 SMTP 往往只对
+# 校园网/国内 IP 开放。GitHub Actions 的 runner 在海外，会直接超时——
+# 换端口、加重试都救不了，因为整个服务器对海外 IP 不可达。
+#
+# 配上一组**全球可访问**的备用邮箱（如 QQ 邮箱 smtp.qq.com:465、163 邮箱
+# smtp.163.com:465），主通道连不上时会自动降级到备用通道发信。
+# 四个变量要么全配、要么全不配；只配一部分视为未配置（保持向后兼容）。
+SMTP_FALLBACK_HOST = os.getenv("SMTP_FALLBACK_HOST") or ""
+SMTP_FALLBACK_PORT = int(os.getenv("SMTP_FALLBACK_PORT") or "465")
+SMTP_FALLBACK_USER = os.getenv("SMTP_FALLBACK_USER") or ""
+SMTP_FALLBACK_PASS = os.getenv("SMTP_FALLBACK_PASS") or ""
+
 # OpenAlex 礼貌池（faster pool）。留空则不带 mailto，仍可用但速率更低。
 OPENALEX_MAILTO = os.getenv("OPENALEX_MAILTO") or SMTP_USER or ""
 

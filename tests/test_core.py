@@ -3955,7 +3955,13 @@ class TestMailAttachment(unittest.TestCase):
         self._fake_smtp = FakeSMTP
 
     def _patch_connect(self):
-        return patch.object(mailer, "_connect", lambda: self._fake_smtp(self.sent))
+        # _connect() 现在返回 (server, user, password)：备用通道降级时
+        # 会带回它自己的登录凭据，所以桩也要返回三元组。
+        return patch.object(
+            mailer,
+            "_connect",
+            lambda: (self._fake_smtp(self.sent), "bot@example.com", "secret"),
+        )
 
     def _message(self):
         return [item[1] for item in self.sent if item[0] == "message"][0]
@@ -4021,6 +4027,67 @@ class TestMailAttachment(unittest.TestCase):
         outbox = os.path.join(self.tmp.name, "outbox2")
         mailer.save_preview("<p>hi</p>", "2026-10-02", outbox)
         self.assertEqual([name for name in os.listdir(outbox) if name.endswith(".pdf")], [])
+
+    def test_connect_falls_back_to_secondary_channel(self):
+        """主通道全端口不可达时，应降级到备用通道并带回它的登录凭据。
+
+        这是海外 runner 连不上校园邮箱 SMTP 的兜底：主通道（如
+        mail.ustc.edu.cn）超时后，改用全球可达的备用邮箱发信。
+        """
+        attempts: list[tuple[str, int]] = []
+
+        def fake_open(host, port, context):
+            attempts.append((host, port))
+            if host == "primary.example.com":
+                raise OSError("timed out")
+            return self._fake_smtp(self.sent)
+
+        with patch.object(mailer, "SMTP_HOST", "primary.example.com"), \
+             patch.object(mailer, "SMTP_PORT", 465), \
+             patch.object(mailer, "SMTP_USER", "primary@example.com"), \
+             patch.object(mailer, "SMTP_PASS", "primary-pass"), \
+             patch.object(mailer, "SMTP_FALLBACK_HOST", "backup.example.com"), \
+             patch.object(mailer, "SMTP_FALLBACK_PORT", 465), \
+             patch.object(mailer, "SMTP_FALLBACK_USER", "backup@example.com"), \
+             patch.object(mailer, "SMTP_FALLBACK_PASS", "backup-pass"), \
+             patch.object(mailer, "_open_connection", side_effect=fake_open), \
+             patch.object(mailer.time, "sleep"):
+            server, user, password = mailer._connect()
+
+        self.assertIsInstance(server, self._fake_smtp)
+        self.assertEqual(user, "backup@example.com")
+        self.assertEqual(password, "backup-pass")
+        # 主通道两个端口都试过，之后才轮到备用通道
+        self.assertIn(("primary.example.com", 465), attempts)
+        self.assertIn(("primary.example.com", 587), attempts)
+        self.assertIn(("backup.example.com", 465), attempts)
+        self.assertLess(
+            attempts.index(("primary.example.com", 587)),
+            attempts.index(("backup.example.com", 465)),
+        )
+
+    def test_connect_skips_fallback_when_not_configured(self):
+        """备用通道没配全时不应被尝试，行为与改动前一致。"""
+        attempts: list[tuple[str, int]] = []
+
+        def fake_open(host, port, context):
+            attempts.append((host, port))
+            raise OSError("timed out")
+
+        with patch.object(mailer, "SMTP_HOST", "primary.example.com"), \
+             patch.object(mailer, "SMTP_PORT", 465), \
+             patch.object(mailer, "SMTP_USER", "primary@example.com"), \
+             patch.object(mailer, "SMTP_PASS", "primary-pass"), \
+             patch.object(mailer, "SMTP_FALLBACK_HOST", ""), \
+             patch.object(mailer, "SMTP_FALLBACK_PORT", 465), \
+             patch.object(mailer, "SMTP_FALLBACK_USER", ""), \
+             patch.object(mailer, "SMTP_FALLBACK_PASS", ""), \
+             patch.object(mailer, "_open_connection", side_effect=fake_open), \
+             patch.object(mailer.time, "sleep"):
+            with self.assertRaises(RuntimeError):
+                mailer._connect()
+
+        self.assertTrue(all(host == "primary.example.com" for host, _ in attempts), attempts)
 
     def test_build_html_notices_switch_between_attachment_and_truncation(self):
         works = [

@@ -38,6 +38,10 @@ from . import authors, ranking
 from .config import (
     EMAIL_TITLE,
     MAX_EMAIL_ITEMS,
+    SMTP_FALLBACK_HOST,
+    SMTP_FALLBACK_PASS,
+    SMTP_FALLBACK_PORT,
+    SMTP_FALLBACK_USER,
     SMTP_HOST,
     SMTP_PASS,
     SMTP_PORT,
@@ -364,43 +368,67 @@ def _open_connection(host: str, port: int, context: ssl.SSLContext) -> smtplib.S
     return server
 
 
-def _connect() -> smtplib.SMTP:
-    """建立 SMTP 连接，带**重试**与**端口回退**。
+def _connect() -> tuple[smtplib.SMTP, str, str]:
+    """建立 SMTP 连接，带**重试**、**端口回退**与**备用通道降级**。
 
     背景：GitHub Actions 的 runner 在海外，连 ``mail.ustc.edu.cn:465``（隐式
-    SSL）经常直接 ``TimeoutError``。这不是代码 bug，而是网络可达性问题。
-    对策：
+    SSL）经常直接 ``TimeoutError``。这不是代码 bug，而是网络可达性问题——
+    校园/单位邮箱的 SMTP 往往只对国内 IP 开放，换端口也救不了。
 
-    1. 先按配置端口连，失败重试 ``SMTP_ATTEMPTS_PER_PORT`` 次（超时多为瞬时）；
+    对策（按顺序）：
+
+    1. 先按主通道配置端口连，失败重试 ``SMTP_ATTEMPTS_PER_PORT`` 次；
     2. 仍失败则回退到另一个端口（465 ↔ 587）再试一轮；
-    3. 全部失败才抛异常，由调用方决定是否回写状态。
+    3. 主通道全失败后，若配置了备用通道（``SMTP_FALLBACK_*``），
+       对备用通道重复 1、2 两步；
+    4. 全部失败才抛异常，由调用方决定是否回写状态。
 
-    这样即使 465 被墙，只要 587 能通，邮件照样发得出去。
+    返回 ``(server, user, password)``：备用通道有自己的登录凭据，
+    调用方必须用返回的 user/password 登录，而不是全局的 ``SMTP_USER``。
     """
     context = ssl.create_default_context()
-    host = SMTP_HOST.strip()
 
-    ports = [SMTP_PORT]
-    alt = _SMTP_PORT_FALLBACK.get(SMTP_PORT)
-    if alt is not None:
-        ports.append(alt)
+    # 通道列表：主通道在前，备用通道（若配置完整）在后。
+    channels: list[tuple[str, int, str, str]] = [
+        (SMTP_HOST.strip(), SMTP_PORT, SMTP_USER, SMTP_PASS)
+    ]
+    if SMTP_FALLBACK_HOST.strip() and SMTP_FALLBACK_USER and SMTP_FALLBACK_PASS:
+        channels.append(
+            (
+                SMTP_FALLBACK_HOST.strip(),
+                SMTP_FALLBACK_PORT,
+                SMTP_FALLBACK_USER,
+                SMTP_FALLBACK_PASS,
+            )
+        )
 
     last_error: Exception | None = None
-    for port in ports:
-        for attempt in range(1, SMTP_ATTEMPTS_PER_PORT + 1):
-            try:
-                return _open_connection(host, port, context)
-            except (OSError, smtplib.SMTPException) as exc:
-                last_error = exc
-                log.warning(
-                    "SMTP 连接失败（%s:%s，第 %s/%s 次）：%s",
-                    host, port, attempt, SMTP_ATTEMPTS_PER_PORT, exc,
-                )
-                if attempt < SMTP_ATTEMPTS_PER_PORT:
-                    time.sleep(2 * attempt)  # 2s、4s 退避
+    for host, port, user, password in channels:
+        ports = [port]
+        alt = _SMTP_PORT_FALLBACK.get(port)
+        if alt is not None:
+            ports.append(alt)
 
+        for p in ports:
+            for attempt in range(1, SMTP_ATTEMPTS_PER_PORT + 1):
+                try:
+                    server = _open_connection(host, p, context)
+                    return server, user, password
+                except (OSError, smtplib.SMTPException) as exc:
+                    last_error = exc
+                    log.warning(
+                        "SMTP 连接失败（%s:%s，第 %s/%s 次）：%s",
+                        host, p, attempt, SMTP_ATTEMPTS_PER_PORT, exc,
+                    )
+                    if attempt < SMTP_ATTEMPTS_PER_PORT:
+                        time.sleep(2 * attempt)  # 2s、4s 退避
+
+        if len(channels) > 1 and (host, port) != (channels[-1][0], channels[-1][1]):
+            log.warning("主通道 %s 不可达，尝试备用通道……", host)
+
+    tried = "、".join(f"{h}:{p}" for h, p, _, _ in channels)
     raise RuntimeError(
-        f"SMTP 连接失败：{host} 端口 {ports} 均不可达（最后错误：{last_error}）"
+        f"SMTP 连接失败：{tried} 均不可达（最后错误：{last_error}）"
     ) from last_error
 
 
@@ -474,15 +502,17 @@ def send_mail(
 
     # 中文主题必须显式做 RFC 2047 编码
     message["Subject"] = Header(subject, "utf-8").encode()
-    message["From"] = SMTP_USER
     message["To"] = ", ".join(recipients)
     message["Date"] = formatdate(localtime=True)
     message["Message-ID"] = make_msgid(domain="literature-bot")
 
-    server = _connect()
+    # _connect() 可能降级到备用通道，返回它自己的登录凭据；
+    # From 必须用实际发信账号，否则会被收件方判为伪造发件人。
+    server, user, password = _connect()
+    message["From"] = user
     try:
-        if SMTP_USER:
-            server.login(SMTP_USER, SMTP_PASS)
+        if user:
+            server.login(user, password)
         server.send_message(message)
     finally:
         try:
