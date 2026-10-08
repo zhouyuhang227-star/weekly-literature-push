@@ -25,6 +25,7 @@ import logging
 import re
 import smtplib
 import ssl
+import time
 from email import encoders
 from email.header import Header
 from email.mime.base import MIMEBase
@@ -332,21 +333,28 @@ def _wrap(body: str, run_date: str, meta_line: str, title: str | None = None) ->
 # ---------------------------------------------------------------------------
 # 发送
 # ---------------------------------------------------------------------------
-def _connect() -> smtplib.SMTP:
-    """按端口自动选择 SSL 或 STARTTLS。
+# 连接超时（秒）。GitHub Actions 的海外 runner 连国内邮箱经常要十几秒才握手，
+# 30 秒太紧，放宽到 45 秒。
+SMTP_TIMEOUT = 45
 
-    - 465：隐式 SSL（``smtplib.SMTP_SSL``）
-    - 587 / 25 / 其它：明文连接后 ``STARTTLS``
-    """
-    context = ssl.create_default_context()
-    host = SMTP_HOST.strip()
+# 每个端口的重试次数。超时往往是**瞬时**的（网络抖动 / 对端限流），
+# 重试一两次通常就能连上，比直接失败划算得多。
+SMTP_ATTEMPTS_PER_PORT = 2
 
-    if SMTP_PORT == 465:
-        log.info("SMTP 连接：%s:%s（SSL）", host, SMTP_PORT)
-        return smtplib.SMTP_SSL(host, SMTP_PORT, timeout=30, context=context)
+# 端口回退顺序：先试配置的端口，失败再试另一个。
+# 465 = 隐式 SSL，587 = STARTTLS。海外 runner 上 465 常被墙/超时，
+# 587 走明文+STARTTLS 反而更容易通，所以两个都试一遍。
+_SMTP_PORT_FALLBACK = {465: 587, 587: 465}
 
-    log.info("SMTP 连接：%s:%s（STARTTLS）", host, SMTP_PORT)
-    server = smtplib.SMTP(host, SMTP_PORT, timeout=30)
+
+def _open_connection(host: str, port: int, context: ssl.SSLContext) -> smtplib.SMTP:
+    """按端口建立一条 SMTP 连接（不做登录）。"""
+    if port == 465:
+        log.info("SMTP 连接：%s:%s（SSL）", host, port)
+        return smtplib.SMTP_SSL(host, port, timeout=SMTP_TIMEOUT, context=context)
+
+    log.info("SMTP 连接：%s:%s（STARTTLS）", host, port)
+    server = smtplib.SMTP(host, port, timeout=SMTP_TIMEOUT)
     try:
         server.ehlo()
         server.starttls(context=context)
@@ -354,6 +362,46 @@ def _connect() -> smtplib.SMTP:
     except smtplib.SMTPException:
         log.warning("服务器不支持 STARTTLS，将使用明文连接（不推荐）")
     return server
+
+
+def _connect() -> smtplib.SMTP:
+    """建立 SMTP 连接，带**重试**与**端口回退**。
+
+    背景：GitHub Actions 的 runner 在海外，连 ``mail.ustc.edu.cn:465``（隐式
+    SSL）经常直接 ``TimeoutError``。这不是代码 bug，而是网络可达性问题。
+    对策：
+
+    1. 先按配置端口连，失败重试 ``SMTP_ATTEMPTS_PER_PORT`` 次（超时多为瞬时）；
+    2. 仍失败则回退到另一个端口（465 ↔ 587）再试一轮；
+    3. 全部失败才抛异常，由调用方决定是否回写状态。
+
+    这样即使 465 被墙，只要 587 能通，邮件照样发得出去。
+    """
+    context = ssl.create_default_context()
+    host = SMTP_HOST.strip()
+
+    ports = [SMTP_PORT]
+    alt = _SMTP_PORT_FALLBACK.get(SMTP_PORT)
+    if alt is not None:
+        ports.append(alt)
+
+    last_error: Exception | None = None
+    for port in ports:
+        for attempt in range(1, SMTP_ATTEMPTS_PER_PORT + 1):
+            try:
+                return _open_connection(host, port, context)
+            except (OSError, smtplib.SMTPException) as exc:
+                last_error = exc
+                log.warning(
+                    "SMTP 连接失败（%s:%s，第 %s/%s 次）：%s",
+                    host, port, attempt, SMTP_ATTEMPTS_PER_PORT, exc,
+                )
+                if attempt < SMTP_ATTEMPTS_PER_PORT:
+                    time.sleep(2 * attempt)  # 2s、4s 退避
+
+    raise RuntimeError(
+        f"SMTP 连接失败：{host} 端口 {ports} 均不可达（最后错误：{last_error}）"
+    ) from last_error
 
 
 def _ascii_filename(name: str, fallback: str = "literature-overflow.pdf") -> str:
