@@ -352,14 +352,7 @@ class TestResearchDirectionIsConfigurable(unittest.TestCase):
     def setUp(self):
         self._saved = {
             name: getattr(config, name)
-            for name in (
-                "RESEARCH_FIELD",
-                "RESEARCH_DESCRIPTION",
-                "USER_KEYWORDS",
-                # 全局排除说明是**用户配置**（会拼进 prompt），不算模板里写死的学科词，
-                # 所以这里要保存/恢复，下面的"无写死示例"测试会把它清空。
-                "GLOBAL_EXCLUDE_NOTE",
-            )
+            for name in ("RESEARCH_FIELD", "RESEARCH_DESCRIPTION", "USER_KEYWORDS")
         }
 
     def tearDown(self):
@@ -386,12 +379,11 @@ class TestResearchDirectionIsConfigurable(unittest.TestCase):
     def test_user_prompt_has_no_hardcoded_score_examples(self):
         """评分档位里的"固态电解质、锂金属负极"这类示例必须已经清除。
 
-        注意：这里也要把 ``GLOBAL_EXCLUDE_NOTE`` / ``AI_ANODE_FREE_HINT`` /
-        ``AI_CATHODE_HINT`` 清空 —— 那些都是用户能在 config 里改的**配置文本**
-        （会拼进 prompt），不是模板里写死的学科词。
+        注意：这里也要把 ``AI_ANODE_FREE_HINT`` / ``AI_CATHODE_HINT`` 清空 ——
+        那些都是用户能在 config 里改的**配置文本**（会拼进 prompt），
+        不是模板里写死的学科词。
         """
         config.USER_KEYWORDS = ["perovskite solar cell"]
-        config.GLOBAL_EXCLUDE_NOTE = ""
         config.AI_ANODE_FREE_HINT = ""
         config.AI_CATHODE_HINT = ""
         prompt = ai_matcher.build_prompt({"title": "T"}, None)
@@ -415,13 +407,26 @@ class TestResearchDirectionIsConfigurable(unittest.TestCase):
         self.assertIn("自定义无负极口径", prompt)
         self.assertIn("自定义体系口径", prompt)
 
-    def test_global_exclude_note_reaches_the_prompt(self):
-        """全局排除说明要真的进到 AI 的尺子里（不然 AI 不知道你要避开什么）。"""
-        config.USER_KEYWORDS = ["x"]
-        config.RESEARCH_DESCRIPTION = ""
-        config.GLOBAL_EXCLUDE_NOTE = "不看隔膜改性"
-        prompt = ai_matcher.build_prompt({"title": "T"}, None)
-        self.assertIn("不看隔膜改性", prompt)
+    def test_rules_are_not_written_into_the_ai_prompt(self):
+        """★ 剔除 / 保底是**本地规则**，不能出现在提示词里。
+
+        规则文本一旦进了 prompt，AI 就会照着它打分 —— 而不同主题的规则
+        本来就不一样（「无负极钠电」还要看电解液工程），写死一句全局口径
+        必然和某个主题自相矛盾。
+        """
+        leaky = {"label": "绝不外泄的规则", "any": ["secret phrase"]}
+        topic = config.ResearchTopic(
+            name="测试主题",
+            keywords=["kw"],
+            description="desc",
+            exclude=[leaky],
+            keep=[leaky],
+        )
+        prompt = ai_matcher.build_prompt({"title": "T"}, None, topic)
+        self.assertNotIn("绝不外泄的规则", prompt)
+        self.assertNotIn("secret phrase", prompt)
+        self.assertIn("desc", prompt)
+        self.assertIn("kw", prompt)
 
     def test_explicit_keywords_override_config_brief(self):
         config.RESEARCH_DESCRIPTION = "不应出现在这里"
@@ -1776,8 +1781,21 @@ class TestMultiTopicOrchestration(unittest.TestCase):
         self._orig_topics = config.RESEARCH_TOPICS
         config.PUSHED_FILE = os.path.join(self.tmp.name, "pushed.json")
         config.RESEARCH_TOPICS = [
-            {"name": "富锂锰正极", "topic_query": "lithium rich cathode", "keywords": ["富锂锰"]},
-            {"name": "无负极钠离子电池", "topic_query": "anode free sodium", "keywords": ["无负极"]},
+            {
+                "name": "富锂锰正极",
+                "topic_query": "lithium rich cathode",
+                "keywords": ["富锂锰"],
+                # 多主题模式只读主题自己的规则，测试主题也要显式挂上。
+                "exclude": list(config.EXCLUDE_RULES),
+                "keep": list(config.KEEP_RULES),
+            },
+            {
+                "name": "无负极钠离子电池",
+                "topic_query": "anode free sodium",
+                "keywords": ["无负极"],
+                "exclude": list(config.EXCLUDE_RULES),
+                "keep": list(config.KEEP_RULES),
+            },
         ]
         self.sent: list[tuple[str, str]] = []
         self.attachments: list[tuple[str, bytes] | None] = []
@@ -2001,12 +2019,14 @@ class TestMultiTopicOrchestration(unittest.TestCase):
         self.assertIn("内容加分（全局）", text)
         self.assertIn("固态电池 +1", text)
         self.assertIn("无负极 +10", text)
-        self.assertIn("剔除规则（全局）", text)
+        self.assertIn("剔除规则（单方向默认）", text)
         self.assertIn("电解液工程", text)
         self.assertIn("隔膜改性", text)
         # 保底规则必须能离线看到，否则老板要盯的方向配错了也发现不了
-        self.assertIn("硬保底（全局）", text)
+        self.assertIn("硬保底（单方向默认）", text)
         self.assertIn("免剔除规则、免 AI 入选线", text)
+        # 多主题模式：主题行要回显它**自己的**规则（不是全局表）
+        self.assertIn("多主题以各自主题行为准", text)
 
     def test_show_config_lists_every_topic(self):
         from src import main as main_module
@@ -2395,11 +2415,9 @@ class TestKeepRules(unittest.TestCase):
         论文进了候选池、AI 也打了分，却拿不到保底（日志里看不出任何异常）。
         这里逐词测：``Anode-free cell with <召回词>`` 必须能保底。
         例外只能写在 ``GATE_EXEMPT_RECALL_TERMS`` 里，改一处就必须改这里。
-        主题自带 keep 时，保底标签是主题的那条（例如「无负极钠电」）。
+        多主题模式下保底只读主题自己的 ``keep``，所以每个主题都必须挂一条。
         """
         for topic in config.active_research_topics():
-            # 保底标签以当前主题**实际生效**的最后一条规则为准：
-            # 全局规则在前、主题自己的在后；没写 keep 的主题只有全局那条。
             expected = content_rules.keep_rules(topic)[-1]["label"]
             for term in topic.search_terms:
                 if term in GATE_EXEMPT_RECALL_TERMS:
@@ -2505,17 +2523,15 @@ class TestContentRuleValidation(unittest.TestCase):
         problems = config.topic_warnings("topic", broken)
         self.assertTrue(any("keep" in p and "永远不会生效" in p for p in problems), problems)
 
-    def test_bad_skip_topics_shape_is_reported(self):
-        """``skip_topics`` 写成字符串 = 豁免永远不生效，必须报出来。"""
-        broken = [{"label": "坏的", "score": 0, "any": ["x"], "skip_topics": "无负极钠电"}]
-        with patch.object(config, "EXCLUDE_RULES", broken):
-            problems = config.validate_content_rules()
-        self.assertTrue(any("skip_topics" in p for p in problems), problems)
+    def test_bad_keep_systems_are_reported(self):
+        """``keep_systems`` 写错 = AI 侧保底永远不生效，必须报出来。"""
+        broken = config.ResearchTopic(name="A", keywords=["x"], keep_systems=["lithium"])
+        problems = config.topic_warnings("keyword", broken)
+        self.assertTrue(any("keep_systems" in p for p in problems), problems)
 
-    def test_skip_topics_accepts_a_list_of_topic_names(self):
-        ok = [{"label": "好的", "score": 0, "any": ["x"], "skip_topics": ["无负极钠电"]}]
-        with patch.object(config, "EXCLUDE_RULES", ok):
-            self.assertEqual(config.validate_content_rules(), [])
+    def test_keep_systems_accepts_known_systems(self):
+        ok = config.ResearchTopic(name="A", keywords=["x"], keep_systems=["sodium"])
+        self.assertEqual(config.topic_warnings("keyword", ok), [])
 
 
 class TestContentBonusAffectsRanking(unittest.TestCase):
@@ -2633,11 +2649,13 @@ class TestLiveResearchConfig(unittest.TestCase):
         joined = " ".join(topic.keywords).lower()
         for clue in ("electrolyte", "current collector", "sodiophilic"):
             self.assertIn(clue, joined)
-        # 本主题的核心内容必须在 AI 提示里说清楚「不是排除项」
-        self.assertIn("电解液工程", topic.exclude_note)
-        self.assertIn("不是排除项", topic.exclude_note)
+        # 本主题是唯一**不挂**「电解液工程」的：exclude 里只有隔膜改性。
+        self.assertEqual([rule["label"] for rule in topic.exclude], ["隔膜改性"])
+        # 保底与 AI 侧保底都只认钠电。
+        self.assertEqual([rule["label"] for rule in topic.keep], ["无负极"])
+        self.assertEqual(topic.keep_systems, ["sodium"])
 
-    def test_electrolyte_engineering_exclusion_is_skipped_for_the_anode_free_topic(self):
+    def test_electrolyte_engineering_exclusion_is_not_mounted_on_the_anode_free_topic(self):
         topics = {topic.name: topic for topic in config.active_research_topics()}
         anode_free = topics["无负极钠电"]
         self.assertNotIn(
@@ -2659,12 +2677,15 @@ class TestLiveResearchConfig(unittest.TestCase):
     def test_anode_free_keep_gate_narrows_per_topic(self):
         topics = {topic.name: topic for topic in config.active_research_topics()}
         anode_free = topics["无负极钠电"]
-        # 全局那条（富锂锰 或 钠电）让位给主题自己的（只认钠电）
+        # 每个主题只挂自己的保底：钠电主题只认钠电，富锂锰主题只认富锂锰。
         self.assertEqual(
-            [rule["label"] for rule in content_rules.keep_rules(anode_free)], ["无负极钠电"]
+            [rule["label"] for rule in content_rules.keep_rules(anode_free)], ["无负极"]
         )
+        self.assertEqual(anode_free.keep_systems, ["sodium"])
+        self.assertEqual(topics["富锂锰正极"].keep_systems, ["li-rich-mn"])
         li_work = {"title": "Anode-free Li-rich layered oxide cathode", "abstract": ""}
         self.assertIsNone(content_rules.keep_hit(li_work, anode_free))
+        self.assertIsNone(content_rules.keep_hit(li_work, topics["钠离子正极"]))
         self.assertEqual(
             content_rules.keep_hit(li_work, topics["富锂锰正极"]), "无负极"
         )
@@ -2672,17 +2693,34 @@ class TestLiveResearchConfig(unittest.TestCase):
             "title": "Sodiophilic current collector for anode-free sodium batteries",
             "abstract": "",
         }
-        self.assertEqual(content_rules.keep_hit(na_work, anode_free), "无负极钠电")
+        self.assertEqual(content_rules.keep_hit(na_work, anode_free), "无负极")
+        # AI 侧保底同样按主题收窄：钠电判定进不了富锂锰主题。
+        ai_na = {"anode_free": True, "cathode_system": "sodium"}
+        self.assertIsNone(content_rules.ai_keep_hit(ai_na, topics["富锂锰正极"]))
+        self.assertIsNotNone(content_rules.ai_keep_hit(ai_na, anode_free))
 
-    def test_global_exclude_note_is_fed_to_the_ai(self):
-        self.assertTrue(config.GLOBAL_EXCLUDE_NOTE.strip())
-        first_clause = config.GLOBAL_EXCLUDE_NOTE.split("；")[0]
+    def test_every_topic_owns_its_rules_and_the_global_note_is_gone(self):
+        """★ 用户口径：保底 / 斩杀按主题各配各的，且规则不进 AI 提示词。"""
+        self.assertFalse(hasattr(config, "GLOBAL_EXCLUDE_NOTE"))
         for topic in config.active_research_topics():
-            if topic.exclude_note:
-                # 覆盖了的主题必须用**自己的**口径，不能继续喂全局那句
-                self.assertIn(topic.exclude_note, topic.brief(), topic.name)
-                continue
-            self.assertIn(first_clause, topic.brief(), topic.name)
+            with self.subTest(topic=topic.name):
+                self.assertTrue(topic.exclude, topic.name)
+                self.assertTrue(topic.keep, topic.name)
+                self.assertTrue(topic.keep_systems, topic.name)
+                # brief 只由主题名 + 描述 + 关键词组成。
+                self.assertEqual(topic.brief().splitlines()[0], topic.name)
+                self.assertNotIn("不看电解液工程", topic.brief())
+        # 全局表仍保留给单方向模式；两个富锂锰/钠离子正极主题都挂这两条。
+        self.assertEqual(
+            [rule["label"] for rule in config.EXCLUDE_RULES], ["电解液工程", "隔膜改性"]
+        )
+        topics = {topic.name: topic for topic in config.active_research_topics()}
+        for name in ("富锂锰正极", "钠离子正极"):
+            self.assertEqual(
+                [rule["label"] for rule in topics[name].exclude],
+                ["电解液工程", "隔膜改性"],
+                name,
+            )
 
     def test_keep_rule_has_the_cathode_gate(self):
         """★ Seg Q：无负极保底必须带体系闸门（锂硫事件后加的）。"""

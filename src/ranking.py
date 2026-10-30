@@ -1,6 +1,7 @@
 """加权排序：期刊档次加成 **+** 内容规则加成。
 
-规则的数字都在 ``config.py`` 里（``JOURNAL_TIERS`` / ``BONUS_RULES`` / ``KEEP_RULES``）：
+规则的数字都在 ``config.py`` 里（``JOURNAL_TIERS`` / 主题的 ``bonuses`` / ``keep``；
+单方向模式是 ``BONUS_RULES`` / ``KEEP_RULES``）：
 
     最终分 = AI 相关性分（0-100） + 期刊档次加成 + 内容规则加成
 
@@ -8,13 +9,13 @@
 ``AI_THRESHOLD``。这样"顶刊的低相关论文"和"蹭到热词的论文"都不会挤掉
 "普通刊的高相关论文"，只是同样相关时排得更靠前。
 
-（唯一能改变"入选"的是两条**保底**通道：``config.KEEP_RULES`` 的关键词保底，
-以及 AI 判定「无负极 + 体系对口」的保底。它们的生效点在 :mod:`src.ai_matcher`，
-本模块只负责把它们置顶。）
+（唯一能改变"入选"的是两条**保底**通道：主题 ``keep`` 的关键词保底
+（单方向模式为 ``config.KEEP_RULES``），以及 AI 判定「无负极 + 体系对口」的保底。
+它们的生效点在 :mod:`src.ai_matcher`，本模块只负责把它们置顶。）
 
 两类加成的分工：
 * **期刊档次加成**（``JOURNAL_TIERS``）：这篇发在哪本刊。
-* **内容规则加成**（``config.BONUS_RULES`` + 主题的 ``bonuses``）：这篇写了什么，
+* **内容规则加成**（主题的 ``bonuses``；单方向模式为 ``config.BONUS_RULES``）：这篇写了什么，
   由 :mod:`src.content_rules` 按关键词规则判定，可命中多条累加（如
   「固态电池 +1」+「固态聚合物电解质 +1」）。
 
@@ -109,7 +110,7 @@ def annotate(works: list[dict], topic=None) -> list[dict]:
         keep_reason = (
             work.get("keep_reason")
             or content_rules.keep_hit(work, topic)
-            or content_rules.ai_keep_hit(work)
+            or content_rules.ai_keep_hit(work, topic)
         )
         if keep_reason:
             work["keep_reason"] = keep_reason

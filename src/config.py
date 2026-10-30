@@ -256,7 +256,8 @@ def journals_for(names=None) -> dict[str, str]:
 # ⚠️ 两种加成**都只管排序，不管入选**。能不能进邮件仍然只看 AI 分是否过 AI_THRESHOLD。
 #    好处：不会因为"顶刊"或"蹭到热词"就把一篇不相关的论文塞进邮件。
 #
-# 规则是一个字典，字段说明（写规则的地方就是这里和每个主题自己的 bonuses）：
+# 规则是一个字典，字段说明（写规则的地方是每个主题自己的 bonuses / exclude / keep；
+# 单方向模式才用下面的全局默认表）：
 #   label   必填。显示名，会出现在邮件的加分明细里（如「固态电池 +1」）。
 #   score   必填。加几分。排除规则写 0（反正它只看"有没有命中"）。
 #   any     必填。命中其中**任意一个**短语就算命中。
@@ -265,10 +266,15 @@ def journals_for(names=None) -> dict[str, str]:
 #   scope   选填。"all"（默认，标题+摘要）或 "title"（只看标题）。
 #           排除规则**默认只看标题**，见下面 EXCLUDE_RULES 的说明。
 #
-# 上面这套字段同时用于三类规则（都在下面）：
-#   BONUS_RULES  加分     —— 只管**排序**，分数再高也换不来入选。
-#   EXCLUDE_RULES 剔除    —— 命中就**直接丢掉**，连 AI 都不打分。
-#   KEEP_RULES   硬保底  —— 命中就**强制进邮件**，AI 分再低也留，且**免于上面所有剔除**。
+# 上面这套字段同时用于三类规则：
+#   加分     —— 只管**排序**，分数再高也换不来入选。
+#   剔除     —— 命中就**直接丢掉**，连 AI 都不打分。
+#   硬保底   —— 命中就**强制进邮件**，AI 分再低也留，且**免于剔除**。
+#
+# ★ 多主题模式下这些规则**归属各自的主题**（``RESEARCH_TOPICS`` 里的
+#   ``bonuses`` / ``exclude`` / ``keep``），互不串门。下面的全局表
+#   ``BONUS_RULES`` / ``EXCLUDE_RULES`` / ``KEEP_RULES`` 只是**单方向模式**
+#   （``RESEARCH_TOPICS`` 为空）的默认值，多主题模式下不参与。
 #
 # 匹配方式：先把文本归一化（转小写、标点与连字符换成空格、压缩空格），
 #   再按「词首对齐」匹配短语。所以
@@ -278,8 +284,9 @@ def journals_for(names=None) -> dict[str, str]:
 
 #: 「无负极」构型的写法集合（**加分规则与硬保底规则共用这一份**）。
 #:
-#: 单独抽出来是因为它要出现在两个地方：``BONUS_RULES``（加分）与
-#: ``KEEP_RULES``（硬保底，见下面）。两处如果各写一份词表，早晚会漂移 ——
+#: 单独抽出来是因为它要出现在两处：加分规则（主题的 ``bonuses`` / 全局
+#: ``BONUS_RULES``）与保底规则（主题的 ``keep`` / 全局 ``KEEP_RULES``）。
+#: 两处如果各写一份词表，早晚会漂移 ——
 #: 加了新写法只改了一处，于是"能加分但保不住"，或者反过来，都是很难查的坑。
 #:
 #: 匹配前会先归一化（转小写、连字符换成空格），所以 ``Anode-free`` / ``anode free``
@@ -297,9 +304,9 @@ ANODE_FREE_TERMS: list[str] = [
     "aflmb",  # anode-free lithium metal battery（文献里常见的缩写）
 ]
 
-#: 「富锂锰基」正极体系的证据词 —— **只用于保底的体系闸门**（见 ``KEEP_RULES``），
-#: 不参与加分。分工是：``BONUS_RULES`` 只认「无负极」这一个方向，
-#: 体系在保底那边是"资格条件"（无负极 **且** 体系对口才保底）。
+#: 「富锂锰基」正极体系的证据词 —— **只用于保底的体系闸门**（见主题的 ``keep``，
+#: 单方向模式见 ``KEEP_RULES``），不参与加分。分工是：加分规则只认「无负极」这一个
+#: 方向，体系在保底那边是"资格条件"（无负极 **且** 体系对口才保底）。
 #:
 #: ⚠️ 这里**故意混装了体系名与机理名**（``oxygen redox`` / ``voltage decay`` 等）。
 #:    原先只放体系名，理由是「钠电层状正极也讲阴离子氧化还原，机理词区分不开两种体系」。
@@ -423,11 +430,11 @@ BONUS_RULES: list[dict] = [
         # 而期刊加成最高也就 +9（大子刊），AI 分满打满算 100 —— +10 足以把
         # 一篇「AI 只给了 55 分」的无负极论文顶到能和顶刊论文并排的位置。
         #
-        # ⚠️ 这里**故意不加体系闸门**（与下面的 ``KEEP_RULES`` 不同）：
+        # ⚠️ 这里**故意不加体系闸门**（与主题的 ``keep`` 不同）：
         #   加分只管排序，管不了入选；能进到排序这一步的论文已经过了 AI 阈值，
         #   而 AI 是看着「富锂锰 / 钠电」的判据打的分。锂硫之类的无负极论文
         #   就算蹭到 +10 也得先过 AI 那一关，加闸门反而会漏掉一些体系写法陌生的
-        #   好论文。真正需要闸门的是"免阈值 + 置顶"那一层，见下面 KEEP_RULES。
+        #   好论文。真正需要闸门的是"免阈值 + 置顶"那一层，见下面主题的 keep。
         "label": "无负极",
         "score": 10,
         "any": ANODE_FREE_TERMS,
@@ -439,12 +446,13 @@ BONUS_RULES: list[dict] = [
 #: 和 ``BONUS_RULES`` 的区别（很容易混，务必分清）：
 #:   * ``BONUS_RULES`` 只管**排序**，不管入选 —— 加再多分，AI 分没过
 #:     ``AI_THRESHOLD`` 照样进不了邮件。
-#:   * ``KEEP_RULES`` 管**入选**：命中就强制进邮件，AI 分再低也留。
+#:   * ``keep`` 管**入选**：命中就强制进邮件，AI 分再低也留。
 #:
 #: 为什么需要它：无负极构型的论文经常以"电解液设计/工程"为主题（例如 JACS 那篇
 #: 《Data-Driven Knowledge Discovery Reveals Quantitative Electrolyte Design Rules
 #: for Anode-Free Sodium Metal Batteries》，DOI ``10.1021/jacs.6c05130``），
-#: 而「电解液工程」是 ``EXCLUDE_RULES`` 里的硬剔除项 —— 在**还没进 AI 打分**时
+#: 而「电解液工程」是富锂锰 / 钠离子正极主题 ``exclude`` 里的硬剔除项 ——
+#: 在**还没进 AI 打分**时
 #: 就被丢掉了，加分规则根本来不及生效。老板要盯的方向不能这样丢，所以单开这一层。
 #:
 #: 另有一条**AI 侧保底**（口径见 ``AI_ANODE_FREE_HINT``）：AI 从摘要里判定"这篇就是
@@ -460,22 +468,43 @@ BONUS_RULES: list[dict] = [
 #:    形状：``[[短语, 短语], [短语]]`` —— 组之间是 **AND**（每一组都必须满足），
 #:    组内是 **OR**（任一命中即可）。等价于 all 的多选一版本。
 #:    ``all`` 表达不了"A 或 B 至少命中一个"，而保底恰恰需要：
-#:    无负极 **且**（富锂锰 **或** 钠电）。
+#:    无负极 **且** 富锂锰（钠电主题则是 无负极 **且** 钠电）。
 #: 其余字段与 ``BONUS_RULES`` 相同，只是 ``score`` 无意义（可省略）。
+#
+# ★ 保底规则是**主题自己的**（见下面 ``RESEARCH_TOPICS`` 里的 ``keep``）：
+#   富锂锰正极主题挂 ``ANODE_FREE_LI_RICH_KEEP``（只认富锂锰），
+#   两个钠电主题挂 ``ANODE_FREE_SODIUM_KEEP``（只认钠电）。
+#   这样富锂锰的无负极论文不会被强推进钠电主题的邮件，反过来也一样。
+#   下面的 ``KEEP_RULES`` 只是**单方向模式**（``RESEARCH_TOPICS`` 为空）的默认规则，
+#   多主题模式下不参与 —— 主题写什么就按什么保底，没写就不保底。
+#
+# label 只写方向名：邮件卡片/日志会自己在前面加「硬保底 · 」，
+# 写进来会变成「硬保底 · 无负极（硬保底）」。
+ANODE_FREE_LI_RICH_KEEP: dict = {
+    "label": "无负极",
+    "score": 0,
+    "any": ANODE_FREE_TERMS,
+    # ★ 体系闸门：命中无负极之后还必须命中富锂锰体系证据词。
+    #   没有它的话，"摘要里顺口提一句无负极"的锂硫/其它体系论文也会被置顶
+    #   （真实事故见 ANODE_FREE_KEEP_CATHODES 上面的注释）。
+    "require": [LMR_CATHODE_TERMS],
+}
+
+ANODE_FREE_SODIUM_KEEP: dict = {
+    "label": "无负极",
+    "score": 0,
+    "any": ANODE_FREE_TERMS,
+    "require": [SODIUM_CATHODE_TERMS],
+}
+
 KEEP_RULES: list[dict] = [
     {
-        # label 只写方向名：邮件卡片/日志会自己在前面加「硬保底 · 」，
-        # 写进来会变成「硬保底 · 无负极（硬保底）」。
         "label": "无负极",
         "score": 0,
         "any": ANODE_FREE_TERMS,
         # ★ 体系闸门：只放**一组**是有意的 —— 富锂锰 **或** 钠电，命中之一即可。
-        #   没有它的话，"摘要里顺口提一句无负极"的锂硫/其它体系论文也会被置顶
-        #   （真实事故见 ANODE_FREE_KEEP_CATHODES 上面的注释）。
+        #   单方向模式没有"主题"可挂，只能两种体系都认。
         "require": [ANODE_FREE_KEEP_CATHODES],
-        # 「无负极钠电」主题有自己的保底（只认钠电），见该主题的 keep。
-        # 不豁免的话，富锂锰的无负极论文会被这条全局保底强推进钠电邮件。
-        "skip_topics": ["无负极钠电"],
     },
 ]
 
@@ -485,70 +514,61 @@ KEEP_RULES: list[dict] = [
 #:    原因：摘要是 AI 生成的浓缩文本，"electrolyte additive" 这类词在**相关论文**里
 #:    也经常作为对比组出现，按摘要剔除会误杀。而这样的"漏网之鱼"本来就会被 AI 打低分，
 #:    所以宁可漏掉也不误杀。确实想看摘要就显式写 ``"scope": "all"``。
-EXCLUDE_RULES: list[dict] = [
-    {
-        "label": "电解液工程",
-        "score": 0,
-        # 在「无负极钠电」主题里**不生效**：那个主题专门研究无负极钠电的
-        # 电解液工程，把它硬剔除掉等于把要盯的方向整片删掉。
-        # 其它主题（富锂锰 / 钠离子正极）照旧剔除。
-        "skip_topics": ["无负极钠电"],
-        "any": [
-            "electrolyte additive",
-            "electrolyte additives",
-            "electrolyte formulation",
-            "electrolyte engineering",
-            "electrolyte optimization",
-            "electrolyte design",
-            "solvation structure",
-            "solvent molecule",
-            "high concentration electrolyte",
-            "localized high concentration",
-            "electrolyte solvent",
-        ],
-        # 固态体系不误伤：命中这些词就放行
-        "unless": [
-            "solid state",
-            "all solid state",
-            "solid electrolyte",
-            "inorganic electrolyte",
-            "polymer electrolyte",
-        ],
-    },
-    {
-        "label": "隔膜改性",
-        "score": 0,
-        "any": [
-            "separator modification",
-            "modified separator",
-            "separator coating",
-            "coated separator",
-            "functional separator",
-            "separator design",
-            "separator engineering",
-            "ceramic coated separator",
-            "separator for",
-        ],
-    },
-]
+#
+# ★ 剔除规则同样是**主题自己的**（见 ``RESEARCH_TOPICS`` 里的 ``exclude``）：
+#   * 电解液工程：富锂锰 / 钠离子正极主题剔除；
+#     「无负极钠电」主题**不挂** —— 那个主题正是要盯电解液工程，
+#     挂上去等于把要盯的方向整片删掉；
+#   * 隔膜改性：三个主题都剔除。
+#   下面的 ``EXCLUDE_RULES`` 只是**单方向模式**的默认规则（两条都挂）。
+ELECTROLYTE_ENGINEERING_EXCLUDE: dict = {
+    "label": "电解液工程",
+    "score": 0,
+    "any": [
+        "electrolyte additive",
+        "electrolyte additives",
+        "electrolyte formulation",
+        "electrolyte engineering",
+        "electrolyte optimization",
+        "electrolyte design",
+        "solvation structure",
+        "solvent molecule",
+        "high concentration electrolyte",
+        "localized high concentration",
+        "electrolyte solvent",
+    ],
+    # 固态体系不误伤：命中这些词就放行
+    "unless": [
+        "solid state",
+        "all solid state",
+        "solid electrolyte",
+        "inorganic electrolyte",
+        "polymer electrolyte",
+    ],
+}
 
-#: 全局排除说明。会拼进**每个主题**给 AI 看的描述里，让 AI 也避开这些方向。
-#: （与上面的 EXCLUDE_RULES 互补：那一条管"硬剔除"，这一句管"AI 打分时别给高分"。）
-#:
-#: ⚠️ 末尾那句例外是必需的：无负极构型的论文常常正是"电解液工程"，
-#:    如果不告诉 AI，AI 会照着"不看电解液工程"给低分、并写一段负面的理由 ——
-#:    那样硬保底虽然还能把它捞进邮件，但卡片上的解读和理由是反的。
-#: ⚠️ 例外里的"体系条件"也必须写上：这条例外只对富锂锰 / 钠电成立，
-#:    写漏了 AI 会把锂硫之类的无负极论文也当成本课题的例外而给高分。
-GLOBAL_EXCLUDE_NOTE = (
-    "不看电解液工程（液态电解液添加剂 / 溶剂化结构 / 配方优化）与隔膜改性；"
-    "不计入凝胶电解质。"
-    "**例外：涉及无负极构型（anode-free / anodeless / hostless / zero-excess、"
-    "负极过量≈0、直接在裸集流体上沉积）的论文，只要正极是富锂锰基或钠电体系，"
-    "一律保留并给高分，即使它属于电解液工程** —— 这是重点关注方向。"
-    "⚠️ 无负极是**电芯构型**，常常并不是论文的研究重点，标题里可能一个字都没写，"
-    "请从摘要所描述的电芯结构自行判断，不要只在标题里找关键词。"
-)
+SEPARATOR_EXCLUDE: dict = {
+    "label": "隔膜改性",
+    "score": 0,
+    "any": [
+        "separator modification",
+        "modified separator",
+        "separator coating",
+        "coated separator",
+        "functional separator",
+        "separator design",
+        "separator engineering",
+        "ceramic coated separator",
+        "separator for",
+    ],
+}
+
+EXCLUDE_RULES: list[dict] = [ELECTROLYTE_ENGINEERING_EXCLUDE, SEPARATOR_EXCLUDE]
+
+#: ⚠️ 剔除 / 保底**不写进 AI 提示词**：它们是本地规则（:mod:`src.content_rules`），
+#:    在送 AI 之前/之后生效。提示词里只放主题名、描述与关键词（见 ``ResearchTopic.brief``）。
+#:    把「不看电解液工程」「无负极例外」这类规则塞进提示词，只会让 AI 的打分
+#:    和本地规则互相打架 —— 尤其当某个主题恰恰要看电解液工程时。
 
 #: 让 AI 自己判断"是不是无负极构型"的口径（拼进给 AI 的提示词）。
 #:
@@ -612,16 +632,10 @@ def validate_rule_list(rules: object, group_name: str) -> list[str]:
         patterns = [str(p).strip() for p in (rule.get("any") or []) if str(p).strip()]
         if not patterns:
             problems.append(f'{label} 缺少非空的 "any"（命中列表）→ 这条规则永远不会生效')
-        for key in ("all", "unless", "skip_topics"):
+        for key in ("all", "unless"):
             value = rule.get(key)
             if value is not None and not isinstance(value, (list, tuple)):
                 problems.append(f'{label} 的 "{key}" 必须是列表')
-            elif key == "skip_topics" and value is not None:
-                if not all(isinstance(item, str) and item.strip() for item in value):
-                    problems.append(
-                        f'{label} 的 "skip_topics" 必须是主题名/键的字符串列表'
-                        "（写错名字 = 这条豁免永远不生效）"
-                    )
         # "require" 是"必须命中"的短语**组**：每组内 OR、组之间 AND，
         # 形状比 all/unless 深一层，少写一层方括号（把组写成字符串）会让规则**永远不命中**，
         # 而这正是本项目最怕的失效方式（静默丢文献），所以形状要一条条查。
@@ -795,10 +809,16 @@ TOPICS: dict[str, str] = {}
 #   key          选填。状态文件里的分区键，默认等于 name。
 #                    ⚠️ **改了 name 就会换一个新分区** → 该主题会被当成首次运行（30 天预热），
 #                       旧记录留在旧分区里不再生效。想改名又不想重跑，把 key 填成旧 name。
-#   bonuses      选填。**只对这个主题生效**的内容加分（写法同上面的 BONUS_RULES）。
+#   bonuses      选填。**只对这个主题生效**的内容加分（写法同上面的 BONUS_RULES）；
+#                全局 BONUS_RULES 仍然叠加（加分只管排序）。
 #   exclude      选填。**只对这个主题生效**的剔除规则（写法同上面的 EXCLUDE_RULES）。
+#                ⚠️ 多主题模式下**全局 EXCLUDE_RULES 不参与**：主题写什么就剔什么，
+#                   没写就什么都不剔。这样「无负极钠电」不挂电解液工程，别的主题照挂。
 #   keep         选填。**只对这个主题生效**的硬保底规则（写法同上面的 KEEP_RULES）。
-#                    全局的 BONUS_RULES / EXCLUDE_RULES / KEEP_RULES 仍然照常生效，这里是叠加。
+#                全局 KEEP_RULES 同样不参与（富锂锰主题不该把钠电无负极论文强推进去）。
+#   keep_systems 选填。AI 侧保底认可的体系（KEEP_CATHODE_SYSTEMS 的键）。
+#                富锂锰主题写 ["li-rich-mn"]，两个钠电主题写 ["sodium"]。
+#                空 = 不限制（只建议单方向模式或测试用）。
 #
 # 当前启用：三个方向（想回到单方向就把 RESEARCH_TOPICS 改回 []）
 #
@@ -878,6 +898,11 @@ RESEARCH_TOPICS: list[dict] = [
             "关注电压衰减、阴离子氧化还原、氧释放、表面重构等机理问题。"
             "不含磷酸铁锂 / 三元 NCM / 富镍等其它正极体系。"
         ),
+        # 本主题自己的剔除 / 保底规则。多主题模式下全局那两张表不参与，
+        # 所以必须在这里写清楚：不看电解液工程与隔膜改性；无负极 **且** 富锂锰才保底。
+        "exclude": [ELECTROLYTE_ENGINEERING_EXCLUDE, SEPARATOR_EXCLUDE],
+        "keep": [ANODE_FREE_LI_RICH_KEEP],
+        "keep_systems": ["li-rich-mn"],
     },
     {
         "name": "钠离子正极",
@@ -889,7 +914,7 @@ RESEARCH_TOPICS: list[dict] = [
         #   另加几条高精度词兜住层状氧化物 / 普鲁士蓝的其它写法。
         # ⚠️ 钠电方向必然会捞到硬碳负极、电解液、隔膜类论文 ——
         #    交给第 2 层处理：AI 打分（description 里已写明「只看正极」）
-        #    + EXCLUDE_RULES（电解液工程 / 隔膜改性）。
+        #    + 本主题 exclude（电解液工程 / 隔膜改性）。
         "search_terms": [
             "sodium-ion",
             "sodium ion",
@@ -931,8 +956,7 @@ RESEARCH_TOPICS: list[dict] = [
             "只看钠离子电池**正极**材料：层状过渡金属氧化物（P2/O3 型）、"
             "普鲁士蓝类似物、聚阴离子化合物。关注相变与循环稳定性、空气/水分稳定性、"
             "阴离子氧化还原、Na+ 扩散动力学。不含硬碳等负极、不含电解液与隔膜工作。"
-            "**例外：涉及无负极构型（anode-free / 负极过量≈0 / 直接在裸集流体上沉积）"
-            "的钠电论文一律保留并给高分，即使它做的是电解液工程**。"
+            "无负极（anode-free）钠电的电解液与集流体工作归入「无负极钠电」主题。"
         ),
         # 层状钠离子正极是本主题的重点方向，额外加分
         "bonuses": [
@@ -954,6 +978,10 @@ RESEARCH_TOPICS: list[dict] = [
                 "all": ["sodium"],
             },
         ],
+        # 保底只认钠电：富锂锰的无负极论文不会出现在钠电主题的邮件里。
+        "exclude": [ELECTROLYTE_ENGINEERING_EXCLUDE, SEPARATOR_EXCLUDE],
+        "keep": [ANODE_FREE_SODIUM_KEEP],
+        "keep_systems": ["sodium"],
     },
     {
         "name": "无负极钠电",
@@ -1013,29 +1041,13 @@ RESEARCH_TOPICS: list[dict] = [
             "电解液工程（溶剂化结构、弱溶剂化溶剂、添加剂、SEI 设计）、集流体与界面改性"
             "（亲钠 sodiophilic 涂层、Cu/Al 集流体、3D 集流体、人工界面层）、"
             "钠沉积/剥离与库仑效率、贫电解液与 Ah 级实用电芯。"
-            "**电解液工程与集流体界面改性在本主题里是核心内容，不是排除项**。"
             "不含锂/锌/钾等其它金属体系；不含钠离子电池正极材料研究（另有主题）；不含隔膜改性。"
         ),
-        # 本主题自己的硬保底：无负极构型 **且** 钠电体系。
-        # 全局 KEEP_RULES 已被 skip_topics 豁免，换成这条更窄的闸门：
-        # 富锂锰的无负极论文不会再被强推进钠电邮件。
-        "keep": [
-            {
-                "label": "无负极钠电",
-                "any": ANODE_FREE_TERMS,
-                "require": [SODIUM_CATHODE_TERMS],
-            },
-        ],
-        # 覆盖全局的「不看电解液工程」：本主题正是要盯它。
-        # 全局说明里那句「无负极例外」本来就是为这类论文写的，但主句仍会把 AI
-        # 往「电解液工程 -> 低分」带，所以这里整段替换。
-        "exclude_note": (
-            "本主题**专门关注无负极钠电**，所以「电解液工程」在这里**不是排除项**："
-            "溶剂化结构、弱溶剂化 / 高浓电解液、添加剂、SEI 设计、集流体亲钠改性、"
-            "钠沉积/剥离与库仑效率都属于核心内容，请正常给高分。"
-            "仍然不看：隔膜改性；锂 / 锌 / 钾等其它金属体系；钠离子电池正极材料（另有主题）；"
-            "以及只研究钠离子电解液、与钠金属 / 无负极无关的工作。"
-        ),
+        # ★ 本主题是唯一**不挂**「电解液工程」剔除规则的主题：电解液工程正是核心内容。
+        #   只剔隔膜改性；保底只认钠电（富锂锰的无负极论文不会流进来）。
+        "exclude": [SEPARATOR_EXCLUDE],
+        "keep": [ANODE_FREE_SODIUM_KEEP],
+        "keep_systems": ["sodium"],
     },
 ]
 
@@ -1054,15 +1066,17 @@ class ResearchTopic:
     title: str = ""
     #: 去重状态文件里的分区键。默认等于 name，改了 name 又想沿用旧记录时手工指定。
     key: str = ""
-    #: 只对本主题生效的内容加分 / 剔除规则（全局的 BONUS_RULES / EXCLUDE_RULES 照常叠加）。
+    #: 只对本主题生效的内容加分（全局 BONUS_RULES 仍然叠加 —— 加分只管排序）。
     bonuses: list[dict] = field(default_factory=list)
+    #: 只对本主题生效的剔除规则。多主题模式下**全局 EXCLUDE_RULES 不参与**：
+    #: 主题写什么就剔什么，没写就什么都不剔。
     exclude: list[dict] = field(default_factory=list)
-    #: 只对本主题生效的硬保底规则（全局的 KEEP_RULES 照常叠加）。
+    #: 只对本主题生效的硬保底规则。全局 KEEP_RULES 同样不参与。
     keep: list[dict] = field(default_factory=list)
-    #: 覆盖全局 ``GLOBAL_EXCLUDE_NOTE``（拼进 AI 提示词的「不看什么」）。
-    #: 空 = 用全局那句。专门看电解液工程的主题必须覆盖，否则 AI 会照着
-    #: 「不看电解液工程」给低分，跟主题描述自相矛盾。
-    exclude_note: str = ""
+    #: AI 侧保底认可的体系（``KEEP_CATHODE_SYSTEMS`` 的键）。
+    #: AI 判定「无负极 + 体系对口」时只有落在这一组里才会保底 ——
+    #: 否则富锂锰主题会把 AI 判出的钠电无负极论文也强推进去。空 = 不限制。
+    keep_systems: list[str] = field(default_factory=list)
     #: 本主题的期刊范围（config.JOURNALS 里的刊名）。空 = 全部期刊。
     journals: list[str] = field(default_factory=list)
     #: 本主题启用的数据源。空 = config.DATA_SOURCES。
@@ -1083,6 +1097,9 @@ class ResearchTopic:
         self.keywords = [str(word).strip() for word in self.keywords if str(word).strip()]
         self.journals = [str(name).strip() for name in self.journals if str(name).strip()]
         self.sources = [str(name).strip() for name in self.sources if str(name).strip()]
+        self.keep_systems = [
+            str(system).strip() for system in self.keep_systems if str(system).strip()
+        ]
 
     @property
     def email_title(self) -> str:
@@ -1107,12 +1124,8 @@ class ResearchTopic:
             lines.append(self.description.strip())
         if self.keywords:
             lines.append("关注关键词：" + "、".join(self.keywords))
-        # 全局排除说明（在文件顶部配置）——让 AI 打分时也避开这些方向。
-        # 主题可以用 exclude_note 整段覆盖（例如「无负极钠电」主题要把
-        # 「不看电解液工程」换成「电解液工程是核心内容」）。
-        note = (self.exclude_note or GLOBAL_EXCLUDE_NOTE or "").strip()
-        if note:
-            lines.append(note)
+        # ⚠️ 剔除 / 保底规则**不写进这里**：它们是本地规则（src/content_rules），
+        #    在送 AI 之前/之后生效。写进提示词只会让 AI 的打分和规则打架。
         return "\n".join(lines)
 
 
@@ -1136,6 +1149,10 @@ def _legacy_topic() -> ResearchTopic:
         keywords=list(USER_KEYWORDS),
         description=RESEARCH_DESCRIPTION,
         topics=dict(TOPICS),
+        # 单方向模式的默认规则：全局那两张表就是为它准备的。
+        exclude=list(EXCLUDE_RULES),
+        keep=list(KEEP_RULES),
+        keep_systems=list(KEEP_CATHODE_SYSTEMS),
     )
 
 
@@ -1167,7 +1184,7 @@ def active_research_topics() -> list[ResearchTopic]:
             bonuses=[rule for rule in (item.get("bonuses") or []) if isinstance(rule, dict)],
             exclude=[rule for rule in (item.get("exclude") or []) if isinstance(rule, dict)],
             keep=[rule for rule in (item.get("keep") or []) if isinstance(rule, dict)],
-            exclude_note=str(item.get("exclude_note") or ""),
+            keep_systems=[str(system) for system in (item.get("keep_systems") or [])],
             journals=[str(name) for name in (item.get("journals") or [])],
             sources=[str(name) for name in (item.get("sources") or [])],
             lookback_days=_int_or_zero(item.get("lookback_days")),
@@ -1663,6 +1680,12 @@ def _topic_warnings(mode: str, view: ResearchTopic) -> list[str]:
     problems.extend(validate_rule_list(view.bonuses, f"主题「{view.name}」的 bonuses"))
     problems.extend(validate_rule_list(view.exclude, f"主题「{view.name}」的 exclude"))
     problems.extend(validate_rule_list(view.keep, f"主题「{view.name}」的 keep"))
+    for system in view.keep_systems:
+        if system not in KEEP_CATHODE_SYSTEMS:
+            problems.append(
+                f'主题「{view.name}」的 keep_systems 里有不认识的体系 {system!r}：'
+                f'只能是 {"、".join(KEEP_CATHODE_SYSTEMS)}（写错 = AI 侧保底永远不生效）'
+            )
     return problems
 
 

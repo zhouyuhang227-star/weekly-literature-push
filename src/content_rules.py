@@ -8,20 +8,27 @@
 ``AI_THRESHOLD``。这样"蹭到热词"或"发在顶刊"的论文不会被硬塞进邮件，
 只是在同样相关时排得更靠前。
 
-**唯一能改变"入选"的是保底**（``config.KEEP_RULES`` + 主题自己的 ``keep``，
-外加一条 AI 侧保底 :func:`ai_keep_hit`），见下面第三个方向。
+**唯一能改变"入选"的是保底**（主题自己的 ``keep`` + 一条 AI 侧保底
+:func:`ai_keep_hit`），见下面第三个方向。
+
+规则属于**主题**，不属于全局
+--------------------------
+多主题模式下，剔除 / 保底**只读该主题自己的 ``exclude`` / ``keep``**；
+``config.EXCLUDE_RULES`` / ``config.KEEP_RULES`` 只是**单方向模式**的默认值。
+这样「无负极钠电」可以不挂「电解液工程」而其它主题照挂，互不串味。
+（加分是例外：全局 ``BONUS_RULES`` 与主题 ``bonuses`` 叠加 —— 加分只管排序。）
 
 三个方向
 --------
 * **加分**（``config.BONUS_RULES`` + 主题自己的 ``bonuses``）
   命中就加分，如「固态电池 +1」「无负极 +10」。默认在 **标题 + 摘要** 上匹配
   （摘要里提到同样算数，宁滥勿缺 —— 反正只是排序）。
-* **剔除**（``config.EXCLUDE_RULES`` + 主题自己的 ``exclude``）
+* **剔除**（主题自己的 ``exclude``；单方向模式用 ``config.EXCLUDE_RULES``）
   命中就直接丢出链路，**不进 AI 打分**（省钱），也不进邮件。
   默认**只看标题**：摘要是浓缩文本，"electrolyte additive" 这种词在**相关论文**里
   也常作为对比组出现，按摘要剔除会误杀；而漏掉的无关论文本来就会被 AI 打低分。
   确实想看摘要，在规则里显式写 ``"scope": "all"``。
-* **硬保底**（``config.KEEP_RULES`` + 主题自己的 ``keep``）
+* **硬保底**（主题自己的 ``keep``；单方向模式用 ``config.KEEP_RULES``）
   命中就**强制进邮件**，且**免于上面所有剔除规则**。
   还有一条**AI 侧保底**（:func:`ai_keep_hit`）走的是同一条通道：
   AI 从摘要里判定"这篇就是无负极、而且正极是富锂锰/钠电"时同样强推。
@@ -33,10 +40,11 @@
 --------------------
 有些方向是"无论怎么判都要看"的（例如老板指定要盯的无负极构型）。
 而这类论文常常正好撞在剔除规则上 —— 无负极钠电论文很多以「电解液设计/工程」
-为主题，直接命中 ``EXCLUDE_RULES`` 里的「电解液工程」，在**还没进 AI 打分**时
+为主题，直接命中主题 ``exclude`` 里的「电解液工程」，在**还没进 AI 打分**时
 就被丢掉了，加分规则根本来不及生效。只在 ``unless`` 里打补丁也不够：
 那只能免掉**一条**剔除规则，而且免完仍要过 ``AI_THRESHOLD``，
-而 AI 恰恰被告知"不看电解液工程"。所以单开这一层。
+而这类论文恰恰常常不像"正极材料"，AI 给分偏低。所以单开这一层。
+（规则是**本地**的，不会写进 AI 提示词 —— 见 ``ResearchTopic.brief``。）
 
 匹配细节
 --------
@@ -120,7 +128,8 @@ def _hit_required(text: str, groups: object) -> bool:
     """``groups`` 是"必须命中"的短语**组**列表：**每一组**都要命中，组内任意一个即可。
 
     ``all`` 表达不了"A 或 B 至少命中一个"，而保底恰恰需要：
-    无负极 **且**（富锂锰 **或** 钠电）。见 ``config.KEEP_RULES`` 的 ``require``。
+    无负极 **且** 富锂锰（钠电主题则是 无负极 **且** 钠电）。
+    见主题 ``keep`` 的 ``require``（单方向模式见 ``config.KEEP_RULES``）。
     形状写错（例如组写成了字符串）只会"永远不命中"，所以 ``config.validate_rule_list``
     会专门查它。
     """
@@ -167,7 +176,7 @@ def _matching_rules(work: dict, rules: list[dict], default_scope: str) -> list[d
 
 
 # ---------------------------------------------------------------------------
-# 规则集合（全局 + 当前主题）
+# 规则集合（主题自己的；全局表只服务单方向模式）
 # ---------------------------------------------------------------------------
 def bonus_rules(topic=None) -> list[dict]:
     """本轮生效的加分规则：全局的 + 该主题自己的（``score <= 0`` 的会被跳过）。"""
@@ -185,60 +194,30 @@ def bonus_rules(topic=None) -> list[dict]:
     return rules
 
 
-def _skipped_by_topic(rule: dict, topic) -> bool:
-    """规则是否用 ``skip_topics`` 声明了在本主题不生效。
-
-    主题名与分区键都比对，避免改了 key 之后豁免静默失灵。
-    """
-    skip_keys = {
-        str(getattr(topic, "key", "") or "").strip(),
-        str(getattr(topic, "name", "") or "").strip(),
-    } - {""}
-    skip = {str(item).strip() for item in (rule.get("skip_topics") or []) if str(item).strip()}
-    if not (skip & skip_keys):
-        return False
-    log.debug(
-        "规则「%s」在主题「%s」里被 skip_topics 豁免",
-        rule.get("label") or "内容",
-        getattr(topic, "name", ""),
-    )
-    return True
-
-
 def exclusion_rules(topic=None) -> list[dict]:
-    """本轮生效的剔除规则：全局的 + 该主题自己的。
+    """本轮生效的剔除规则。
 
-    全局规则可以用 ``skip_topics`` 声明「在哪些主题里不生效」——
-    例如「电解液工程」对「无负极钠电」主题失效（那个主题正是要盯它）。
+    **规则属于主题**：给了 ``topic`` 就**只**用该主题自己的 ``exclude``，
+    不与全局表合并 —— 否则「无负极钠电」会被别的主题的「电解液工程」误剔。
+    只有 ``topic`` 为空（单方向模式 / 工具调用）才退回 ``config.EXCLUDE_RULES``。
     """
-    rules = [
-        rule
-        for rule in (config.EXCLUDE_RULES or [])
-        if isinstance(rule, dict) and not _skipped_by_topic(rule, topic)
-    ]
     if topic is not None:
-        rules += [rule for rule in (getattr(topic, "exclude", None) or []) if isinstance(rule, dict)]
-    return rules
+        return [rule for rule in (getattr(topic, "exclude", None) or []) if isinstance(rule, dict)]
+    return [rule for rule in (config.EXCLUDE_RULES or []) if isinstance(rule, dict)]
 
 
 def keep_rules(topic=None) -> list[dict]:
-    """本轮生效的硬保底规则：全局的 + 该主题自己的。
+    """本轮生效的硬保底规则。
 
-    与 ``bonus_rules`` 不同，这里**不过滤 score**：保底规则本来就
-    不靠分数起作用（它是入选开关，不是排序权重）。
+    与 ``bonus_rules`` 不同，这里**不过滤 score**：保底规则不靠分数起作用
+    （它是入选开关，不是排序权重）。
 
-    全局保底也可以用 ``skip_topics`` 让位给主题自己的保底：
-    全局那条的体系闸门是「富锂锰 **或** 钠电」，对「无负极钠电」主题
-    会把富锂锰的无负极论文也强推进去；该主题换成只认钠电的保底。
+    和剔除一样：**只读主题自己的 ``keep``**，全局表仅用于 ``topic`` 为空时。
+    这样富锂锰主题的保底（只认富锂锰）不会把钠电主题的论文强推进去，反之亦然。
     """
-    rules = [
-        rule
-        for rule in (config.KEEP_RULES or [])
-        if isinstance(rule, dict) and not _skipped_by_topic(rule, topic)
-    ]
     if topic is not None:
-        rules += [rule for rule in (getattr(topic, "keep", None) or []) if isinstance(rule, dict)]
-    return rules
+        return [rule for rule in (getattr(topic, "keep", None) or []) if isinstance(rule, dict)]
+    return [rule for rule in (config.KEEP_RULES or []) if isinstance(rule, dict)]
 
 
 def _score_of(rule: dict) -> int:
@@ -301,15 +280,19 @@ def is_kept(work: dict, topic=None) -> bool:
     return bool(keep_matched(work, topic))
 
 
-def ai_keep_hit(work: dict) -> str | None:
+def ai_keep_hit(work: dict, topic=None) -> str | None:
     """AI 判定「无负极 + 体系对口」时返回保底理由，否则 ``None``。
 
-    这是**关键词保底之外的补充**（是一条独立的保底通道，与 ``KEEP_RULES`` 并列）。
+    这是**关键词保底之外的补充**（一条独立的保底通道，与主题的 ``keep`` 并列）。
     为什么需要：``ANODE_FREE_TERMS`` 只能做字面匹配，而"是不是无负极"经常要靠读懂
     **电芯构型**才能判断（「裸 Cu 集流体」「负极过量≈0」）—— 那类论文的关键词可能
     一个都不命中。AI 本来就通读了摘要（口径见 ``config.AI_ANODE_FREE_HINT``），
-    让它顺手判一下即可：判为无负极 **且** 正极体系是富锂锰/钠电 → 视同命中保底
+    让它顺手判一下即可：判为无负极 **且** 正极体系对口 → 视同命中保底
     （免 AI 阈值 + 置顶），且解读里会点名「无负极」。
+
+    ⚠️ 体系范围按**主题**收窄（``topic.keep_systems``）：富锂锰主题只认
+    ``li-rich-mn``，钠电主题只认 ``sodium`` —— 否则 AI 判出的钠电无负极论文
+    会被富锂锰主题强推进去。``topic`` 为空时不过滤（单方向/工具调用）。
 
     ⚠️ 前提是那篇论文**过了剔除、并且已经送给 AI 打过分**：被剔除规则丢掉的论文
     根本走不到 AI，AI 也就没机会捞它 —— 那条路仍然只能靠关键词保底兜。
@@ -319,6 +302,14 @@ def ai_keep_hit(work: dict) -> str | None:
     system = str(work.get("cathode_system") or "").strip().lower()
     label = config.KEEP_CATHODE_SYSTEMS.get(system)
     if not label:
+        return None
+    allowed = [str(item).strip() for item in (getattr(topic, "keep_systems", None) or [])]
+    if allowed and system not in allowed:
+        log.debug(
+            "AI 判定无负极（体系 %s）不在主题「%s」的 keep_systems 里，不保底",
+            system,
+            getattr(topic, "name", ""),
+        )
         return None
     return f"无负极（AI 判定 · {label}）"
 

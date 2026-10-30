@@ -71,7 +71,7 @@ TOPIC_FIELDS = {
     "search_terms",
     "keywords",
     "description",
-    "exclude_note",
+    "keep_systems",
     "journals",
     "sources",
     "lookback_days",
@@ -101,7 +101,7 @@ def _default_topic(topic: config.ResearchTopic) -> dict:
         "search_terms": list(topic.search_terms),
         "keywords": list(topic.keywords),
         "description": topic.description,
-        "exclude_note": topic.exclude_note,
+        "keep_systems": list(topic.keep_systems),
         "journals": list(topic.journals),
         "sources": list(topic.sources),
         "lookback_days": topic.lookback_days,
@@ -218,6 +218,15 @@ def validate_plan(data) -> list[str]:
             if field in item:
                 _as_rules(item.get(field), f"{label} 的 {field}", problems)
 
+        if "keep_systems" in item:
+            systems = _as_str_list(item.get("keep_systems"), f"{label} 的 keep_systems", problems)
+            for system in systems:
+                if system not in config.KEEP_CATHODE_SYSTEMS:
+                    problems.append(
+                        f"{label} 的 keep_systems 里有不认识的体系 {system!r}"
+                        f"（只能是 {'、'.join(config.KEEP_CATHODE_SYSTEMS)}）"
+                    )
+
         for field in ("lookback_days", "lookback_days_first_run"):
             if field in item:
                 _as_int(
@@ -285,7 +294,7 @@ def _topic_from_dict(item: dict) -> config.ResearchTopic:
         search_terms=[str(term) for term in (item.get("search_terms") or [])],
         keywords=[str(word) for word in (item.get("keywords") or [])],
         description=str(item.get("description") or ""),
-        exclude_note=str(item.get("exclude_note") or ""),
+        keep_systems=[str(system) for system in (item.get("keep_systems") or [])],
         topics=dict(item.get("topics") or {}),
         title=str(item.get("title") or ""),
         key=str(item.get("key") or ""),

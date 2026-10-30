@@ -657,8 +657,8 @@ def evaluate_works(
     若不记录这些已判定过的文献，下周它们会被原封不动地重新打分一遍。
 
     **硬保底（两条通道）**：
-      * 命中 ``config.KEEP_RULES``（或主题自己的 ``keep``）的论文，无论分数
-        多低都进"入选"，**并且**即使 AI 调用失败也照样入"入选"（分数记 0）——
+      * 命中所属主题的 ``keep``（单方向模式为 ``config.KEEP_RULES``）的论文，
+        无论分数多低都进"入选"，**并且**即使 AI 调用失败也照样入"入选"（分数记 0）——
         这是"老板要盯的方向不能丢"的最后一层保险，代价最大可以接受。
       * AI 自己在摘要里判定"这篇就是无负极、而且正极是富锂锰/钠电"时同样直接入"入选"
         （免阈值、后面会被置顶）。关键词表只能做字面匹配，而"是不是无负极"经常
@@ -762,7 +762,7 @@ def _partition_forced(
             keyword_forced += 1
         else:
             # 第二条保底通道：关键词一个都没命中，但 AI 从摘要里读出了「无负极」。
-            reason = content_rules.ai_keep_hit(work)
+            reason = content_rules.ai_keep_hit(work, topic)
             if reason:
                 ai_forced.append((reason, work))
         if reason:

@@ -326,7 +326,7 @@ def _wrap(body: str, run_date: str, meta_line: str, title: str | None = None) ->
     <p style="{_STYLE['footer']}">
       本邮件由 GitHub Actions 自动生成。期刊范围、关键词与评分规则可在仓库 <code>src/config.py</code> 中调整。<br>
       排序规则：最终分 = AI 相关性分 + 期刊档次加成（正刊/大子刊/Joule/小子刊/JACS/Angew/AM）+ 内容加分；加成只影响排序，不改变入选线。<br>
-      例外：命中 <code>KEEP_RULES</code> 的论文免于剔除规则与 AI 入选线，并置顶展示。<br>
+      例外：命中所属主题 <code>keep</code> 规则的论文免于剔除规则与 AI 入选线，并置顶展示。<br>
       邮件正文中所有字段均已做 HTML 转义，DOI 链接指向 doi.org 官方解析。
     </p>
   </div>
