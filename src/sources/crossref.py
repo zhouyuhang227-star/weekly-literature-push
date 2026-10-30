@@ -25,9 +25,10 @@
    没有按 ISSN 关联到 Crossref 的期刊记录里）。该刊只能由 OpenAlex 覆盖，
    这里会记一条 INFO 说明，**不静默**。
 3. **有些刊 Crossref 不给摘要**（实测 Joule 0/100 条带 abstract，Nature Energy
-   8/100，而 Wiley 系刊 91/100）。对这几本刊，本地复核只能看到标题，反而会误杀
-   「标题不含字面词但确实是本主题」的论文 ⇒ 名单里的刊**记录无摘要时不做复核**，
-   交由 AI 阈值兜底（``config.CROSSREF_TITLE_ONLY_JOURNALS``）。放宽的条数会记 INFO。
+   8/100，而 Wiley 系刊 91/100）。对**没有摘要的记录**，本地复核只能看到标题，
+   反而会误杀「标题不含字面词但摘要完全对口」的论文 ⇒ 这类记录一律放行、
+   交给 AI 的双阈值兜底（无摘要的论文走更低的 ``AI_THRESHOLD_TITLE_ONLY``）。
+   有摘要的记录照旧严格复核。放行的条数会记 INFO。
 """
 
 from __future__ import annotations
@@ -185,7 +186,15 @@ def _fetch_one(
     journal: str, issn: str, query: str, iso_from: str, rows: int,
     terms: list[str], checkable: list[str],
 ) -> tuple[list[dict], int, int, int]:
-    """查一本刊。返回 ``(复核通过的 work, 被复核剔除的条数, 原始条数, 放宽的条数)``。"""
+    """查一本刊。返回 ``(复核通过的 work, 有摘要却被剔除的条数, 原始条数, 无摘要仅凭标题的条数)``。
+
+    ★ 复核的判定口径改了：**按"这条记录有没有摘要"分，而不是"这本刊给不给摘要"**。
+    以前只有 ``CROSSREF_TITLE_ONLY_JOURNALS`` 里的 3 本刊能放宽，其余刊里
+    偶发缺摘要的记录照样被标题复核剔掉 —— 那些论文的标题往往是不含召回词的
+    通用写法（"High-Voltage Cathodes for Lithium Batteries"），但摘要完全对口，
+    等于被静默漏掉。现在凡是无摘要的记录都交由 AI 判断（AI 有双阈值兜底，
+    且标题类论文走的是更低的阈值），有摘要的照旧严格复核。
+    """
     params: dict[str, object] = {
         "filter": f"from-pub-date:{iso_from},type:journal-article",
         "query.title": query,
@@ -197,26 +206,23 @@ def _fetch_one(
         params["mailto"] = config.CROSSREF_MAILTO
 
     items = _request_works(journal, issn, params)
-    # ★ 这几本刊 Crossref 常不给摘要，复核只能看到标题（见 config 里的实测数据）。
-    #   标题不含字面词但确实是本主题的论文会被误杀 ⇒ 这种残缺判据不如交给 AI。
-    title_only = journal in config.CROSSREF_TITLE_ONLY_JOURNALS
 
     works: list[dict] = []
     dropped = 0
-    relaxed = 0
+    title_only = 0
     for item in items:
         work = _to_work(item, journal, issn)
         if work is None:
             continue
         if checkable and not matches_recall_terms(work, terms):
-            # 只有「该刊偶发缺摘要」才放宽；这条恰好有摘要时复核是完整的，照旧剔。
-            if title_only and not (work.get("abstract") or "").strip():
-                relaxed += 1
+            if not (work.get("abstract") or "").strip():
+                # 没有摘要 ⇒ 本地只能看标题，误杀风险高，宁可多花一次 AI 调用
+                title_only += 1
             else:
                 dropped += 1
                 continue
         works.append(work)
-    return works, dropped, len(items), relaxed
+    return works, dropped, len(items), title_only
 
 
 def fetch(
@@ -224,9 +230,13 @@ def fetch(
     lookback_days: int,
     max_works: int | None = None,
     notes: list[str] | None = None,
+    journals: dict[str, str] | None = None,
     **_ignored,
 ) -> list[dict]:
-    """按 15 本刊逐刊检索并汇总（并发）。
+    """按期刊范围逐刊检索并汇总（并发）。
+
+    ``journals`` 是已经解析好的 ``{刊名: ISSN}``（主题限定范围），
+    为空表示 ``config.JOURNALS`` 全集。
 
     ``max_works`` 只用于日志提示 —— 真正的总量截断在聚合器里统一做，
     否则各源各截一段会让合并结果难以预测。
@@ -250,7 +260,10 @@ def fetch(
         datetime.date.today() - datetime.timedelta(days=max(1, int(lookback_days)))
     ).isoformat()
     query = _or_query(terms)
-    journals = list(config.JOURNALS.items())
+    scope = journals or config.JOURNALS
+    journals = list(scope.items())
+    if not journals:
+        raise RuntimeError("Crossref 的期刊范围是空的 —— 请检查主题的 journals 配置")
 
     # 本地复核能否生效，取决于召回词的长度（见 base.usable_terms）。
     checkable = usable_terms(terms)
@@ -269,8 +282,8 @@ def fetch(
     errors: list[str] = []
     failed_journals: list[str] = []
     empty: list[str] = []
-    relaxed_journals: list[str] = []
-    relaxed_total = 0
+    title_only_journals: list[str] = []
+    title_only_total = 0
 
     with ThreadPoolExecutor(
         max_workers=max(1, int(config.CROSSREF_CONCURRENCY))
@@ -284,7 +297,7 @@ def fetch(
         for future in as_completed(futures):
             journal = futures[future]
             try:
-                got, dropped, raw, relaxed = future.result()
+                got, dropped, raw, title_only = future.result()
             except Exception as exc:  # noqa: BLE001 - 单刊失败不该拖垮整轮
                 log.warning("Crossref 查询《%s》失败：%s", journal, exc)
                 errors.append(f"{journal}（{exc}）")
@@ -293,12 +306,12 @@ def fetch(
             works.extend(got)
             if raw == 0:
                 empty.append(journal)
-            if relaxed:
-                relaxed_total += relaxed
-                relaxed_journals.append(f"{journal} {relaxed} 条")
+            if title_only:
+                title_only_total += title_only
+                title_only_journals.append(f"{journal} {title_only} 条")
             log.debug(
-                "Crossref《%s》：取回 %s 条 → 复核后 %s 条（剔除 %s 条，放宽 %s 条）",
-                journal, raw, len(got), dropped, relaxed,
+                "Crossref《%s》：取回 %s 条 → 复核后 %s 条（剔除 %s 条，无摘要放行 %s 条）",
+                journal, raw, len(got), dropped, title_only,
             )
 
     if errors and len(errors) == len(journals):
@@ -324,12 +337,12 @@ def fetch(
             "关联进 Crossref，该刊只能由 OpenAlex 覆盖）",
             len(empty), "、".join(empty),
         )
-    if relaxed_total:
-        # 放宽复核是**主动降低筛选强度**，必须留痕，否则又成了静默降级。
+    if title_only_total:
+        # 放行无摘要记录是**主动降低本地复核强度**，必须留痕，否则又成了静默降级。
         log.info(
-            "Crossref 有 %s 条命中因「该刊不给摘要、复核只能看标题」而放宽：%s"
-            "（这几本刊已在 config.CROSSREF_TITLE_ONLY_JOURNALS 里，交由 AI 阈值兜底）",
-            relaxed_total, "、".join(relaxed_journals),
+            "Crossref 有 %s 条命中没有摘要、标题里也没出现召回词，已放行交由 AI 判断：%s"
+            "（这几本刊 Crossref 常不给摘要，纯标题复核会误杀；AI 会用「仅标题」阈值兜底）",
+            title_only_total, "、".join(title_only_journals),
         )
 
     log.info("Crossref 命中 %s 条（本地复核后）", len(works))

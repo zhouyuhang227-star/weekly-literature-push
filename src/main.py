@@ -46,6 +46,7 @@ import traceback
 
 from . import (
     abstract_source,
+    ai_cache,
     ai_matcher,
     config,
     content_rules,
@@ -53,11 +54,13 @@ from . import (
     mailer,
     openalex_client,
     pdf_report,
+    plan,
     ranking,
     sources,
 )
 from .config import (
-    AI_THRESHOLD,
+    AI_THRESHOLD_TITLE_ONLY,
+    AI_THRESHOLD_WITH_ABSTRACT,
     ATTACH_PDF_MAX_ITEMS,
     ISSN_FILTER,
     LOOKBACK_DAYS,
@@ -97,7 +100,10 @@ def build_parser() -> argparse.ArgumentParser:
             "  python -m src.main --topic 富锂锰正极 --dry-run\n"
             "  python -m src.main --no-ai --to me@example.com\n"
             "  python -m src.main --find-topic \"perovskite solar cell\"\n"
-            "\n多个主题只需在 src/config.py 的 RESEARCH_TOPICS 里加一项，本文件无需改动。\n"
+            "  python -m src.main --write-plan    # 导出可编辑的检索方案\n"
+            "  python -m src.main --show-plan     # 校验并查看最终生效的方案\n"
+            "\n检索范围（期刊 / 召回词 / 数据源 / 时间窗 / 阈值）优先读 data/search_plan.json，\n"
+            "没有该文件时回退到 src/config.py。\n"
         ),
     )
     parser.add_argument(
@@ -137,9 +143,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--threshold",
         type=int,
-        default=AI_THRESHOLD,
+        default=None,
         metavar="N",
-        help=f"AI 相关性评分阈值，低于此值不展示（默认 {AI_THRESHOLD}）",
+        help=(
+            "覆盖「有摘要」论文的 AI 入选线"
+            f"（默认按主题 / 全局：{AI_THRESHOLD_WITH_ABSTRACT}）。"
+            "不传时无摘要论文走另一档更低的线"
+        ),
+    )
+    parser.add_argument(
+        "--threshold-title-only",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "覆盖「无摘要（仅标题）」论文的 AI 入选线"
+            f"（默认 {AI_THRESHOLD_TITLE_ONLY}）。"
+            "摘要缺失时 AI 给分天然偏低，所以这一档更低"
+        ),
     )
     parser.add_argument(
         "--retrieval-mode",
@@ -187,6 +208,27 @@ def build_parser() -> argparse.ArgumentParser:
             "不跑主流程，只打印「这一轮靠什么召回、靠什么打分」然后退出（纯离线，不联网）。"
             "改完 config.py 拿不准改动生效在哪一层时先跑它"
         ),
+    )
+    parser.add_argument(
+        "--show-plan",
+        action="store_true",
+        help=(
+            "不跑主流程，只校验并打印最终生效的检索方案"
+            "（data/search_plan.json；不存在则用 config 的默认方案）。改完方案先跑它"
+        ),
+    )
+    parser.add_argument(
+        "--write-plan",
+        action="store_true",
+        help=(
+            "把当前默认方案写成 data/search_plan.json，之后可以直接编辑这个文件"
+            "调整期刊范围 / 召回词 / 时间窗 / 阈值，而不必改代码"
+        ),
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="配合 --write-plan 使用：覆盖已存在的方案文件（会丢掉手改内容）",
     )
     parser.add_argument(
         "--sources",
@@ -261,6 +303,52 @@ def find_topic(query: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# --show-plan / --write-plan 辅助命令
+# ---------------------------------------------------------------------------
+def show_plan() -> int:
+    """离线校验并打印最终生效的检索方案。"""
+    data, from_file = plan.load_plan()
+    topics = plan.effective_topics()
+    print()
+    print("检索方案 · 可编辑的检索范围")
+    print("-" * 68)
+    print(f"  方案文件    {plan.plan_path() if from_file else '（不存在，暂用 config 生成的默认方案）'}")
+    print(f"  主题        {plan.describe(data)}")
+    for index, topic in enumerate(topics, start=1):
+        with_abstract, title_only = topic.effective_thresholds()
+        print()
+        print(f"  {index}. {topic.name}（去重分区键 {topic.key}）")
+        print(
+            f"     期刊范围    {len(config.journals_for(topic.journals))} 本"
+            f"{'（主题限定：' + '、'.join(topic.journals) + '）' if topic.journals else '（全部）'}"
+        )
+        print(
+            "     数据源      "
+            + ("、".join(topic.sources) or "（全部 config.DATA_SOURCES）")
+        )
+        print(
+            f"     时间窗      常规 {topic.effective_lookback(False)} 天 / "
+            f"首次 {topic.effective_lookback(True)} 天"
+        )
+        print(f"     AI 入选线   有摘要 ≥ {with_abstract} / 仅标题 ≥ {title_only}")
+        print(f"     召回词      {list(topic.search_terms) or '（空 → 退回 keywords）'}")
+    print("-" * 68)
+    print("  想改期刊范围 / 召回词 / 时间窗 / 阈值 → 直接编辑 data/search_plan.json")
+    print("  0 或空列表 = 用 config.py 的全局默认值；改完再跑一次本命令校验")
+    print()
+    return 0
+
+
+def write_plan(overwrite: bool = False) -> int:
+    """把当前默认方案导出成可编辑的 JSON。"""
+    path = plan.write_plan(overwrite=overwrite)
+    print(f"\n已写入检索方案：{path}")
+    print("  现在可以直接编辑它来调整检索范围（期刊 / 召回词 / 数据源 / 时间窗 / 阈值）。")
+    print("  改完运行 python -m src.main --show-plan 校验。\n")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # --show-config 辅助命令
 # ---------------------------------------------------------------------------
 def show_config(args: argparse.Namespace) -> int:
@@ -277,12 +365,14 @@ def show_config(args: argparse.Namespace) -> int:
     print()
     print("文献推送 · 生效配置（离线查看，未联网）")
     print("-" * 68)
+    plan_data, from_file = plan.load_plan()
     print(
         f"  主题            {len(topics)} 个"
-        f"（来源：{'RESEARCH_TOPICS' if config.RESEARCH_TOPICS else '单方向 RESEARCH_FIELD 等'}，"
+        f"（来源：{plan.plan_path() if from_file else 'config.RESEARCH_TOPICS / 单方向 RESEARCH_FIELD'}，"
         "每个主题一封邮件、各记各的已推送记录）"
     )
     for index, topic in enumerate(topics, start=1):
+        with_abstract, title_only = topic.effective_thresholds()
         print(f"  {index}. {topic.name}")
         print(f"     邮件标题    {topic.email_title}")
         print(f"     TOPIC_QUERY {topic.topic_query!r}")
@@ -296,11 +386,21 @@ def show_config(args: argparse.Namespace) -> int:
             "   ← 第 2 层「给 AI 看的语义线索」"
         )
         print(f"     补充说明    {topic.description.strip() or '（未设置）'}")
+        print(
+            f"     期刊范围    {len(config.journals_for(topic.journals))} 本"
+            f"{'（限定：' + '、'.join(topic.journals) + '）' if topic.journals else '（全部）'}"
+        )
+        print(f"     数据源      {'、'.join(topic.sources) or '（全部）'}")
+        print(
+            f"     时间窗      常规 {topic.effective_lookback(False)} 天 / "
+            f"首次 {topic.effective_lookback(True)} 天"
+        )
+        print(f"     AI 入选线   有摘要 ≥ {with_abstract} / 仅标题 ≥ {title_only}")
         print(f"     主题加分    {content_rules.describe_bonuses(topic)}")
         print(f"     主题剔除    {content_rules.describe_excludes(topic)}")
         print(f"     主题保底    {content_rules.describe_keeps(topic)}")
         print(f"     去重分区键  {topic.key}")
-    print(f"  期刊            {len(ISSN_FILTER.split('|'))} 本")
+    print(f"  期刊            {len(ISSN_FILTER.split('|'))} 本（全局登记表）")
     try:
         active = sources.enabled_sources(getattr(args, "sources", None))
         source_text = " + ".join(sources.source_label(name) for name in active)
@@ -312,7 +412,8 @@ def show_config(args: argparse.Namespace) -> int:
         f"（最多拉取 {MAX_WORKS_FETCH} 篇）"
     )
     print(
-        f"  AI 入选线       ≥ {AI_THRESHOLD} 分，单封最多展示 "
+        f"  AI 入选线       ≥ {AI_THRESHOLD_WITH_ABSTRACT} 分（有摘要）/ "
+        f"≥ {AI_THRESHOLD_TITLE_ONLY} 分（仅标题），单封最多展示 "
         f"首次 {MAX_EMAIL_ITEMS_FIRST_RUN} 篇 / 之后 {MAX_EMAIL_ITEMS} 篇"
     )
     print(f"  排序规则        {ranking.describe()}")
@@ -346,7 +447,9 @@ def show_config(args: argparse.Namespace) -> int:
         for problem in problems:
             print(f"  ⚠️  {problem}")
     print("-" * 68)
-    print("  想换「能搜到什么」        → keyword 模式改 RESEARCH_TOPICS[].search_terms（短词，OR 并联）")
+    print("  想换「检索范围」          → 编辑 data/search_plan.json（期刊 / 召回词 / 数据源 / 时间窗 / 阈值）")
+    print("                              没有这个文件时先跑 python -m src.main --write-plan")
+    print("  想换「能搜到什么」        → keyword 模式改 search_terms（短词，OR 并联）")
     print("                              topic 模式改 topic_query（必须短且通用，否则解析为 0 会直接报错）")
     print("  想换「搜到的里面留下什么」 → 改 RESEARCH_TOPICS[].keywords / description")
     print("  想换「期刊权重」          → 改 JOURNAL_TIERS（顺序即权重顺序）")
@@ -368,8 +471,8 @@ def _safe_filename(name: str) -> str:
 
 
 def _select_topics(args: argparse.Namespace) -> list[config.ResearchTopic]:
-    """根据 ``--topic`` 选出本轮要跑的主题；不传则全部。"""
-    topics = config.active_research_topics()
+    """本轮要跑的主题：``data/search_plan.json`` 优先，否则用 ``config``；``--topic`` 再筛。"""
+    topics = plan.effective_topics()
     wanted = [str(name).strip() for name in (getattr(args, "topic", None) or []) if str(name).strip()]
     if not wanted:
         return topics
@@ -450,6 +553,12 @@ def run(args: argparse.Namespace) -> int:
     # ---- 1. 配置校验（快速失败，只需校验一次）----
     validate_env(require_ai=not args.no_ai, require_mail=not args.dry_run)
 
+    # AI 打分的跨周缓存：同一篇论文的提示词没变时不重复花钱。
+    # dry-run 只读不写（它承诺「完全无副作用」）。
+    cache = None if args.no_ai else ai_cache.load()
+    if cache is not None:
+        log.info("【AI 缓存】%s（%s）", ai_cache.stats(cache), config.AI_CACHE_FILE)
+
     recipients = (
         [addr.strip() for addr in args.to.replace(";", ",").split(",") if addr.strip()]
         if args.to
@@ -461,12 +570,18 @@ def run(args: argparse.Namespace) -> int:
     for index, topic in enumerate(topics, start=1):
         try:
             stats.append(
-                run_topic(topic, args, run_date, keywords, recipients, index=index, total=len(topics))
+                run_topic(
+                    topic, args, run_date, keywords, recipients,
+                    index=index, total=len(topics), cache=cache,
+                )
             )
         except Exception as exc:  # 一个主题挂掉不该连累其它主题
             log.error("主题「%s」运行失败：%s", topic.name, exc)
             log.debug("详细堆栈：\n%s", traceback.format_exc())
             failures.append(topic.name)
+
+    if cache is not None and not args.dry_run:
+        ai_cache.save(cache)
 
     _log_overall(stats, failures, len(topics), dry_run=args.dry_run)
     if failures:
@@ -486,6 +601,7 @@ def run_topic(
     *,
     index: int = 1,
     total: int = 1,
+    cache: dict | None = None,
 ) -> dict:
     """跑一个主题的完整链路：检索 → 去重 → 摘要 → AI 打分 → 加权排序 → 发信 → 回写状态。"""
     mode = args.retrieval_mode
@@ -499,12 +615,22 @@ def run_topic(
     if args.lookback_days is not None:
         lookback_days = args.lookback_days
     else:
-        lookback_days = LOOKBACK_DAYS_FIRST_RUN if first_run else LOOKBACK_DAYS
+        # 主题可以在方案文件里单独定时间窗；0 = 用全局默认
+        lookback_days = topic.effective_lookback(first_run)
+    with_abstract, title_only = ai_matcher.resolve_thresholds(
+        getattr(args, "threshold", None),
+        getattr(args, "threshold_title_only", None),
+        topic,
+    )
     log.info(
         "%s时间窗：近 %s 天（%s）",
         prefix,
         lookback_days,
         "首次运行预热" if first_run else "常规滚动",
+    )
+    log.info(
+        "%sAI 入选线：有摘要 ≥ %s / 仅标题 ≥ %s（摘要缺失时 AI 给分天然偏低）",
+        prefix, with_abstract, title_only,
     )
 
     # 展示上限：首次预热窗（90 天）候选远多于常规轮，用 20 篇会把大量相关文献直接
@@ -526,7 +652,8 @@ def run_topic(
         max_works=args.max_fetch,
         mode=mode,
         topic=topic,
-        sources=getattr(args, "sources", None),
+        # 命令行 > 主题自己的 sources > config.DATA_SOURCES
+        sources=getattr(args, "sources", None) or (topic.sources or None),
     )
     works = fetched.works
     total_candidates = len(works)
@@ -565,7 +692,12 @@ def run_topic(
         selected = list(fresh)
     else:
         selected, ai_failed, rejected = ai_matcher.evaluate_works(
-            fresh, keywords=keywords, threshold=args.threshold, topic=topic
+            fresh,
+            keywords=keywords,
+            topic=topic,
+            threshold=with_abstract,
+            threshold_title_only=title_only,
+            cache=cache,
         )
 
     # ---- 6.5 加权排序：最终分 = AI 分 + 期刊档次加成 + 内容规则加成 ----
@@ -809,6 +941,12 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging(verbose=args.verbose)
 
     try:
+        if args.write_plan:
+            return write_plan(args.force)
+
+        if args.show_plan:
+            return show_plan()
+
         if args.show_config:
             return show_config(args)
 

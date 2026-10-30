@@ -1,12 +1,17 @@
 # 顶刊文献自动推送机器人
 
-每周五晚自动检索 15 本材料/能源/化学顶刊的最新论文，用 AI 判断是否与**你配置的研究方向**
-相关，只把真正相关的文献整理成中文周报邮件发到你的邮箱。
+每周五晚自动检索 **24 本**材料/能源/化学顶刊（含 5 本综述顶刊）的最新论文，
+用 AI 判断是否与**你配置的研究方向**相关，只把真正相关的文献整理成中文周报邮件发到你的邮箱。
 
 > 🚀 **第一次用？** 直接看 [部署到 GitHub（完整流程）](#部署到-github完整流程)
 > —— 从装 Git 到收到第一封邮件，6 步走完，全程约 20 分钟。
 
-> **换课题只需改 `src/config.py` 里的一段配置**（`RESEARCH_TOPICS`，或单方向时的
+> **检索范围优先改 `data/search_plan.json`**（`--write-plan` 生成）：召回词、期刊范围、
+> 数据源、时间窗、AI 入选线、加分/剔除/保底规则全在里面，改完 `--show-plan` 校验。
+> 没有这个文件时按 `src/config.py` 的 `RESEARCH_TOPICS` 运行。
+> 详见 [检索方案](#search-plan)。
+>
+> 换课题也可以直接改 `src/config.py`（`RESEARCH_TOPICS`，或单方向时的
 > `RESEARCH_FIELD` / `RESEARCH_DESCRIPTION` / `USER_KEYWORDS` / `TOPIC_QUERY`），代码不用动。
 > 详见 [如何换研究方向](#如何换研究方向)。
 
@@ -18,7 +23,7 @@
 
 | 层级 | 手段 | 作用 | 实测候选量 |
 |---|---|---|---|
-| 第 1 层 | **多源字面短词召回**（OpenAlex + Crossref + Semantic Scholar，三源各自查完后按 DOI 合并） | 按研究方向捞出**可能相关**的全部论文 | 首次 90 天窗下两个主题各约 70～110 篇；常规 14 天窗约 20～60 篇 |
+| 第 1 层 | **多源字面短词召回**（OpenAlex + Crossref + Semantic Scholar，三源各自查完后按 DOI 合并） | 按研究方向捞出**可能相关**的全部论文 | 首次 90 天窗下两个主题各约 150～250 篇；常规 45 天窗约 80～180 篇（24 本刊，随召回词数量变化较大） |
 | 第 2 层 | AI 逐篇打分（0–100），低于阈值丢弃 | 按**你的具体兴趣**做精读判断 | ~20 篇入选（首次预热 50 篇） |
 
 > 第 1 层也可以用 OpenAlex 的**语义主题** `topics.id`（`--retrieval-mode topic`），
@@ -29,12 +34,13 @@
 
 入选后的**排序**叠两层加成：`最终分 = AI 相关性分 + 期刊档次加成 + 内容规则加成`
 
-- **期刊档次加成**：正刊 +12 > 大子刊 +9 > Joule +7 > 小子刊 +5 > JACS +4 > Angew +3 > AM +2 > 其他 +0
+- **期刊档次加成**：正刊 +12 > 综述顶刊 +10 > 大子刊 +9 > Joule +7 ≈ 综述名刊 +7 > 小子刊 +5 >
+  JACS +4 > Angew +3 > AM +2 = AEM +2 > 其他 +0
 - **内容规则加成**（按关键词命中，只看标题+摘要）：固态电池 +1 ｜ 固态聚合物电解质 +1 ｜
   无负极 **+10** ｜ 层状钠离子正极 +2（仅「钠离子正极」主题）
 
-> 两种加成**只管排序，不管入选** —— 是否进邮件依旧只看 AI 分数是否过 `AI_THRESHOLD`。
-> 详见 [内容规则](#内容加权bonus_rules--exclude_rules)。
+> 两种加成**只管排序，不管入选** —— 是否进邮件依旧只看 AI 分数是否过入选线
+> （**有摘要 60 / 只有标题 35**）。详见 [内容规则](#内容加权bonus_rules--exclude_rules)。
 
 还有一条**硬保底**（`KEEP_RULES`）：命中即**强制进邮件**，
 **免于所有剔除规则、也免于 AI 入选线**，并排到最前。
@@ -66,7 +72,8 @@
 .
 ├── .github/workflows/weekly_push.yml   # 定时任务（每周五 23:07 北京时间）
 ├── src/
-│   ├── config.py                       # ★所有"可能要改"的参数（研究方向、期刊、阈值、数据源）
+│   ├── config.py                       # 基础设施：期刊登记表 / 默认阈值 / 邮件与 PDF 参数
+│   ├── plan.py                         # ★检索方案 data/search_plan.json（主题级召回/期刊/阈值/规则）
 │   ├── logger.py                       # 日志初始化（时区正确、幂等）
 │   ├── sources/                        # ★多数据源层（三源并集）
 │   │   ├── __init__.py                 #   调度：全查 → 合并 → 去重 → 单源失败不影响其余
@@ -74,9 +81,10 @@
 │   │   ├── openalex.py                 #   主源适配器
 │   │   ├── crossref.py                 #   Crossref 适配器（按 ISSN 逐刊查 + 本地复核）
 │   │   └── semantic_scholar.py         #   Semantic Scholar 适配器（单次 bulk 查询 + 自带限流）
-│   ├── openalex_client.py              # 第 1 层召回：拼查询 + 分页 + 解析 + 主题解析
+│   ├── openalex_client.py              # 第 1 层召回：拼查询 + 分页 + 索引滞后补漏 + 主题解析
 │   ├── abstract_source.py              # 摘要三级回退：OpenAlex → Crossref → S2
-│   ├── ai_matcher.py                   # 第 2 层：AI 并发打分 + 稳健 JSON 解析
+│   ├── ai_matcher.py                   # 第 2 层：AI 并发打分（双阈值）+ 备用端点 + 熔断 + 节流
+│   ├── ai_cache.py                     # AI 打分缓存（同主题同摘要不重复花钱）
 │   ├── content_rules.py                # 内容加分 / 剔除规则 / 硬保底（固态、无负极、层状钠…）
 │   ├── ranking.py                      # 期刊档次 + 内容加分 → 最终分排序
 │   ├── authors.py                      # 「一作 + 一通讯」显示名（只有 OpenAlex 给通讯作者）
@@ -84,9 +92,11 @@
 │   ├── dedup.py                        # DOI 去重 + 运行状态持久化（按主题分区）
 │   ├── mailer.py                       # HTML 渲染 + SMTP 发送（含 PDF 附件）
 │   └── main.py                         # 主流程编排（多主题循环）+ 命令行
-├── tests/test_core.py                  # 341 个单元测试（锁定高风险修复）
+├── tests/test_core.py                  # 344 个单元测试（锁定高风险修复）
 ├── data/
-│   ├── pushed_dois.json                # 去重状态（唯一需要提交的文件）
+│   ├── pushed_dois.json                # 去重状态（必须提交）
+│   ├── search_plan.json                # 可选：检索方案（--write-plan 生成，不入库）
+│   ├── ai_cache.json                   # AI 打分缓存（已 gitignore，自动重建）
 │   ├── topics_cache.json               # 语义主题解析缓存（已 gitignore，自动重建）
 │   ├── logs/                           # 运行日志（已 gitignore，Actions 里传 artifact）
 │   └── outbox/                         # --dry-run 生成的 HTML 预览（已 gitignore）
@@ -95,6 +105,47 @@
 ├── requirements.txt
 └── README.md
 ```
+
+---
+
+## 检索方案 `data/search_plan.json`（改检索范围先看这里）
+
+<a id="search-plan" name="search-plan"></a>
+
+「检索范围」= 每个主题召回哪些词、只搜哪些刊、用哪些数据源、回看多少天、
+AI 入选线多少、加分 / 剔除 / 保底规则。这些现在都在**一个 JSON 文件**里，
+不用再翻 `src/config.py` 的上千行。
+
+```bash
+python -m src.main --write-plan     # 把当前生效的默认方案写成 data/search_plan.json
+python -m src.main --show-plan      # 校验并打印最终生效的方案（离线，不联网）
+python -m src.main --dry-run -v     # 按新方案跑一轮预览
+```
+
+文件结构（`_comment` 是给人看的，程序忽略）：
+
+| 字段 | 作用 | 默认 |
+|---|---|---|
+| `search_terms` | 第 1 层召回词（短词，OR 并联） | 主题自带的召回词 |
+| `keywords` / `description` | 第 2 层 AI 的打分尺 | 同上 |
+| `journals` | **只搜这些刊**（空 = `config.JOURNALS` 全部 24 本） | 空 |
+| `sources` | 本轮用哪些数据源（空 = 三个全开） | 空 |
+| `lookback_days` | 常规回看天数（0 = 45 天） | 0 |
+| `lookback_days_first_run` | 首次预热窗口（0 = 90 天） | 0 |
+| `threshold_with_abstract` | 有摘要的入选线（0 = 60） | 0 |
+| `threshold_title_only` | 只有标题的入选线（0 = 35） | 0 |
+| `bonuses` / `exclude` / `keep` | 加分 / 剔除 / 硬保底规则（空 = 全局默认） | 空 |
+
+几个刻意的设计：
+
+- **`0` 和空列表一律表示「用 `config.py` 的全局默认值」**，所以全局默认改了，方案文件不用跟着改。
+- **文件不存在也能跑**：按 `config.RESEARCH_TOPICS` 生成同样的默认方案，行为与以前一致。
+- **文件损坏会直接报错**，不会静默退回默认方案 —— 悄悄改变检索范围比报错更危险。
+- 字段名拼错、期刊名不在 `JOURNALS` 里、数据源写错、`threshold_title_only` 高于
+  `threshold_with_abstract`，`--show-plan` 都会逐一指出来。
+- 想重新生成一份默认方案：`--write-plan --force`（**会覆盖手改内容**）。
+- `data/search_plan.json` 默认**不入库**：它是一份「本地覆盖」，留在仓库里容易和
+  `config.py` 形成两个真相源。要团队共享时再手动提交即可。
 
 ---
 
@@ -200,7 +251,7 @@ git push -u origin main
 > 一旦把 `.env` 推上去，密钥就泄露了 —— **而且即使删掉文件，它依然留在 git 历史里**，
 > 只能靠重写历史或删库重建来补救。
 >
-> 正常应该只看到这些（约 15 个文件）：
+> 正常应该只看到这些（约 17 个文件）：
 > `.github/workflows/weekly_push.yml`、`.gitignore`、`README.md`、`requirements.txt`、
 > `requests.md`、`src/*.py`、`tests/test_core.py`、`data/pushed_dois.json`
 
@@ -230,6 +281,9 @@ git push -u origin main
 | `AI_BASE_URL` | ✅ | OpenAI 兼容端点 | `https://api.deepseek.com/v1` |
 | `AI_API_KEY` | ✅ | AI 平台的 API Key | `sk-xxxxxxxx` |
 | `AI_MODEL` | ✅ | 模型名 | `deepseek-chat` |
+| `AI_BACKUP_BASE_URL` | 可选 | 备用 AI 端点（主端点连续失败 3 次后自动切换） | `https://api.openai.com/v1` |
+| `AI_BACKUP_API_KEY` | 可选 | 备用端点密钥（不填则不会切换） | `xxxxxxxx` |
+| `AI_BACKUP_MODEL` | 可选 | 备用端点模型名（留空沿用 `AI_MODEL`） | `gpt-4o-mini` |
 | `SMTP_HOST` | ✅ | 发信服务器 | `smtp.qq.com` |
 | `SMTP_PORT` | ✅ | 端口（465 走 SSL，587/25 走 STARTTLS，脚本自动选择） | `465` |
 | `SMTP_USER` | ✅ | 发信邮箱账号 | `you@qq.com` |
@@ -316,12 +370,15 @@ python -m src.main [选项]
 | `--retrieval-mode X` | 第 1 层召回方式：`keyword`（**默认**，主题 `search_terms` 字面短词，粒度准）/ `topic`（OpenAlex 语义主题，粒度粗）/ `both`（并集） |
 | `--sources LIST` | 本轮启用哪些数据源，逗号分隔（默认 `config.DATA_SOURCES` = 三个全开）。例：`--sources openalex` 只跑主源（请求最少）；`--sources crossref,s2` 只用备用源（排查主源时用）。简写 `oa` / `cr` / `s2` 均可 |
 | `--force-first-run` | 强制按首次运行处理（用 90 天预热窗） |
-| `--lookback-days N` | 临时覆盖时间窗天数，如 `--lookback-days 90` 回补三个月 |
+| `--lookback-days N` | 临时覆盖时间窗天数（默认：首次 90、之后 45），如 `--lookback-days 90` 回补三个月 |
 | `--max-items N` | 单封邮件最多展示篇数（默认：首次 50、之后 20）；超出的部分进 PDF 附件 |
 | `--no-attachment` | 本轮不生成 PDF 附件（退回旧行为：超上限的只显示「另有 N 篇未在此展示」） |
 | `--max-fetch N` | 最多拉取候选文献数（默认 300） |
 | `--topic NAME` | 只跑指定主题（可重复，如 `--topic 富锂锰正极 --topic 钠离子正极`），匹配主题的 `name` 或 `key`；省略则跑全部 |
-| `--threshold N` | AI 相关性阈值，低于此值不展示（默认 60） |
+| `--threshold N` | **有摘要**文献的 AI 入选线（默认 60），低于此值不进邮件 |
+| `--threshold-title-only N` | **只有标题**（三个源都缺摘要）的入选线（默认 35）；高于 `--threshold` 会报错 |
+| `--show-plan` | 校验并打印本轮真正生效的检索方案（离线、不联网、不跑主流程） |
+| `--write-plan` | 把当前默认方案写成 `data/search_plan.json`；已存在时不覆盖，加 `--force` 覆盖 |
 | `--keywords "a;b"` | 临时覆盖研究方向（`keyword` 模式下会**作为召回条件**；`topic` 模式下只当 **AI 打分标准**，不参与检索） |
 | `--show-config` | 只打印「靠什么召回 / 靠什么打分」然后退出，**纯离线、不联网、不跑主流程**。改完配置拿不准改动落在哪一层时先跑它 |
 | `--find-topic [QUERY]` | 只查询 OpenAlex 语义主题、打印候选 id/名称，**不跑主流程**（省略 QUERY 则用 `config.TOPIC_QUERY`） |
@@ -335,6 +392,10 @@ python -m src.main [选项]
 # 改完 config.py 先跑这个：离线看「靠什么召回/靠什么打分」，秒出
 python -m src.main --show-config
 python -m src.main --show-config --retrieval-mode both   # 预览切到 both 之后的样子
+
+# 把当前方案导出成可编辑文件，然后只改 JSON 就能调检索范围
+python -m src.main --write-plan
+python -m src.main --show-plan          # 校验 + 看最终生效范围（离线）
 
 # 完整链路预览（需要 AI_API_KEY，不需要 SMTP）
 python -m src.main --dry-run --verbose
@@ -376,14 +437,23 @@ python -m src.main --show-config --sources openalex
 | 场景 | 时间窗 | 目的 |
 |---|---|---|
 | **首次运行**（`pushed_dois.json` 为空） | 最近 **90 天** | 一次性把积压的文献补齐，避免刚部署时收到空邮件 |
-| **之后每次** | 最近 **14 天** | 每周跑一次，14 天重叠期能兜住节假日跳过、接口抖动等漏网 |
+| **之后每次** | 最近 **45 天** | 每周跑一次，45 天重叠足够兜住节假日跳过、接口抖动、以及**出版商索引滞后** |
 
 > ⚠️ 首次窗口特意开到 90 天，是因为 **OpenAlex 对新论文的收录有滞后**：
 > 论文可能月初就在线了，进 OpenAlex 却晚几周，而 `from_publication_date` 卡的是收录到的发表日。
 > 窗口开窄（早期默认 30 天）时，刚部署那阵子会出现「我手动翻期刊网站明明有好几篇，
 > 机器人却说没有」的假象。
 >
-> 首次跑完就会把推过的 DOI 写进 `pushed_dois.json`，之后每轮只按 14 天滚动，不会重复推送。
+> 首次跑完就会把推过的 DOI 写进 `pushed_dois.json`，之后每轮按 45 天滚动，不会重复推送。
+>
+> **45 天是「不漏」与「不重复花钱」的折中**：14 天窗实测会稳定漏掉一类文献 ——
+> 论文 8 月就 online 了，但 OpenAlex / Crossref 过了三四周才建索引，等它出现时
+> 早已滑出 14 天窗。窗口内重复出现的论文由 DOI 去重挡掉，不会重复推送。
+>
+> 另外，OpenAlex 主查询之后还会做一次**建索引时间补漏**（`INDEX_CATCHUP_DAYS`，默认 21 天）：
+> 用 `from_created_date` 再查一次最近 21 天进库的论文。这个过滤字段是 OpenAlex
+> **Member 及以上套餐专享**，免费 / 匿名额度会返回 429 —— 程序会自动识别并跳过，
+> 只在日志里记一条 INFO，不影响本轮结果。
 
 可用 `--force-first-run` 或 `--lookback-days N` 临时改变。
 
@@ -453,11 +523,12 @@ DATA_SOURCES = ("openalex", "crossref", "semantic_scholar")   # 顺序即优先�
    前 71 篇全是锂金属/电解液论文（`li-rich` 被拆成了 `li` + `rich`）。
    程序会用主题的 `search_terms` 在本地的“标题+摘要”里再匹配一遍**整词**，
    不匹配的直接丢掉，并记进日志。
-   ⚠️ **但有两本刊要特殊对待**：实测 *Joule* 近半年 100 篇里 **0 篇**带 abstract，
-   *Nature Energy* 只有 8 篇（而 *Advanced Materials* 有 91 篇）。这几本刊里
-   复核退化成“只看标题”，会把标题不含字面词但确实是本主题的论文误杀。
-   所以 `config.CROSSREF_TITLE_ONLY_JOURNALS` 里的刊**在记录没有摘要时不做复核**，
-   直接交给 AI 阈值兜底，放宽条数会写成一条 INFO 日志 —— 不做静默降级。
+   ⚠️ **但「有没有摘要」要逐条看，不能按刊看**：实测 *Joule* 近半年 100 篇里
+   **0 篇**带 abstract，*Nature Energy* 只有 8 篇（而 *Advanced Materials* 有 91 篇）。
+   没有摘要时本地复核退化成“只看标题”，会把标题不含字面词但确实对口的论文误杀；
+   所以**凡是没有摘要的记录一律放行，交给 AI 双阈值兜底**（纯标题走 35 分线），
+   放行条数写成一条 INFO 日志。有摘要的记录仍严格复核 —— 不核对就会把
+   `query.title` 分词匹配的噪音整片喂给 AI。
 2. **Semantic Scholar 的期刊名不可信，一律按 DOI 前缀判定。**
    实测一篇货真价实的 *Advanced Materials* 论文（`10.1002/adma.74958`）
    被它写成 `venue = "Advances in Materials"`、`issn = "2327-2503"`；
@@ -475,7 +546,7 @@ DATA_SOURCES = ("openalex", "crossref", "semantic_scholar")   # 顺序即优先�
 | 情况 | 行为 |
 |---|---|
 | 某一个源失败（429 / 超时 / HTTP 500） | 其余源照常合并发信；邮件**页头**出现 `⚠️ 本轮有数据源不可用（OpenAlex），结果由其余数据源合并而来，可能比平时少。`；日志里记具体原因 |
-| **源成功、但某几本刊查询失败**（Crossref 逐刊查询） | 源状态仍是 `ok`，但页头会写成 `Crossref 27 篇⚠️有 1/15 本刊查询失败（Angewandte Chemie Int. Ed.）…`，另外附一条 `⚠️` 提示。**“少了一整本顶刊”必须看得见** |
+| **源成功、但某几本刊查询失败**（Crossref 逐刊查询） | 源状态仍是 `ok`，但页头会写成 `Crossref 27 篇⚠️有 1/24 本刊查询失败（Angewandte Chemie Int. Ed.）…`，另外附一条 `⚠️` 提示。**“少了一整本顶刊”必须看得见** |
 | 源只支持关键词、但本轮是 `topic` 模式 | 该源标为“未参与”并说明原因，不算失败 |
 | **所有**源都失败 | 直接 `RuntimeError` 中断该主题（Actions 变红），不发明知道不完整的邮件 |
 
@@ -553,7 +624,7 @@ Actions 变红。宁可贵主题失败，也不要「绿着跑错」。
 
 `search_terms` 是**逐字**在标题/摘要里匹配的，所以「越像论文里真会写的短词越好」。
 以「富锂锰正极」为例，30 天 / 14 本刊实测（这是当时条件下的数据；配置后来变成了
-90 天 / 15 本刊 / 三源，但下面「短词 ≫ 长短语」的结论完全不变）：
+90 天 / 24 本刊 / 三源，但下面「短词 ≫ 长短语」的结论完全不变）：
 
 | 写法 | 召回 |
 |---|---|
@@ -628,8 +699,16 @@ AI 对每篇候选返回一个 **0–100 相关性分数** + 一句话中文结�
 | 50–69 | 相邻领域，可能沾边但需人工判断，或只把该方向当作应用场景之一 |
 | 0–49 | 明显不属于该方向，或属于综述/展望/纯工程应用类内容 |
 
-低于 `AI_THRESHOLD`（默认 60）的不进邮件。摘要缺失时会把"仅有标题"这一事实
-明确告知 AI，让它自己降低置信度，而不是让程序瞎猜。
+入选线是**双阈值**，按「有没有摘要」分开：
+
+| 情况 | 默认入选线 | 为什么 |
+|---|---|---|
+| 有摘要 | **60** | 摘要足够判断，与以前一致 |
+| 只有标题（三个源都没摘要） | **35** | 新上线的 Nature / Joule 论文常几周内都没有摘要；用 60 卡等于系统性丢掉**最新的**论文，而那恰恰是最该看的 |
+
+阈值由 `config.AI_THRESHOLD_WITH_ABSTRACT` / `AI_THRESHOLD_TITLE_ONLY` 决定，
+也可以在方案文件里按主题覆盖（`threshold_with_abstract` / `threshold_title_only`）。
+摘要缺失时会把"仅有标题"这一事实明确告知 AI，让它自己降低置信度，而不是让程序瞎猜。
 
 > 提示词里也明确要求 AI **以标题+摘要实际写的内容为准，不要被期刊名影响**。
 
@@ -653,6 +732,17 @@ AI 对每篇候选返回一个 **0–100 相关性分数** + 一句话中文结�
 - 判定为「无负极 + 富锂锰/钠电」时该论文**视同命中硬保底**（免阈值 + 置顶），
   详见 [内容规则](#内容加权bonus_rules--exclude_rules)。
 
+### AI 调用的三个工程细节（不重复花钱、不怕单点故障）
+
+| 机制 | 配置 | 行为 |
+|---|---|---|
+| **打分缓存** | `data/ai_cache.json`（自动重建、已 gitignore） | 键 = 主题 + DOI + 提示词指纹 + **摘要指纹**。同一篇论文下轮再次出现（或多个源重复）直接复用结果；摘要后来补上了 → 指纹变化 → **自动重打** |
+| **备用端点** | `AI_BACKUP_BASE_URL` / `AI_BACKUP_API_KEY` / `AI_BACKUP_MODEL` | 主端点连续失败 `AI_FAILOVER_AFTER`（默认 3）次后切到备用端点；主端点恢复后再切回 |
+| **熔断 + 节流** | `AI_CIRCUIT_BREAK_AFTER`（默认 8）/ `AI_MIN_INTERVAL`（默认 0.4 秒）/ `AI_MAX_WORKERS`（默认 3） | 连续失败到 8 次本轮直接停（剩余论文按「打分失败」展示，不会静默消失）；全局最小请求间隔防 429；实测 3 并发比 6 并发更稳 |
+
+> 备用端点不配时行为与以前完全一致；三个值都只从环境变量读取，**不写进代码**。
+> 并发从 6 降到 3 不是保守 —— 实测 6 并发会被端点成片 429，重试反而更慢。
+
 ### 摘要三级回退（以及一个诚实的局限）
 
 | 级别 | 来源 | 实测命中率 |
@@ -664,7 +754,7 @@ AI 对每篇候选返回一个 **0–100 相关性分数** + 一句话中文结�
 第 2、3 级都带 **429 / 5xx 退避重试**（4xx 不重试）。为什么要重试：摘要是 AI 打分的
 主要依据，碰上一次限流这篇文献就退化成「仅看标题」，代价远高于多等几秒。
 实测 `Crossref 无摘要 … (HTTP 429)` 的诱因有两个，都已修：
-① 逐刊检索刚发完 15 本刊×100 条，紧接着 4 个线程逐篇查摘要，把礼貌池短暂打满；
+① 逐刊检索刚发完 24 本刊×100 条，紧接着 4 个线程逐篇查摘要，把礼貌池短暂打满；
 ② 这一路原来用的是 `OPENALEX_MAILTO`（只来自 `SMTP_USER`，**本地为空** ⇒
 不在礼貌池），现在统一用有内置默认值的 `CROSSREF_MAILTO`。
 
@@ -790,7 +880,7 @@ AI 打分失败时卡片会打 `AI 打分失败` 标签，且该文献仍会展�
 
 ### 改完怎么生效：一键同步到 GitHub
 
-**改什么 = 改哪里**（全部在 `src/config.py` 里，改完不用动其它任何文件）：
+**改什么 = 改哪里**（检索范围优先改 `data/search_plan.json`；基础设施参数才动 `src/config.py`）：
 
 | 想改什么 | 改哪个变量 | 属于 |
 |---|---|---|
@@ -800,17 +890,22 @@ AI 打分失败时卡片会打 `AI 打分失败` 标签，且该文献仍会展�
 | **搜到的里面留下什么**（AI 的打分尺） | **`USER_KEYWORDS`** + `RESEARCH_DESCRIPTION` | 旋钮 B |
 | 方向名（邮件标题也用它） | `RESEARCH_FIELD` | 旋钮 B |
 | **同时跑几个方向** | **`RESEARCH_TOPICS`** | — |
-| **期刊** | **`JOURNALS`** | — |
+| **期刊**（全局名单） | **`JOURNALS`**（方案文件里可用 `journals` 只给某主题限范围） | — |
 | **期刊权重**（顶刊加多少分） | **`JOURNAL_TIERS`** | — |
 | **内容加分 / 不看什么** | **`BONUS_RULES`** / **`EXCLUDE_RULES`**（或主题的 `bonuses` / `exclude`） | — |
 | **无论如何都要留的**（硬保底） | **`KEEP_RULES`**（或主题的 `keep`） | — |
-| 评分阈值 / 并发 / 时间窗 | `AI_THRESHOLD` / `AI_MAX_WORKERS` / `LOOKBACK_DAYS` | — |
+| **评分阈值 / 时间窗** | **方案文件的 `threshold_with_abstract` / `threshold_title_only` / `lookback_days`** | — |
+| 并发 / 节流 | `AI_MAX_WORKERS` / `AI_MIN_INTERVAL` | — |
 | 密钥、AI 供应商、收件人 | **GitHub Secrets**，改完即生效，**不用改代码也不用 push** | — |
 
 **推荐流程**（三步）：
 
 ```bash
-# ① 本地改 src/config.py，先确认改动落在哪一层（离线，秒出）
+# ① 只改检索范围 → 编辑 data/search_plan.json（没有就先 --write-plan）
+python -m src.main --write-plan          # 只需一次
+python -m src.main --show-plan           # 校验 + 看最终生效范围
+
+# ① 改基础设施（期刊登记表/邮件/PDF） → 改 src/config.py，再确认落在哪一层（离线，秒出）
 python -m src.main --show-config
 
 # ② 再看真实检索结果对不对，别白等一周
@@ -825,7 +920,7 @@ python -m src.main --find-topic "solid-state battery"   # 只有 topic 模式下
 `push.cmd`（实际逻辑在 `push.ps1`）会依次做 5 件事：
 
 1. 检查待提交文件，**拦住 `.env` 等敏感文件**（推上去就泄露了，而且删掉也仍留在 git 历史里）
-2. 跑全部单元测试（当前 341 个），**不通过就中止**（配置改错了根本推不上去）
+2. 跑全部单元测试（当前 344 个），**不通过就中止**（配置改错了根本推不上去）
 3. `fetch` + `rebase` ← **关键，见下方说明**
 4. `push`，失败自动重试 4 次（`github.com` 在国内时通时不通）
 5. 校验远程 commit 和本地是否一致
@@ -960,12 +1055,13 @@ TOPIC_QUERY = "perovskite solar cell"     # → 自动解析到 T10247
 （Nature、Science、Joule、Nature Energy、Adv. Mater. …）。
 如果你从固态电池换到**同一大类**内的方向（钙钛矿、催化、电化学储能…），
 这份清单仍然合适；但如果换成**计算机 / 医学 / 经济**等方向，
-15 本期刊里可能一篇相关的都没有 —— 检索结果会是空的，而不是报错。
+24 本期刊里可能一篇相关的都没有 —— 检索结果会是空的，而不是报错。
 
 另外两个建议顺手一起调：
 
-- `AI_THRESHOLD`（默认 60）：新方向的"沾边"边界不同，建议先跑
-  `--dry-run` 看 AI 打分分布，再决定阈值高低。
+- `AI_THRESHOLD_WITH_ABSTRACT` / `AI_THRESHOLD_TITLE_ONLY`（默认 60 / 35）：
+  新方向的"沾边"边界不同，建议先跑 `--dry-run` 看 AI 打分分布，再决定阈值高低。
+  （按主题调就写进方案文件的 `threshold_with_abstract` / `threshold_title_only`。）
 - `RESEARCH_DESCRIPTION`：第一轮跑完发现 AI 判错时，在这里写清"要什么/不要什么"
   比反复改关键词有效得多。
 
@@ -982,6 +1078,14 @@ JOURNALS: dict[str, str] = {
 
 ISSN 可在 [OpenAlex Sources](https://openalex.org/sources) 或期刊官网查询。
 
+> **只想让某一个主题多搜几本刊？** 不用改全局 `JOURNALS` —— 在方案文件里给该主题填
+> `journals: ["刊名", ...]`，其余主题不受影响。
+>
+> 当前全局名单是 **24 本**：原有的 15 本材料/能源/化学顶刊 + 9 本新增
+> （Advanced Energy Materials、Energy Storage Materials、Nature Reviews Materials、
+> Nature Reviews Chemistry、Chemical Reviews、Chemical Society Reviews、
+> Accounts of Chemical Research、Electrochemical Energy Reviews、Progress in Materials Science）。
+
 **新增期刊后建议顺手做两件事**（因为期刊列表现在同时喂给三个数据源）：
 
 1. 在 `JOURNAL_DOI_PATTERNS` 里为该期刊加一条 DOI 前缀（如 `"10.1002/adfm."`）。
@@ -991,10 +1095,13 @@ ISSN 可在 [OpenAlex Sources](https://openalex.org/sources) 或期刊官网查�
    若某个源对这本刊**稳定为 0**（如 RSC 的 EES 在 Crossref 里就是 0），
    那就是那家的收录问题，不是配置错了。
 
+> RSC 的 **EES** 与 **Chemical Society Reviews** 都没有可用的 DOI 前缀，
+> 只能按刊名识别 —— `JOURNAL_DOI_PATTERNS` 里留空是**正确**的，不是漏配。
+
 > ⚠️ **ISSN 写错不会报错，只会返回 0 篇**，表现是收到一封「本周无新文献」的心跳邮件。
 > 改完务必跑一次 `python -m src.main --dry-run --no-ai` 确认「OpenAlex 命中总数」不是 0。
 >
-> ⚠️ **跨学科换向必须同时换期刊**。当前这 15 本是材料 / 能源 / 化学类，
+> ⚠️ **跨学科换向必须同时换期刊**。当前这 24 本是材料 / 能源 / 化学类，
 > 如果你想换成计算机、医学等方向，光改研究方向会让候选集几乎为空（同样不报错）。
 
 ### 多主题调研（`RESEARCH_TOPICS`）
@@ -1008,7 +1115,7 @@ ISSN 可在 [OpenAlex Sources](https://openalex.org/sources) 或期刊官网查�
 > 「钠离子正极」（分区键 `钠离子正极`）。
 > 这两个分区**已被手动清空**（旧记录来自一次静默退化的全库检索，DOI 全是无关论文，
 > 留着会把正确结果挡在去重之外），所以下一轮会被当成首次运行 ——
-> **第一封邮件覆盖 90 天**，之后回到 14 天。
+> **第一封邮件覆盖 90 天**，之后回到 45 天。
 > 运行日志里的「使用 90 天窗口」就是这个原因，不是配置错了。
 
 ```python
@@ -1108,17 +1215,20 @@ python -m src.main --topic 富锂锰正极 --topic 钠离子正极
 | 档次 | 加成 | 期刊 |
 |---|---|---|
 | 正刊 | **+12** | Nature、Science |
+| 综述顶刊 | **+10** | Chemical Reviews、Chemical Society Reviews、Nature Reviews Materials、Progress in Materials Science、Electrochemical Energy Reviews |
 | 大子刊 | **+9** | Nature Energy、Nature Materials、Nature Chemistry、Nature Sustainability |
 | Joule | **+7** | Joule |
+| 综述名刊 | **+7** | Nature Reviews Chemistry、Accounts of Chemical Research |
 | 小子刊 | **+5** | Nature Communications、Science Advances |
 | JACS | **+4** | Journal of the American Chemical Society |
 | Angew | **+3** | Angewandte Chemie Int. Ed. |
 | AM | **+2** | Advanced Materials |
-| （其它） | 0 | Energy & Environmental Science、Advanced Functional Materials、Small 等 |
+| AEM | **+2** | Advanced Energy Materials |
+| （其它） | 0 | Energy & Environmental Science、Energy Storage Materials、Advanced Functional Materials、Small 等 |
 
 要点：
 
-- **加成只影响排序，不影响入选** —— 是否进邮件仍然只看 AI 分数是否过 `AI_THRESHOLD`。
+- **加成只影响排序，不影响入选** —— 是否进邮件仍然只看 AI 分数是否过双阈值（60/35）。
   一本低档刊但只要真相关，仍会入选，只是排在后面。
 - 效果：大子刊 AI 给 62 分 → 最终 71 分，会排在 AM 的 70 分前面。
   同分时看 AI 真实分（相关性更准），再同分看发表日。
@@ -1285,7 +1395,7 @@ def test_every_recall_term_can_also_pass_the_gate(self): ...
 
 **两个刻意设计，别当成 bug：**
 
-1. **加成只管排序，不管入选。** 是否进邮件依旧只看 AI 分是否过 `AI_THRESHOLD`；
+1. **加成只管排序，不管入选。** 是否进邮件依旧只看 AI 分是否过双阈值（60/35）；
    真正不想要的内容用 `EXCLUDE_RULES` 剔掉，而不是靠给低分。
    反过来说，「不容错过」的内容要用 **`KEEP_RULES`**，不是靠把 `BONUS_RULES` 的分数堆高 ——
    堆到 100 也只是排第一的**落选者**。
@@ -1399,8 +1509,10 @@ def test_every_recall_term_can_also_pass_the_gate(self): ...
 
 ### 调阈值 / 并发 / 时间窗
 
-都在 `src/config.py`：`AI_THRESHOLD`（默认 60）、`AI_MAX_WORKERS`（默认 6）、
-`LOOKBACK_DAYS`（默认 14）。临时调整用命令行参数。
+都在 `src/config.py`：`AI_THRESHOLD_WITH_ABSTRACT`（默认 60）、
+`AI_THRESHOLD_TITLE_ONLY`（默认 35）、`AI_MAX_WORKERS`（默认 3）、
+`AI_MIN_INTERVAL`（默认 0.4 秒）、`LOOKBACK_DAYS`（默认 45）。
+按主题单独调就写进 `data/search_plan.json`；临时调整用命令行参数。
 
 ---
 
@@ -1446,7 +1558,7 @@ on:
 ## 本地开发
 
 ```bash
-# 跑测试（341 个）
+# 跑测试（344 个）
 python -m unittest discover -s tests -v
 
 # 语法检查
@@ -1484,14 +1596,14 @@ python -m src.main --to your@email.com --lookback-days 7
 - **多源并集不得退化成“自动降级”**：每个启用的源都必须真的被调用（回归测试）
 - **单源失败不得拖垮整轮**：其余源照常合并发信，并把故障写进邮件页头的 `notices`（回归测试）
 - **源部分失败也要进页头**：Crossref 单刊 429 不得表现为“本轮少了一本顶刊”——
-  优先重试；重试仍失败就把“N/15 本刊查询失败”写进页头；4xx 不重试（回归测试）
+  优先重试；重试仍失败就把“N/24 本刊查询失败”写进页头；4xx 不重试（回归测试）
 - **摘要回退的两个源都要重试**：Crossref 碰 429 必须退避重试而不是直接放弃；
   404 不重试；`mailto` 必须来自有内置默认值的 `CROSSREF_MAILTO`（回归测试）
 - **全部源失败必须报错**，不得发出一封看似正常的“本周无新文献”心跳邮件（回归测试）
 - **Crossref 结果必须本地复核召回词**：`query.title=lithium-rich` 返回的
   “Lithium Metal Batteries” 必须被丢掉（回归测试）
-- **无摘要的刊（Joule / Nature Energy）只能放宽、不能硬剔**：记录带摘要时
-  仍要正常剔除，名单外的刊不许被连带放宽（回归测试）
+- **无摘要记录只能放宽、不能硬剔**：按「这条记录有没有摘要」逐条判断，
+  带摘要的记录仍要严格复核，刊名不再影响判定（回归测试）
 - **邮件展示上限**：首次预热 50 篇、之后 20 篇、`--max-items` 始终优先，
   且主题行里的篇数必须与正文上限一致（回归测试）
 - **超出上限的文献必须排进 PDF 附件、而不是消失**：附带 PDF 内确实含正文外的
@@ -1576,13 +1688,14 @@ OpenAlex 免费，但有**每日额度**：2026 年起按请求计费（匿名 1
 所以真的把 OpenAlex 额度打光了也**不会断更** —— 备用源照常发信，
 邮件页头会提醒你“本轮 OpenAlex 不可用”，见 [数据源](#数据源)。
 
-实测 15 本期刊、90 天窗口（召回词 14 个），三源合并去重后单主题候选量在 **~70～110 篇**；
-常规 14 天窗口则约 **20～60 篇**，其中约 96% 带摘要。按每篇约 1.5k token 计，
-每周一次折合约 5 万 token，用 DeepSeek 的成本约 **每月一两毛钱**。
+实测 24 本期刊、90 天窗口（召回词 14 个），三源合并去重后单主题候选量在 **~150～250 篇**；
+常规 45 天窗口则约 **80～180 篇**，其中约 96% 带摘要。按每篇约 1.5k token 计，
+每周一次折合约 5～10 万 token，用 DeepSeek 的成本约 **每月几毛钱**。
+打分缓存会把上周已评估过的论文直接复用，实际请求量通常只有候选量的一小部分。
 
 > 候选量随召回词数量与宽泛程度变化。第一次改召回词后建议先跑
 > `python -m src.main --dry-run --no-ai -v` 看日志里的 `OpenAlex 命中总数 meta.count=N`，
-> 必要时调 `MAX_WORKS_FETCH` 或 `AI_THRESHOLD`。
+> 必要时调 `MAX_WORKS_FETCH`，或方案文件里的两个 threshold。
 
 ### 为什么打分全部候选，成本也没有失控
 
@@ -1604,3 +1717,5 @@ OpenAlex 免费，但有**每日额度**：2026 年起按请求计费（匿名 1
 > 但下轮再也不会被评估了。所以必须摘。
 
 所以**每周的 AI 打分总量稳定在「候选量」这个量级**，不随去重库增长而无限膨胀。
+打分缓存（`data/ai_cache.json`）再叠一层：同一主题、同一摘要指纹的论文即使
+重新进入候选，也不会重复请求 AI。

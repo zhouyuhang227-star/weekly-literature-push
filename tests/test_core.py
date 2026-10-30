@@ -494,11 +494,23 @@ class TestRelevanceLayersAreExplained(unittest.TestCase):
         self.assertIn("TOPIC_QUERY", recall)
 
     def test_scoring_layer_follows_config(self):
+        """入选线必须是「当前」配置（双阈值），不能是 import 时的常量。"""
+        saved = (
+            config.RESEARCH_FIELD,
+            config.AI_THRESHOLD_WITH_ABSTRACT,
+            config.AI_THRESHOLD_TITLE_ONLY,
+        )
+        self.addCleanup(setattr, config, "RESEARCH_FIELD", saved[0])
+        self.addCleanup(setattr, config, "AI_THRESHOLD_TITLE_ONLY", saved[2])
+        self.addCleanup(setattr, config, "AI_THRESHOLD_WITH_ABSTRACT", saved[1])
+
         config.RESEARCH_FIELD = "钙钛矿太阳能电池"
-        config.AI_THRESHOLD = 77
+        config.AI_THRESHOLD_WITH_ABSTRACT = 77
+        config.AI_THRESHOLD_TITLE_ONLY = 42
         scoring = self._detail(config.relevance_plan("topic"), config.LAYER_SCORING)
         self.assertIn("钙钛矿太阳能电池", scoring)
         self.assertIn("77", scoring)
+        self.assertIn("42", scoring)
 
     def test_unknown_mode_is_reported_not_crashed(self):
         recall = self._detail(config.relevance_plan("nope"), config.LAYER_RECALL)
@@ -2009,7 +2021,7 @@ class TestMultiTopicOrchestration(unittest.TestCase):
         # 两个主题各自回显自己的检索短语，否则看了也不知道在搜什么
         self.assertIn("lithium rich cathode", text)
         self.assertIn("anode free sodium", text)
-        self.assertIn("2 个（来源：RESEARCH_TOPICS", text)
+        self.assertIn("2 个（来源：config.RESEARCH_TOPICS", text)
         # 多主题下那五项常数已不生效：只给 INFO 说明，不再对它们报警
         self.assertIn("已配置 RESEARCH_TOPICS", text)
         self.assertNotIn("USER_KEYWORDS 为空", text)
@@ -2814,10 +2826,16 @@ class TestJournalIdentity(unittest.TestCase):
         for name in config.JOURNALS:
             self.assertIn(name, config.JOURNAL_DOI_PATTERNS)
 
-    def test_ees_is_the_only_journal_without_a_doi_prefix(self):
-        """RSC 的 DOI 里没有刊名（10.1039/D6EE01234A），所以 EES 只能靠名字兜底。"""
+    def test_rsc_journals_have_no_doi_prefix_and_fall_back_to_the_name(self):
+        """RSC 的 DOI 里没有刊名（10.1039/D6EE01234A），所以 EES / CSR 只能靠名字兜底。
+
+        Chemical Society Reviews 的 DOI 同样是 ``10.1039/...``，前缀分不出是哪本刊，
+        与 EES 一样只能按刊名识别 —— 所以两本都是空模式，这是预期行为。
+        """
         empty = [n for n, patterns in config.JOURNAL_DOI_PATTERNS.items() if not patterns]
-        self.assertEqual(empty, ["Energy & Environmental Science"])
+        self.assertEqual(
+            empty, ["Energy & Environmental Science", "Chemical Society Reviews"]
+        )
 
 
 class TestUnionMerge(unittest.TestCase):
@@ -3097,16 +3115,20 @@ class TestCrossrefAdapter(unittest.TestCase):
 
     def test_tokenised_false_positives_are_dropped_locally(self):
         items = [
-            self._item(doi="10.1002/adma.1", title="Lithium Metal Batteries"),
-            self._item(doi="10.1002/adma.2", title="Li-rich layered oxide with anion redox"),
+            self._item(
+                doi="10.1002/adma.1",
+                title="Lithium Metal Batteries",
+                abstract="<jats:p>Lithium metal anodes and electrolytes.</jats:p>",
+            ),
+            self._item(
+                doi="10.1002/adma.2",
+                title="Li-rich layered oxide with anion redox",
+                abstract="<jats:p>Anion redox in Li-rich cathodes.</jats:p>",
+            ),
         ]
         works, _ = self._run(items, ["li-rich", "anion redox"])
-        title_only = set(config.CROSSREF_TITLE_ONLY_JOURNALS)
-        # 无摘要的刊会放宽复核，所以只对"其余刊"断言「误命中被剔掉了」
-        kept = {w["doi"] for w in works if w["journal"] not in title_only}
-        self.assertEqual(kept, {"10.1002/adma.2"})
-        normal = len(config.JOURNALS) - len(title_only)
-        self.assertEqual(len(works), normal * 1 + len(title_only) * 2)
+        # 有摘要 ⇒ 复核是完整的，分词误命中必须被剔掉
+        self.assertEqual({w["doi"] for w in works}, {"10.1002/adma.2"})
 
     def test_journal_name_comes_from_config_so_tier_bonus_still_resolves(self):
         # mock 让 15 本刊都返回同一批条目（真实场景里每本刊只会返回自己的论文），
@@ -3134,22 +3156,21 @@ class TestCrossrefAdapter(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self._run([], ["li-rich"], status_code=500)
 
-    # -- 「无摘要刊」放宽复核 -------------------------------------------
-    def test_title_only_journals_relax_the_recheck_when_the_abstract_is_missing(self):
-        """Joule / Nature Energy 在 Crossref 不带摘要 ⇒ 复核只能看标题 ⇒ 放宽。
+    # -- 「无摘要记录」放宽复核 -----------------------------------------
+    def test_records_without_an_abstract_are_passed_to_ai_instead_of_dropped(self):
+        """没有摘要 ⇒ 本地只能看标题 ⇒ 误杀风险高 ⇒ 放行交给 AI（双阈值兜底）。
 
-        实测反例：Joule 近 30 天 2 条命中（全固态锂传输 / 储氢）剔除是对的，
-        但同一本刊里标题写成 "Reversible anion storage in cathodes" 的富锂锰论文
-        会被同一个判据杀掉 —— 而 OpenAlex 挂掉的那轮它没有任何兜底。
+        以前只有 ``CROSSREF_TITLE_ONLY_JOURNALS`` 里那 3 本刊能放宽，其余刊里
+        偶发缺摘要的记录照样被标题复核杀掉 —— 而这类论文的标题常常是
+        "Reversible anion storage in cathodes" 这种不含字面词的通用写法。
+        现在按「这条记录有没有摘要」判断，不再看刊名。
         """
         items = [
             self._item(doi="10.1016/j.joule.1", title="Reversible anion storage in cathodes")
         ]
         works, _ = self._run(items, ["li-rich", "anion redox"])
-        # 名单内的刊全部留下（没摘要 ⇒ 判据残缺 ⇒ 交给 AI），其余刊照旧剔除
-        self.assertEqual(
-            {w["journal"] for w in works}, set(config.CROSSREF_TITLE_ONLY_JOURNALS)
-        )
+        # 每本刊都返回同一条无摘要记录 ⇒ 全部放行（刊名已不再影响判定）
+        self.assertEqual(len(works), len(config.JOURNALS))
 
     def test_relaxation_requires_a_missing_abstract(self):
         """有摘要就说明复核是完整的，哪怕在放宽名单里也不能放行。"""

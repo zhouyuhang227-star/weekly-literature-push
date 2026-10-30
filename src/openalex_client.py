@@ -85,6 +85,18 @@ SELECT_FIELDS = ",".join(
 #: 需要重试的 HTTP 状态码（限流与临时性服务端错误）
 _RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 
+
+class CreatedDateUnsupported(RuntimeError):
+    """``from_created_date`` 是 OpenAlex Member+ 套餐专享（2026 实测）。
+
+    匿名/免费额度请求它会直接 429，正文写明 ``daily sync ... Member+ and Partner
+    plans``。这不是故障，也不该重试 —— 识别出来后整轮不再尝试索引补漏查询。
+    """
+
+
+#: ``None`` = 还没试过；``False`` = 当前额度不支持按入库时间过滤
+_created_filter_supported: bool | None = None
+
 _DOI_PREFIXES = (
     "https://doi.org/",
     "http://doi.org/",
@@ -331,6 +343,8 @@ def build_filter(
     keywords: list[str] | None = None,
     mode: str = RETRIEVAL_MODE,
     topic=None,
+    issns: str | None = None,
+    created_from: date | None = None,
 ) -> str:
     """构造 ``filter=`` 参数。
 
@@ -340,6 +354,11 @@ def build_filter(
       * ``"both"``    —— 两者并集
 
     ``topic`` 为空时用单方向模式的全局配置（向后兼容）。
+
+    ``issns`` 是 ``A|B|C`` 形式的期刊范围（``None`` 用全局 ``ISSN_FILTER``）——
+    主题可以自己限定盯哪几本刊，不必再改全局配置。
+    ``created_from`` 只在索引补漏查询里用（见 :func:`fetch_works`）：按
+    「入库时间」而不是「出版时间」过滤，捞回索引滞后、发表日期落在窗口外的论文。
 
     ⚠️ ``title_and_abstract.search`` 必须写进 filter，不能作为 URL query 参数（会 400）。
     检索串本身不含逗号，因此与其它条件用逗号拼接是安全的。
@@ -351,12 +370,18 @@ def build_filter(
     两个主题各拿到同一批 300 篇无关论文，一个报 0 篇、一个报 4 篇）。
     """
     parts = [
-        f"primary_location.source.issn:{ISSN_FILTER}",
+        f"primary_location.source.issn:{issns or ISSN_FILTER}",
         f"from_publication_date:{from_date.isoformat()}",
-        "type:article",
-        "is_retracted:false",
-        "is_paratext:false",
     ]
+    if created_from is not None:
+        parts.append(f"from_created_date:{created_from.isoformat()}")
+    parts.extend(
+        [
+            "type:article",
+            "is_retracted:false",
+            "is_paratext:false",
+        ]
+    )
     if mode in ("topic", "both"):
         topic_ids = topic_filter_value(topic)
         if topic_ids:
@@ -492,7 +517,12 @@ def _request_page(params: dict, attempt: int) -> dict:
             elif resp.status_code == 429:
                 if _is_budget_exhausted(resp):
                     raise RuntimeError(_budget_message(resp))
-                last_exc = requests.HTTPError(f"HTTP 429 {_short_body(resp)}")
+                body = _short_body(resp)
+                lowered = body.lower()
+                if "from_created_date" in body or "daily sync" in lowered:
+                    # 免费额度不支持按入库时间过滤 —— 不重试，交给调用方降级
+                    raise CreatedDateUnsupported(body)
+                last_exc = requests.HTTPError(f"HTTP 429 {body}")
             elif resp.status_code in _RETRY_STATUS:
                 last_exc = requests.HTTPError(f"HTTP {resp.status_code} {_short_body(resp)}")
             elif 400 <= resp.status_code < 500:
@@ -596,42 +626,26 @@ def author_name(author) -> str:
 
 
 
-def fetch_works(
-    keywords: list[str] | None,
-    lookback_days: int,
-    max_works: int = MAX_WORKS_FETCH,
-    mode: str = RETRIEVAL_MODE,
-    topic=None,
-) -> list[dict]:
-    """检索指定时间窗内的顶刊论文，返回去重后的候选列表。
-
-    第 1 层筛选由 ``mode`` 决定（主题分类 / 字面关键词 / 两者并集）。
-    所有条件在**一次**查询里组合（比多次查询更省配额、更快）。
-    ``topic`` 为空时用单方向模式的全局配置（向后兼容）。
-    """
-    from_date = date.today() - timedelta(days=lookback_days)
-    filter_value = build_filter(from_date, keywords, mode, topic)
-
-    log.info(
-        "OpenAlex 检索：期刊 %s 本 / %s / 起始日期 %s / 上限 %s 篇",
-        len(ISSN_FILTER.split("|")),
-        _describe_filter(mode, keywords, topic),
-        from_date.isoformat(),
-        max_works,
-    )
-    log.debug("filter=%s", filter_value)
-
-    collected: dict[str, dict] = {}
+def _collect_pages(
+    filter_value: str,
+    max_works: int,
+    collected: dict[str, dict],
+    sort: str = "publication_date:desc",
+    max_pages: int | None = None,
+) -> tuple[int, int]:
+    """按 cursor 翻页收集，就地写入 ``collected``。返回 ``(本次新增, 页数)``。"""
+    added = 0
+    before = len(collected)
     cursor = "*"
     page = 0
-    dropped = 0
+    limit_pages = max(1, int(max_pages or MAX_PAGES))
 
-    while cursor and len(collected) < max_works and page < MAX_PAGES:
+    while cursor and len(collected) < max_works and page < limit_pages:
         page += 1
         remaining = max_works - len(collected)
         params = {
             "filter": filter_value,
-            "sort": "publication_date:desc",
+            "sort": sort,
             "per-page": max(1, min(PER_PAGE, remaining)),
             "cursor": cursor,
             "select": SELECT_FIELDS,
@@ -661,20 +675,104 @@ def fetch_works(
         for raw in results:
             parsed = parse_work(raw)
             if parsed is None:
-                dropped += 1
                 continue
             collected.setdefault(parsed["openalex_id"] or parsed["doi"], parsed)
 
         cursor = meta.get("next_cursor") or ""
 
+    return len(collected) - before, page
+
+
+def fetch_works(
+    keywords: list[str] | None,
+    lookback_days: int,
+    max_works: int = MAX_WORKS_FETCH,
+    mode: str = RETRIEVAL_MODE,
+    topic=None,
+    journals: dict[str, str] | None = None,
+) -> list[dict]:
+    """检索指定时间窗内的顶刊论文，返回去重后的候选列表。
+
+    第 1 层筛选由 ``mode`` 决定（主题分类 / 字面关键词 / 两者并集）。
+    所有条件在**一次**查询里组合（比多次查询更省配额、更快）。
+    ``topic`` 为空时用单方向模式的全局配置（向后兼容）。
+    ``journals`` 是已经解析好的 ``{刊名: ISSN}``，为空表示用全部期刊。
+
+    ★ **索引补漏**：主查询按 ``publication_date`` 划分时间窗，而 OpenAlex 的
+    索引常常滞后 1–3 周 —— 一篇 40 天前上线、上周才入库的论文永远不会落进
+    「近 45 天」的窗口里，**永久漏掉**。所以主查询之后再加一次：按
+    ``from_created_date``（入库时间，近 ``INDEX_CATCHUP_DAYS`` 天）筛，
+    出版日期放宽到 ``INDEX_CATCHUP_PUB_DAYS`` 天，把"刚被收录的旧文"捞回来。
+    这一步失败只记 WARNING，不影响主查询结果。
+    """
+    scope = journals or config.JOURNALS
+    issns = "|".join(dict.fromkeys(str(v) for v in scope.values() if v))
+    from_date = date.today() - timedelta(days=lookback_days)
+    filter_value = build_filter(from_date, keywords, mode, topic, issns=issns)
+
+    log.info(
+        "OpenAlex 检索：期刊 %s 本 / %s / 起始日期 %s / 上限 %s 篇",
+        len(scope),
+        _describe_filter(mode, keywords, topic),
+        from_date.isoformat(),
+        max_works,
+    )
+    log.debug("filter=%s", filter_value)
+
+    collected: dict[str, dict] = {}
+    added, page = _collect_pages(filter_value, max_works, collected)
+
+    global _created_filter_supported
+
+    catchup_days = max(0, int(getattr(config, "INDEX_CATCHUP_DAYS", 0)))
+    if catchup_days and len(collected) < max_works and _created_filter_supported is not False:
+        pub_days = max(catchup_days, int(getattr(config, "INDEX_CATCHUP_PUB_DAYS", 365)))
+        created_from = date.today() - timedelta(days=catchup_days)
+        catchup_pub_from = date.today() - timedelta(days=pub_days)
+        try:
+            catchup_filter = build_filter(
+                catchup_pub_from, keywords, mode, topic,
+                issns=issns, created_from=created_from,
+            )
+            catchup_added, catchup_pages = _collect_pages(
+                catchup_filter,
+                min(max_works, len(collected) + PER_PAGE * 3),
+                collected,
+                max_pages=3,
+            )
+            _created_filter_supported = True
+        except CreatedDateUnsupported as exc:
+            # 一次性说明，之后整轮（含其它主题）都不再试：这不是错误，是套餐限制
+            _created_filter_supported = False
+            log.info(
+                "OpenAlex 索引补漏不可用（from_created_date 属 Member+ 套餐）：%s。"
+                "本轮只按出版日期检索；若担心索引滞后漏文献，可调大时间窗，"
+                "或用 OPENALEX_API_KEY（付费额度）解锁补漏查询。",
+                exc,
+            )
+        except Exception as exc:  # noqa: BLE001 - 补漏失败不影响主线
+            log.warning(
+                "OpenAlex 索引补漏查询失败（不影响主查询结果，但本轮可能漏掉"
+                "「刚入库、发表日期较早」的论文）：%s", exc,
+            )
+        else:
+            if catchup_added:
+                # 这几篇本来会被时间窗直接漏掉，值得单独留一行
+                log.info(
+                    "OpenAlex 索引补漏：近 %s 天入库、出版日期在近 %s 天内，"
+                    "额外捞回 %s 篇主查询窗口外的论文（%s 页）",
+                    catchup_days, pub_days, catchup_added, catchup_pages,
+                )
+            else:
+                log.debug("OpenAlex 索引补漏：没有发现窗口外的新入库论文")
+
     works = list(collected.values())
     works.sort(key=lambda w: w.get("pub_date") or "", reverse=True)
 
     log.info(
-        "检索完成：共 %s 篇（%s 页，时间窗 %s 天%s）",
+        "检索完成：共 %s 篇（主查询 %s 页，时间窗 %s 天）",
         len(works),
         page,
         lookback_days,
-        "" if not dropped else f"，另丢弃 {dropped} 篇无 DOI 记录",
     )
     return works

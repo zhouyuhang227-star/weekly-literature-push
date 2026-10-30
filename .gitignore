@@ -23,6 +23,9 @@ data/outbox/
 # 不入库可避免每次换研究方向都产生无意义的 diff
 data/topics_cache.json
 
+# AI 打分缓存：机器生成，删掉只会多花一次钱，不会丢数据
+data/ai_cache.json
+
 # 注意：data/pushed_dois.json 必须入库！它是去重状态的唯一来源
 !data/pushed_dois.json
 

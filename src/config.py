@@ -20,6 +20,11 @@ from dataclasses import dataclass, field
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 PUSHED_FILE = os.path.join(DATA_DIR, "pushed_dois.json")
+#: 可编辑的「检索方案」。不存在时按 config.py 的默认值运行。
+#: 想拿到一份可编辑的副本：``python -m src.main --write-plan``。
+PLAN_FILE = os.path.join(DATA_DIR, "search_plan.json")
+#: AI 打分缓存（按 主题 + DOI + 提示词指纹）。避免同一篇论文每周重复花钱。
+AI_CACHE_FILE = os.path.join(DATA_DIR, "ai_cache.json")
 LOG_DIR = os.path.join(DATA_DIR, "logs")
 OUTBOX_DIR = os.path.join(DATA_DIR, "outbox")  # --dry-run 产出的 HTML
 
@@ -51,6 +56,19 @@ JOURNALS: dict[str, str] = {
     "Energy & Environmental Science": "1754-5706",
     "Advanced Functional Materials": "1616-3028",
     "Small": "1613-6829",
+    # —— 能源材料方向（用户点名要覆盖的两本）——
+    "Advanced Energy Materials": "1614-6840",
+    "Energy Storage Materials": "2405-8297",
+    # —— 综述刊 ——
+    # 收录标准：OpenAlex 2 年平均被引明显高于 AEM（19.8），且是这个方向
+    # 「现在到哪一步了」最快的入口。ISSN 均已核对。
+    "Nature Reviews Materials": "2058-8437",
+    "Nature Reviews Chemistry": "2397-3358",
+    "Chemical Reviews": "0009-2665",
+    "Chemical Society Reviews": "0306-0012",
+    "Accounts of Chemical Research": "0001-4842",
+    "Electrochemical Energy Reviews": "2520-8136",
+    "Progress in Materials Science": "0079-6425",
 }
 
 # OpenAlex 的 OR 语法：用 | 拼接 ISSN。
@@ -94,6 +112,18 @@ JOURNAL_DOI_PATTERNS: dict[str, tuple[str, ...]] = {
     "Energy & Environmental Science": (),
     "Advanced Functional Materials": ("10.1002/adfm.",),
     "Small": ("10.1002/smll.",),
+    "Advanced Energy Materials": ("10.1002/aenm.",),
+    "Energy Storage Materials": ("10.1016/j.ensm.",),
+    # —— 综述刊（DOI 前缀均从真实论文取样核实）——
+    "Nature Reviews Materials": ("10.1038/s41578-",),
+    "Nature Reviews Chemistry": ("10.1038/s41570-",),
+    "Chemical Reviews": ("10.1021/acs.chemrev.",),
+    "Accounts of Chemical Research": ("10.1021/acs.accounts.",),
+    "Electrochemical Energy Reviews": ("10.1007/s41918-",),
+    "Progress in Materials Science": ("10.1016/j.pmatsci.",),
+    # RSC 的 DOI 形如 10.1039/d5cs00938c，没有能区分 Chemical Society Reviews
+    # 与同社其它刊的稳定前缀，留空走刊名兜底。
+    "Chemical Society Reviews": (),
 }
 
 #: Semantic Scholar 的刊名写法 → 本项目 ``JOURNALS`` 里的刊名。
@@ -122,12 +152,27 @@ S2_VENUE_ALIASES: dict[str, str] = {
 # 它们照样会被检索、会进邮件，只是排序时不额外加分。
 JOURNAL_TIERS: dict[str, tuple[int, tuple[str, ...]]] = {
     "正刊": (12, ("Nature", "Science")),
+    # 综述顶刊：一篇顶十篇 —— 它们是「这个方向现在到哪一步了」最快的入口。
+    "综述顶刊": (
+        10,
+        (
+            "Chemical Reviews",
+            "Chemical Society Reviews",
+            "Nature Reviews Materials",
+            "Progress in Materials Science",
+            "Electrochemical Energy Reviews",
+        ),
+    ),
     "大子刊": (9, ("Nature Energy", "Nature Materials", "Nature Chemistry", "Nature Sustainability")),
     "Joule": (7, ("Joule",)),
+    "综述名刊": (7, ("Nature Reviews Chemistry", "Accounts of Chemical Research")),
     "小子刊": (5, ("Nature Communications", "Science Advances")),
     "JACS": (4, ("Journal of the American Chemical Society",)),
     "Angew": (3, ("Angewandte Chemie Int. Ed.",)),
     "AM": (2, ("Advanced Materials",)),
+    # AEM 与 AM 同档；档次名分开写，免得卡片上显示 "AM +2" 让人误以为是 Advanced Materials。
+    "AEM": (2, ("Advanced Energy Materials",)),
+    # ⚠️ Energy Storage Materials 刻意不加分（照样会被检索），与 AFM / Small 一致。
 }
 
 
@@ -165,6 +210,40 @@ def journal_tiers_not_in_journals() -> list[str]:
             if name not in known:
                 missing.append(name)
     return missing
+
+
+def journals_for(names=None) -> dict[str, str]:
+    """把「期刊范围」（刊名列表）解析成 ``{刊名: ISSN}``。
+
+    ``names`` 为空表示**不限定**，返回 ``config.JOURNALS`` 全集（保持配置顺序）。
+    写错刊名会直接报错并列出全部合法写法 —— 静默忽略等于悄悄缩小检索范围，
+    而这正是这个项目最怕的那类错误。
+    """
+    if not names:
+        return dict(JOURNALS)
+
+    picked: dict[str, str] = {}
+    unknown: list[str] = []
+    for raw in names:
+        name = str(raw or "").strip()
+        if not name or name in picked:
+            continue
+        issn = JOURNALS.get(name)
+        if not issn:
+            unknown.append(name)
+            continue
+        picked[name] = issn
+
+    if unknown:
+        raise RuntimeError(
+            f"期刊范围里有不认识的刊名：{'、'.join(unknown)}。\n"
+            "  可用刊名：" + "、".join(JOURNALS) + "\n"
+            "  想新增一本刊：先把它加进 config.JOURNALS（需要 ISSN），"
+            "再在 data/search_plan.json 的主题 journals 里引用。"
+        )
+    if not picked:
+        raise RuntimeError("期刊范围为空 —— 请删掉 journals 字段（= 全部期刊）或至少写一本。")
+    return picked
 
 
 # ===========================================================================
@@ -876,6 +955,16 @@ class ResearchTopic:
     exclude: list[dict] = field(default_factory=list)
     #: 只对本主题生效的硬保底规则（全局的 KEEP_RULES 照常叠加）。
     keep: list[dict] = field(default_factory=list)
+    #: 本主题的期刊范围（config.JOURNALS 里的刊名）。空 = 全部期刊。
+    journals: list[str] = field(default_factory=list)
+    #: 本主题启用的数据源。空 = config.DATA_SOURCES。
+    sources: list[str] = field(default_factory=list)
+    #: 时间窗（天）。0 = 用全局 LOOKBACK_DAYS / LOOKBACK_DAYS_FIRST_RUN。
+    lookback_days: int = 0
+    lookback_days_first_run: int = 0
+    #: AI 入选线。0 = 用全局 AI_THRESHOLD_WITH_ABSTRACT / AI_THRESHOLD_TITLE_ONLY。
+    threshold_with_abstract: int = 0
+    threshold_title_only: int = 0
 
     def __post_init__(self) -> None:
         self.name = (self.name or "").strip()
@@ -884,10 +973,24 @@ class ResearchTopic:
         self.key = (self.key or "").strip() or self.name
         self.search_terms = [str(term).strip() for term in self.search_terms if str(term).strip()]
         self.keywords = [str(word).strip() for word in self.keywords if str(word).strip()]
+        self.journals = [str(name).strip() for name in self.journals if str(name).strip()]
+        self.sources = [str(name).strip() for name in self.sources if str(name).strip()]
 
     @property
     def email_title(self) -> str:
         return self.title.strip() or f"{self.name}顶刊周报"
+
+    def effective_thresholds(self) -> tuple[int, int]:
+        """``(有摘要阈值, 仅标题阈值)``。0 表示用全局默认值。"""
+        with_abstract = self.threshold_with_abstract or AI_THRESHOLD_WITH_ABSTRACT
+        title_only = self.threshold_title_only or AI_THRESHOLD_TITLE_ONLY
+        return with_abstract, title_only
+
+    def effective_lookback(self, first_run: bool) -> int:
+        """时间窗天数。首次与常规可以分别配置。"""
+        if first_run:
+            return self.lookback_days_first_run or LOOKBACK_DAYS_FIRST_RUN
+        return self.lookback_days or LOOKBACK_DAYS
 
     def brief(self) -> str:
         """给 AI 看的「研究方向」描述。单方向模式下等价于 ``research_brief()``。"""
@@ -901,6 +1004,18 @@ class ResearchTopic:
         if note:
             lines.append(note)
         return "\n".join(lines)
+
+
+def _int_or_zero(value) -> int:
+    """把配置里的数字字段转成 int；写错就当 0（= 用全局默认值）。
+
+    不在这里抛异常：``config`` 是用户手改的，一处笔误不该让整个程序连
+    ``--show-plan`` 都跑不起来；真正需要严格的地方是 :mod:`src.plan` 的校验。
+    """
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _legacy_topic() -> ResearchTopic:
@@ -942,6 +1057,12 @@ def active_research_topics() -> list[ResearchTopic]:
             bonuses=[rule for rule in (item.get("bonuses") or []) if isinstance(rule, dict)],
             exclude=[rule for rule in (item.get("exclude") or []) if isinstance(rule, dict)],
             keep=[rule for rule in (item.get("keep") or []) if isinstance(rule, dict)],
+            journals=[str(name) for name in (item.get("journals") or [])],
+            sources=[str(name) for name in (item.get("sources") or [])],
+            lookback_days=_int_or_zero(item.get("lookback_days")),
+            lookback_days_first_run=_int_or_zero(item.get("lookback_days_first_run")),
+            threshold_with_abstract=_int_or_zero(item.get("threshold_with_abstract")),
+            threshold_title_only=_int_or_zero(item.get("threshold_title_only")),
         )
         if not candidate.name:
             raise RuntimeError(f'RESEARCH_TOPICS 第 {index} 项缺少 "name"（主题显示名）')
@@ -983,16 +1104,28 @@ SEARCH_FIELD = "title_and_abstract.search"
 
 # 时间窗。首次运行（去重库为空）用宽窗口做一次预热，之后固定滚动窗口。
 #
-# ⚠️ 首次预热窗口要留够长：OpenAlex 对新论文的收录有滞后（在线发表 → 进库可能差
-#    几周），而 from_publication_date 卡的是 publication_date。窗口开太窄，
-#    刚上线那阵子会「看起来一篇都没有」。首次跑完就会把 DOI 记进 pushed_dois.json，
-#    之后每轮只按 LOOKBACK_DAYS 滚动，不会重复推送。
-LOOKBACK_DAYS = 14
+# ⚠️ 为什么常规窗是 45 天而不是 7/14 天：这是「经常漏文献」最主要的根因之一。
+#    出版商从「在线发表」到「被 OpenAlex / Crossref 收录」常有 2–4 周滞后，
+#    而按 publication_date 卡的窗口一旦滑过去，这篇论文就**永远不会**再被看到。
+#    窗口放宽后，同一篇会被连续几轮看到，但 DOI 去重会在检索后立刻把它过滤掉，
+#    不会重复推送、也不会重复花钱（AI 结果另有 ai_cache 兜底）。
+#
+#    代价只有检索请求数（各源都是按期刊+词一次查完，与窗口宽度关系很小）。
+LOOKBACK_DAYS = 45
 LOOKBACK_DAYS_FIRST_RUN = 90
+
+# OpenAlex 的「索引滞后补漏」通道。
+#
+# 主查询按 publication_date 卡窗口，补漏查询按 **created_date**（论文进入 OpenAlex
+# 的日期）卡近 N 天，并限制「发表时间不超过 365 天」以免把陈年补录文献捞进来。
+# 两者取并集 —— 这正好覆盖「上个月发表、这周才入库」的论文。
+# 设为 0 可关闭（只保留主查询）。
+INDEX_CATCHUP_DAYS = 21
+INDEX_CATCHUP_PUB_DAYS = 365
 
 # 分页与总量上限。per-page 最大 200（OpenAlex 上限）。
 PER_PAGE = 200
-MAX_WORKS_FETCH = 300
+MAX_WORKS_FETCH = 500
 MAX_PAGES = 10
 
 # HTML 请求通用超时（秒）
@@ -1052,28 +1185,15 @@ CROSSREF_RETRY_WAIT = 2.0
 # 想换邮箱就改这里，或在 GitHub 仓库 Secrets 里设 CROSSREF_MAILTO。
 CROSSREF_MAILTO = os.environ.get("CROSSREF_MAILTO", "") or "literature-push-bot@users.noreply.github.com"
 
-# Crossref：**不给摘要的刊**。
+# Crossref：复核口径 —— **按「这条记录有没有摘要」逐条判断，不看刊名**。
 #
-# 为什么需要这张名单：Crossref 的 ``query.title`` 是分词匹配，必须本地拿
-# ``search_terms`` 复核（同时看标题和摘要）。但这几本刊在 Crossref 里**根本不带
-# abstract**，复核退化成「只看标题」—— 一篇真正做富锂锰正极、标题却写成
-# "Reversible anion storage in Li2MnO3-based cathodes" 的论文会被误杀。
-# 所以对这几本刊：**记录没有摘要时不做复核**，直接放进候选，交给 AI 相关性
-# 阈值（``AI_THRESHOLD``）兜底 —— AI 看得到完整信息，比拿一个残缺判据硬剔更可靠。
+# 有摘要 ⇒ 严格复核：``query.title`` 是分词匹配（``li-rich`` 会被拆成 li + rich），
+#   不核对就会把整片噪音喂给 AI。
+# 无摘要 ⇒ 本地只能看标题，误杀风险高 ⇒ **放行交给 AI**（AI 有双阈值兜底，
+#   纯标题论文走更低的 35 分线）。放行条数以 INFO 记进日志，不静默。
 #
-# 实测（2026-09-16，各刊近半年各抽 100 篇，看 Crossref 是否带 abstract）：
-#   Joule                 0 / 100   ← 一条摘要都没有
-#   Energy & Environmental Science  0 条记录（RSC 未按 ISSN 关联，见 README）
-#   Nature Energy         8 / 100
-#   Advanced Materials   91 / 100   ← Wiley 系很好，不需要放宽
-#
-# 只有「该刊在名单里 + 这条记录确实没摘要」两个条件同时成立才放宽，
-# 所以本名单的副作用有上界，不会因为一本刊就放过整片噪音。加刊后建议实测一遍。
-CROSSREF_TITLE_ONLY_JOURNALS: tuple[str, ...] = (
-    "Joule",
-    "Nature Energy",
-    "Energy & Environmental Science",
-)
+# 历史上曾按「哪本刊不给摘要」放宽，实测打脸：同一本刊里有摘要的噪音记录照样混进来，
+# 而别的刊里偶发缺摘要的真论文却被误杀。所以现在改成逐条判断。
 
 # Semantic Scholar bulk search 单轮最多取回条数（接口硬上限 1000）。
 # 实测富锂锰正极 14 个召回词 + 90 天 = 685 条，所以 1000 足够一页拉完。
@@ -1096,11 +1216,93 @@ AI_API_KEY = os.getenv("AI_API_KEY") or ""
 AI_MODEL = os.getenv("AI_MODEL") or "deepseek-flash"
 
 AI_TEMPERATURE = 0
-AI_THRESHOLD = 60  # 相关性评分低于此值的文献不进邮件
-AI_MAX_WORKERS = 6  # 并发打分线程数
+
+# ★ 双阈值：有摘要的论文按正常尺子判，只有标题的论文按更低的尺子判。
+#
+# 为什么不能只用一个阈值：顶刊新论文的摘要普遍**晚于论文上线**才被索引
+# （OpenAlex / Crossref / S2 都实测到），而「摘要缺失」恰恰会让 AI 只能凭标题
+# 判断、倾向于给低分。单阈值 60 等于系统性地把「刚上线的好论文」挡在门外 ——
+# 这是「经常漏文献」的第二个主要根因。
+AI_THRESHOLD_WITH_ABSTRACT = 60
+AI_THRESHOLD_TITLE_ONLY = 35
+
+#: 兼容旧代码/旧测试：不区分摘要时的默认阈值 = 有摘要那一档。
+AI_THRESHOLD = AI_THRESHOLD_WITH_ABSTRACT
+
+AI_MAX_WORKERS = 3  # 并发打分线程数（实测 6 并发会被端点成片 429）
+
+#: 任意两次 AI 请求的**发起时刻**至少间隔多少秒（跨线程生效）。
+#: 与并发数一起把瞬时 QPS 压在端点限流线以下。
+AI_MIN_INTERVAL = 0.4
+
 AI_MAX_RETRIES = 3  # 单篇重试次数（指数退避）
 AI_TIMEOUT = 60  # 单次请求超时（秒）
 ABSTRACT_MAX_CHARS = 2500  # 送入 AI 的摘要截断长度
+
+#: 连续这么多篇都彻底失败（每篇内部已重试过）就判定端点失联，
+#: 本轮剩余文献直接标记为失败、不再逐篇撞墙。
+#: 250 篇 × 3 次重试 × 60 秒超时 = 十几小时，而 Actions 上限 30 分钟 ——
+#: 没有这道熔断，端点一挂整轮就必然超时，连「哪一篇失败」都看不到。
+AI_CIRCUIT_BREAK_AFTER = 8
+
+# ---------------------------------------------------------------------------
+# ★ AI 结果缓存
+# ---------------------------------------------------------------------------
+# 为什么需要：候选里有一批论文**每周都会被重新打分** ——
+#   * 缺摘要、AI 判为低分（摘要可能下周才出现，所以不能标记已读）；
+#   * 分数在阈值边缘反复横跳；
+#   * AI 某轮调用失败。
+# 这些论文的提示词其实一字未变，重复调用纯属浪费。缓存键 = 主题 + DOI +
+# 提示词指纹（含「有没有摘要」），所以摘要一旦补上就会自动重新打分。
+AI_CACHE_ENABLED = True
+AI_CACHE_MAX_AGE_DAYS = 180
+AI_CACHE_MAX_ENTRIES = 20000
+
+#: 提示词/解析逻辑改了就 +1，强制让旧缓存失效。
+PROMPT_VERSION = "1.0"
+
+# ---------------------------------------------------------------------------
+# ★ 备用 AI 端点（首选连续失败后自动切换）
+# ---------------------------------------------------------------------------
+# 与检索助手同一套思路：首选端点整段不可用时（限流、维护、余额耗尽），
+# 不要让整批论文变成失败。配置写在 .env / 环境变量里：
+#   AI_BACKUP_BASE_URL=https://api.openai.com/v1
+#   AI_BACKUP_API_KEY=sk-...
+#   AI_BACKUP_MODEL=gpt-4o-mini
+# 地址与 key 必须**同时**配好才算可用（只配一半切过去只会得到 401）。
+AI_BACKUP_BASE_URL = (os.getenv("AI_BACKUP_BASE_URL") or "").strip()
+AI_BACKUP_API_KEY = os.getenv("AI_BACKUP_API_KEY") or ""
+AI_BACKUP_MODEL = (os.getenv("AI_BACKUP_MODEL") or "").strip()
+
+#: 首选端点**连续**失败多少篇后切到备用端点。
+AI_FAILOVER_AFTER = 3
+
+
+def ai_backup_configured() -> bool:
+    """备用端点是否配全了（地址 + key 都要有）。"""
+    return bool(AI_BACKUP_BASE_URL and AI_BACKUP_API_KEY)
+
+
+def ai_endpoints() -> list[dict[str, str]]:
+    """按优先级返回可用端点：``[{"name", "base_url", "api_key", "model"}, ...]``。"""
+    endpoints = [
+        {
+            "name": "首选",
+            "base_url": AI_BASE_URL,
+            "api_key": AI_API_KEY,
+            "model": AI_MODEL,
+        }
+    ]
+    if ai_backup_configured():
+        endpoints.append(
+            {
+                "name": "备用",
+                "base_url": AI_BACKUP_BASE_URL,
+                "api_key": AI_BACKUP_API_KEY,
+                "model": AI_BACKUP_MODEL or AI_MODEL,
+            }
+        )
+    return endpoints
 
 # ---------------------------------------------------------------------------
 # 摘要回退
@@ -1262,8 +1464,10 @@ def relevance_plan(mode: str = RETRIEVAL_MODE, topic: ResearchTopic | None = Non
         hint = "RETRIEVAL_MODE 只接受 'topic' / 'keyword' / 'both'。"
 
     keywords_desc = f"关注关键词 {len(keywords)} 个" if keywords else "关注关键词（空）"
+    with_abstract, title_only = view.effective_thresholds()
     scoring = (
-        f"AI 0-100 分、入选线 ≥ {AI_THRESHOLD} —— 尺子 = 「{view.name}」 + {keywords_desc}"
+        f"AI 0-100 分、入选线 有摘要 ≥ {with_abstract} / 仅标题 ≥ {title_only}"
+        f" —— 尺子 = 「{view.name}」 + {keywords_desc}"
         + (" + 补充说明" if view.description.strip() else "")
         + "；排序 = 最终分（AI 分 + 期刊档次加成 + 内容加分）降序"
     )

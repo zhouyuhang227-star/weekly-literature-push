@@ -3,7 +3,7 @@
 用法
 ----
 ``fetch_works()`` 是本包唯一的对外入口，签名与原来的
-``openalex_client.fetch_works`` 兼容，只是多了一个 ``sources=`` 参数，
+``openalex_client.fetch_works`` 兼容，只是多了 ``sources=`` / ``journals=``，
 返回值从「work 列表」变成 ``FetchResult``（内含 work 列表 + 每个源的表现）。
 
 设计要点
@@ -98,6 +98,13 @@ def enabled_sources(names=None) -> list[str]:
     return ordered
 
 
+def _param_names(fn) -> set[str]:
+    try:
+        return set(inspect.signature(fn).parameters)
+    except (TypeError, ValueError):  # 拿不到签名的内建/C 可调用对象
+        return set()
+
+
 def _notes_sink(fn) -> list[str] | None:
     """适配器接不接受 ``notes=`` 告警通道？接受就返回一个空列表，否则 ``None``。
 
@@ -106,11 +113,7 @@ def _notes_sink(fn) -> list[str] | None:
     而带 ``**kwargs`` 的桩会把 ``notes`` 默默吃掉、告警就丢了，
     所以**只有显式声明了 ``notes`` 的适配器才传**。
     """
-    try:
-        params = inspect.signature(fn).parameters
-    except (TypeError, ValueError):  # 拿不到签名的内建/C 可调用对象
-        return None
-    return [] if "notes" in params else None
+    return [] if "notes" in _param_names(fn) else None
 
 
 def fetch_works(
@@ -121,6 +124,7 @@ def fetch_works(
     mode: str | None = None,
     topic=None,
     sources=None,
+    journals=None,
 ) -> FetchResult:
     """多源并集检索。
 
@@ -132,10 +136,14 @@ def fetch_works(
     :param mode: 检索模式，透传给 OpenAlex。
     :param topic: 主题对象，透传给 OpenAlex。
     :param sources: 覆盖 ``config.DATA_SOURCES``（列表或逗号分隔字符串）。
+    :param journals: 期刊范围（刊名列表）。为空时用主题自己的 ``journals``，
+                     再退到 ``config.JOURNALS`` 全集。写错刊名会立刻报错。
     :raises RuntimeError: 全部数据源都失败时抛出（**绝不返回空结果假装成功**）。
     """
     names = enabled_sources(sources)
     cap = max(1, int(max_works or config.MAX_WORKS_FETCH))
+    scope_names = journals if journals is not None else getattr(topic, "journals", None)
+    scope = config.journals_for(scope_names)
 
     # ★ 召回词必须和 OpenAlex 走同一套优先级（--keywords > 主题 search_terms >
     #   主题 keywords > USER_KEYWORDS）。曾经这里直接用 keywords 参数，
@@ -153,9 +161,11 @@ def fetch_works(
         terms = []
 
     log.info(
-        "多源并集检索：%s（时间窗 %s 天）",
+        "多源并集检索：%s（时间窗 %s 天，期刊范围 %s 本%s）",
         " + ".join(source_label(name) for name in names),
         lookback_days,
+        len(scope),
+        "，主题限定" if scope_names else "",
     )
 
     reports: list[SourceReport] = []
@@ -175,7 +185,10 @@ def fetch_works(
             continue
 
         notes = _notes_sink(ADAPTERS[name])
-        extra = {"notes": notes} if notes is not None else {}
+        extra: dict[str, object] = {"notes": notes} if notes is not None else {}
+        # 同 notes 的探测理由：老桩函数没有 journals 参数，硬传会 TypeError。
+        if "journals" in _param_names(ADAPTERS[name]):
+            extra["journals"] = scope
         try:
             if name == OPENALEX:
                 works = ADAPTERS[name](

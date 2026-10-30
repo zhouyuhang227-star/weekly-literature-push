@@ -154,9 +154,14 @@ def fetch(
     keywords: list[str] | None,
     lookback_days: int,
     max_works: int | None = None,
+    journals: dict[str, str] | None = None,
     **_ignored,
 ) -> list[dict]:
-    """一次 bulk 检索拉回候选，再本地做期刊识别 + 关键词复核。"""
+    """一次 bulk 检索拉回候选，再本地做期刊识别 + 关键词复核。
+
+    ``journals`` 是主题限定的 ``{刊名: ISSN}``：S2 的 ``venue=`` 查询是模糊匹配，
+    这里**不传 venue**，改为拉全量后本地识别，再按这个范围过滤。
+    """
     terms = [str(term).strip() for term in (keywords or []) if str(term).strip()]
     if not terms:
         raise RuntimeError(
@@ -205,6 +210,8 @@ def fetch(
     no_doi = 0
     unmatched: dict[str, int] = {}
     dropped = 0
+    out_of_scope = 0
+    scope = set(journals or config.JOURNALS)
 
     for item in items:
         work, venue = _to_work(item)
@@ -214,6 +221,10 @@ def fetch(
             else:
                 no_doi += 1
             continue
+        if work["journal"] not in scope:
+            # 主题只盯某几本刊时，别把整个检索结果的其它刊也塞给 AI
+            out_of_scope += 1
+            continue
         if checkable and not matches_recall_terms(work, terms):
             dropped += 1
             continue
@@ -221,6 +232,11 @@ def fetch(
 
     if no_doi:
         log.debug("Semantic Scholar 跳过 %s 条无 DOI 记录", no_doi)
+    if out_of_scope:
+        log.info(
+            "Semantic Scholar 按主题的期刊范围剔除 %s 条（范围 %s 本刊）",
+            out_of_scope, len(scope),
+        )
     if dropped:
         log.debug("Semantic Scholar 关键词复核剔除 %s 条", dropped)
     if unmatched:

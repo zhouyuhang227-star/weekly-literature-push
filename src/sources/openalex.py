@@ -29,12 +29,13 @@ def fetch(
     *,
     mode: str | None = None,
     topic=None,
+    journals: dict[str, str] | None = None,
     **_ignored,
 ) -> list[dict]:
     """调用 ``openalex_client.fetch_works`` 并补齐多源所需字段。
 
     ``mode`` / ``topic`` 只有 OpenAlex 支持（语义主题检索是它的独有能力），
-    其它源拿到这两个参数也只能忽略。
+    其它源拿到这两个参数也只能忽略。``journals`` 是主题限定的期刊范围。
     """
     works = openalex_client.fetch_works(
         keywords,
@@ -42,6 +43,7 @@ def fetch(
         max_works=int(max_works or config.MAX_WORKS_FETCH),
         mode=mode or config.RETRIEVAL_MODE,
         topic=topic,
+        journals=journals,
     )
 
     for work in works:

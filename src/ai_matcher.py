@@ -25,25 +25,40 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
-from . import config
+from . import ai_cache, config
 from .config import (
     ABSTRACT_MAX_CHARS,
     AI_API_KEY,
     AI_BASE_URL,
+    AI_FAILOVER_AFTER,
     AI_MAX_RETRIES,
     AI_MAX_WORKERS,
+    AI_MIN_INTERVAL,
     AI_MODEL,
     AI_TEMPERATURE,
     AI_THRESHOLD,
+    AI_THRESHOLD_TITLE_ONLY,
     AI_TIMEOUT,
 )
 
 log = logging.getLogger(__name__)
+
+
+def threshold_for(work: dict, threshold_with_abstract: int, threshold_title_only: int) -> int:
+    """按「有没有摘要」选入选线。
+
+    双阈值的原因见 ``config.AI_THRESHOLD_TITLE_ONLY``：摘要缺失时 AI 只能凭标题
+    判断，给分天然偏低；用同一把尺子等于系统性淘汰刚上线的好论文。
+    """
+    if (work.get("abstract") or "").strip():
+        return threshold_with_abstract
+    return threshold_title_only
 
 
 def build_system_prompt(topic=None) -> str:
@@ -104,6 +119,79 @@ _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 #: 某些兼容端点不支持 response_format，这里做一次性探测降级
 _json_mode_supported = True
+
+#: 本轮运行状态（端点切换 / 熔断 / 节流）。每次 ``evaluate_works`` 开始时重置。
+#: 用模块级状态而不是逐篇传参：``call_ai`` 是既有契约（测试大量 patch 它），
+#: 加参数会让那些桩函数全部 TypeError。
+_run_lock = threading.Lock()
+_run_state = {"endpoint": 0, "fail_streak": 0, "open": False, "calls": 0}
+_last_call = 0.0
+
+
+def _reset_run_state() -> None:
+    with _run_lock:
+        _run_state.update(endpoint=0, fail_streak=0, open=False, calls=0)
+
+
+def _current_endpoint() -> dict[str, str]:
+    endpoints = config.ai_endpoints()
+    with _run_lock:
+        index = min(_run_state["endpoint"], len(endpoints) - 1)
+    return endpoints[index]
+
+
+def _breaker_open() -> bool:
+    with _run_lock:
+        return bool(_run_state["open"])
+
+
+def _record_success() -> None:
+    with _run_lock:
+        _run_state["fail_streak"] = 0
+        _run_state["calls"] += 1
+
+
+def _record_failure() -> None:
+    """记一次「整篇失败」：连续到阈值就切备用端点，再连续到阈值就熔断本轮。"""
+    with _run_lock:
+        _run_state["fail_streak"] += 1
+        streak = _run_state["fail_streak"]
+        endpoints = config.ai_endpoints()
+        if streak >= max(1, int(AI_FAILOVER_AFTER)) and _run_state["endpoint"] + 1 < len(endpoints):
+            _run_state["endpoint"] += 1
+            _run_state["fail_streak"] = 0
+            backup = endpoints[_run_state["endpoint"]]
+            log.warning(
+                "AI 首选端点连续失败 %s 篇，已切换到「%s」端点：%s（模型 %s）",
+                streak, backup["name"], backup["base_url"], backup["model"],
+            )
+            return
+        limit = max(1, int(config.AI_CIRCUIT_BREAK_AFTER))
+        if streak >= limit and not _run_state["open"]:
+            _run_state["open"] = True
+            log.error(
+                "AI 端点连续失败 %s 篇，本轮熔断：剩余文献不再调用 AI，"
+                "标记为「调用失败」（不写已读标记，下轮重试）。"
+                "请检查 AI_BASE_URL / AI_API_KEY，或配置 AI_BACKUP_* 备用端点。",
+                streak,
+            )
+
+
+def _throttle() -> None:
+    """全局节流：任意两次 AI 请求的发起时刻至少相隔 ``AI_MIN_INTERVAL`` 秒。"""
+    global _last_call
+    interval = max(0.0, float(AI_MIN_INTERVAL))
+    if not interval:
+        return
+    with _run_lock:
+        wait = interval - (time.monotonic() - _last_call)
+        if wait <= 0:
+            _last_call = time.monotonic()
+            return
+    # 不在锁里 sleep：那会把其它线程的状态更新一起堵住。
+    time.sleep(wait)
+    with _run_lock:
+        _last_call = time.monotonic()
 
 
 # ---------------------------------------------------------------------------
@@ -348,14 +436,18 @@ def build_prompt(work: dict, keywords: list[str] | None = None, topic=None) -> s
     )
 
 
-def _post_chat(payload: dict) -> str:
+def _post_chat(payload: dict, endpoint: dict | None = None) -> str:
+    endpoint = endpoint or _current_endpoint()
+    body = dict(payload)
+    body["model"] = endpoint.get("model") or AI_MODEL
+    _throttle()
     resp = requests.post(
-        f"{AI_BASE_URL.rstrip('/')}/chat/completions",
+        f"{str(endpoint.get('base_url') or AI_BASE_URL).rstrip('/')}/chat/completions",
         headers={
-            "Authorization": f"Bearer {AI_API_KEY}",
+            "Authorization": f"Bearer {endpoint.get('api_key') or AI_API_KEY}",
             "Content-Type": "application/json",
         },
-        json=payload,
+        json=body,
         timeout=AI_TIMEOUT,
     )
     if resp.status_code in (429, 500, 502, 503, 504):
@@ -399,6 +491,7 @@ def call_ai(
                 raise ValueError(f"无法解析 AI 返回的 JSON: {(content or '')[:120]!r}")
             score, takeaway, reason = normalize_result(data)
             anode_free, cathode_system = normalize_flags(data)
+            _record_success()
             return score, takeaway, reason, anode_free, cathode_system
         except requests.HTTPError as exc:
             status = exc.response.status_code if exc.response is not None else None
@@ -410,7 +503,9 @@ def call_ai(
                 last_error = exc
                 continue
             last_error = exc
-        except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+        except (requests.RequestException, ValueError, KeyError, TypeError, RuntimeError) as exc:
+            # RuntimeError 是 ``_post_chat`` 对 429/5xx 的显式抛出 ——
+            # 之前没接住它，于是"临时错误"直接冒到上层、连一次重试都没有。
             last_error = exc
 
         if attempt < AI_MAX_RETRIES:
@@ -430,15 +525,51 @@ def _dispatch_call(
     return call_ai(work, keywords, topic)
 
 
-def evaluate_one(work: dict, keywords: list[str] | None = None, topic=None) -> dict:
+def evaluate_one(
+    work: dict,
+    keywords: list[str] | None = None,
+    topic=None,
+    cache: dict | None = None,
+    prompt_fp: str = "",
+) -> dict:
     """给单篇文献打分，返回带 ``ai_score`` / ``ai_takeaway`` / ``ai_reason`` 的副本。
 
     ``anode_free`` / ``cathode_system`` 是 AI 的结构化判断，供保底逻辑使用
     （见 :func:`src.content_rules.ai_keep_hit`）。
     即使 AI 失败也会返回结果（``ai_error=True`` + 保守分 0），
     由上层决定是否展示，绝不静默丢稿。
+
+    ``cache`` 是 :mod:`src.ai_cache` 的内存字典：命中时**不调用 AI**，
+    并把 ``ai_cached`` 标成 True（便于日志统计）。
     """
     result = dict(work)
+    key = ""
+    abs_sig = ""
+    if cache is not None and config.AI_CACHE_ENABLED:
+        key = ai_cache.entry_key(topic, work)
+        abs_sig = ai_cache.abstract_signature(work)
+        hit = ai_cache.get(cache, key, prompt_fp, abs_sig)
+        if hit:
+            result.update(
+                ai_score=int(hit.get("score") or 0),
+                ai_takeaway=str(hit.get("takeaway") or ""),
+                ai_reason=str(hit.get("reason") or ""),
+                ai_error=False,
+                anode_free=bool(hit.get("anode_free")),
+                cathode_system=str(hit.get("cathode_system") or ""),
+                ai_cached=True,
+            )
+            return result
+
+    if _breaker_open():
+        result.update(
+            ai_score=0,
+            ai_takeaway="",
+            ai_reason="AI 端点连续失败，本轮已熔断（未标记已读，下轮自动重试）",
+            ai_error=True,
+        )
+        return result
+
     try:
         score, takeaway, reason, anode_free, cathode_system = _dispatch_call(
             work, keywords, topic
@@ -451,7 +582,13 @@ def evaluate_one(work: dict, keywords: list[str] | None = None, topic=None) -> d
             anode_free=anode_free,
             cathode_system=cathode_system,
         )
+        if cache is not None:
+            ai_cache.put(
+                cache, key, prompt_fp, abs_sig,
+                (score, takeaway, reason, anode_free, cathode_system),
+            )
     except Exception as exc:
+        _record_failure()
         log.error("AI 打分失败 %s: %s", work.get("doi"), exc)
         result.update(
             ai_score=0,
@@ -465,19 +602,56 @@ def evaluate_one(work: dict, keywords: list[str] | None = None, topic=None) -> d
 # ---------------------------------------------------------------------------
 # 批量
 # ---------------------------------------------------------------------------
+def resolve_thresholds(
+    threshold: int | None,
+    threshold_title_only: int | None,
+    topic=None,
+) -> tuple[int, int]:
+    """解析出 ``(有摘要阈值, 仅标题阈值)``。
+
+    优先级：
+      1. 显式传入的 ``threshold`` / ``threshold_title_only``（命令行、测试）
+      2. 主题自己的 ``threshold_with_abstract`` / ``threshold_title_only``
+      3. 全局 ``AI_THRESHOLD_WITH_ABSTRACT`` / ``AI_THRESHOLD_TITLE_ONLY``
+
+    只显式给了 ``threshold`` 时，仅标题那档**沿用同一个值**：调用方既然明说
+    "阈值就是 60"，就不该在它背后偷偷换成 35，否则测试与手工调试的结果对不上。
+    想分档就两个一起给（或干脆不传，让主题/全局配置说话）。
+    """
+    if threshold is not None:
+        with_abstract = int(threshold)
+        title_only = int(threshold) if threshold_title_only is None else int(threshold_title_only)
+        return with_abstract, title_only
+
+    if topic is not None and hasattr(topic, "effective_thresholds"):
+        with_abstract, title_only = topic.effective_thresholds()
+    else:
+        with_abstract, title_only = AI_THRESHOLD, AI_THRESHOLD_TITLE_ONLY
+    if threshold_title_only is not None:
+        title_only = int(threshold_title_only)
+    return int(with_abstract), int(title_only)
+
+
 def evaluate_works(
     works: list[dict],
     keywords: list[str] | None = None,
-    threshold: int = AI_THRESHOLD,
+    threshold: int | None = None,
     max_workers: int = AI_MAX_WORKERS,
     topic=None,
+    threshold_title_only: int | None = None,
+    cache: dict | None = None,
 ) -> tuple[list[dict], list[dict], list[dict]]:
-    """并发打分，并按阈值把结果分成三堆。
+    """并发打分，并按**双阈值**把结果分成三堆。
 
     :return: ``(入选, 调用失败, 低于阈值)``
-             * 入选 —— 分数 >= threshold，按 (分数, 日期) 降序
+             * 入选 —— 分数 >= 该篇对应的阈值，按 (分数, 日期) 降序
              * 失败 —— ``ai_error=True``，分数不可信，不要回写已读标记
              * 低于阈值 —— 明确判定不相关，可安全回写已读标记以免重复打分
+
+    阈值分两档：有摘要用 ``threshold_with_abstract``，无摘要用
+    ``threshold_title_only``（默认 60 / 35）。单用 60 一刀切会把刚上线、
+    索引里还没摘要的好论文系统性淘汰 —— 这正是"经常漏文献"的一个主因。
+    解析规则见 :func:`resolve_thresholds`。
 
     之所以要把"低于阈值"单独返回：候选量有近 200 篇而邮件只发 20 篇，
     若不记录这些已判定过的文献，下周它们会被原封不动地重新打分一遍。
@@ -493,15 +667,26 @@ def evaluate_works(
 
     :param keywords: 打分判据；``None`` 表示用 ``topic``（或 config）的研究方向描述。
     :param topic: ``config.ResearchTopic``；多主题调研时每个主题各用各的判据。
+    :param cache: :mod:`src.ai_cache` 的内存字典；命中就不调 AI，下轮接着用。
     """
     if not works:
         return [], [], []
 
-    log.info("AI 打分开始：%s 篇，并发 %s，阈值 %s", len(works), max_workers, threshold)
+    with_abstract, title_only = resolve_thresholds(threshold, threshold_title_only, topic)
+    _reset_run_state()
+    prompt_fp = ai_cache.fingerprint(topic, keywords) if cache is not None else ""
+    if with_abstract == title_only:
+        threshold_note = f"阈值 {with_abstract}"
+    else:
+        threshold_note = f"阈值 有摘要≥{with_abstract} / 仅标题≥{title_only}"
+    log.info("AI 打分开始：%s 篇，并发 %s，%s", len(works), max_workers, threshold_note)
     scored: list[dict] = []
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(evaluate_one, work, keywords, topic): work for work in works}
+        futures = {
+            pool.submit(evaluate_one, work, keywords, topic, cache, prompt_fp): work
+            for work in works
+        }
         for index, future in enumerate(as_completed(futures), start=1):
             try:
                 scored.append(future.result())
@@ -511,15 +696,17 @@ def evaluate_works(
             if index % 10 == 0 or index == len(works):
                 log.info(" AI 进度 %s/%s", index, len(works))
 
-    passed, failed, rejected = _partition_forced(scored, threshold, topic)
+    passed, failed, rejected = _partition_forced(scored, with_abstract, topic, title_only)
     passed.sort(key=lambda w: (w.get("ai_score") or 0, w.get("pub_date") or ""), reverse=True)
 
+    cached = sum(1 for w in scored if w.get("ai_cached"))
     log.info(
-        "AI 打分完成：%s 篇通过阈值（>=%s），%s 篇低于阈值，%s 篇调用失败%s",
+        "AI 打分完成：%s 篇通过阈值（%s），%s 篇低于阈值，%s 篇调用失败%s%s",
         len(passed),
-        threshold,
+        threshold_note.replace("阈值 ", ""),
         len(rejected),
         len(failed),
+        f"，{cached} 篇命中缓存未调用" if cached else "",
         _forced_note(passed),
     )
     return passed, failed, rejected
@@ -534,9 +721,15 @@ def _forced_note(passed: list[dict]) -> str:
 
 
 def _partition_forced(
-    scored: list[dict], threshold: int, topic=None
+    scored: list[dict],
+    threshold: int,
+    topic=None,
+    threshold_title_only: int | None = None,
 ) -> tuple[list[dict], list[dict], list[dict]]:
     """三堆的划分规则，单独拎出来是因为逻辑不直观。
+
+    阈值按篇取：有摘要用 ``threshold``，无摘要用 ``threshold_title_only``
+    （不传就与 ``threshold`` 相同，保持老行为）。
 
     保底命中的论文**先被摘出去**，再划分剩下的。顺序反了就会出错：
     "分数 >= threshold 入选 / 否则低于阈值"这套条件对一篇 55 分的无负极论文
@@ -557,6 +750,7 @@ def _partition_forced(
     """
     from . import content_rules
 
+    title_only = threshold if threshold_title_only is None else threshold_title_only
     passed: list[dict] = []
     failed: list[dict] = []
     rejected: list[dict] = []
@@ -584,7 +778,7 @@ def _partition_forced(
             continue
         if work.get("ai_error"):
             failed.append(work)
-        elif (work.get("ai_score") or 0) >= threshold:
+        elif (work.get("ai_score") or 0) >= threshold_for(work, threshold, title_only):
             passed.append(work)
         else:
             rejected.append(work)
