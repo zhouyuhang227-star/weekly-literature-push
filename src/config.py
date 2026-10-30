@@ -357,6 +357,15 @@ SODIUM_CATHODE_TERMS: list[str] = [
     "na excess",  # 钠电版"无负极"：正极过量钠、负极无活性材料
     "prussian blue",
     "nasicon",
+    # —— 钠金属 / 无负极特有的界面与沉积行话 ——
+    # 标题里常常一个 "sodium" 都不写（"Sodiophilic current collector…"、
+    # "Na deposition behaviour…"），不补这些词，无负极钠电的保底会静默漏掉。
+    "sodiophilic",
+    "sodium deposition",
+    "na deposition",
+    "sodium plating",
+    "na plating",
+    "na nucleation",
 ]
 
 #: 无负极保底的**体系闸门**：命中 ``ANODE_FREE_TERMS`` 之后，还必须命中这里任一个。
@@ -464,6 +473,9 @@ KEEP_RULES: list[dict] = [
         #   没有它的话，"摘要里顺口提一句无负极"的锂硫/其它体系论文也会被置顶
         #   （真实事故见 ANODE_FREE_KEEP_CATHODES 上面的注释）。
         "require": [ANODE_FREE_KEEP_CATHODES],
+        # 「无负极钠电」主题有自己的保底（只认钠电），见该主题的 keep。
+        # 不豁免的话，富锂锰的无负极论文会被这条全局保底强推进钠电邮件。
+        "skip_topics": ["无负极钠电"],
     },
 ]
 
@@ -477,6 +489,10 @@ EXCLUDE_RULES: list[dict] = [
     {
         "label": "电解液工程",
         "score": 0,
+        # 在「无负极钠电」主题里**不生效**：那个主题专门研究无负极钠电的
+        # 电解液工程，把它硬剔除掉等于把要盯的方向整片删掉。
+        # 其它主题（富锂锰 / 钠离子正极）照旧剔除。
+        "skip_topics": ["无负极钠电"],
         "any": [
             "electrolyte additive",
             "electrolyte additives",
@@ -596,10 +612,16 @@ def validate_rule_list(rules: object, group_name: str) -> list[str]:
         patterns = [str(p).strip() for p in (rule.get("any") or []) if str(p).strip()]
         if not patterns:
             problems.append(f'{label} 缺少非空的 "any"（命中列表）→ 这条规则永远不会生效')
-        for key in ("all", "unless"):
+        for key in ("all", "unless", "skip_topics"):
             value = rule.get(key)
             if value is not None and not isinstance(value, (list, tuple)):
                 problems.append(f'{label} 的 "{key}" 必须是列表')
+            elif key == "skip_topics" and value is not None:
+                if not all(isinstance(item, str) and item.strip() for item in value):
+                    problems.append(
+                        f'{label} 的 "skip_topics" 必须是主题名/键的字符串列表'
+                        "（写错名字 = 这条豁免永远不生效）"
+                    )
         # "require" 是"必须命中"的短语**组**：每组内 OR、组之间 AND，
         # 形状比 all/unless 深一层，少写一层方括号（把组写成字符串）会让规则**永远不命中**，
         # 而这正是本项目最怕的失效方式（静默丢文献），所以形状要一条条查。
@@ -778,7 +800,7 @@ TOPICS: dict[str, str] = {}
 #   keep         选填。**只对这个主题生效**的硬保底规则（写法同上面的 KEEP_RULES）。
 #                    全局的 BONUS_RULES / EXCLUDE_RULES / KEEP_RULES 仍然照常生效，这里是叠加。
 #
-# 当前启用：两个方向（想回到单方向就把 RESEARCH_TOPICS 改回 []）
+# 当前启用：三个方向（想回到单方向就把 RESEARCH_TOPICS 改回 []）
 #
 # 【三层字段的分工 —— 改方向前先看这一段】
 #   search_terms  【召回层】进 OpenAlex 的字面检索（title_and_abstract.search），
@@ -933,6 +955,88 @@ RESEARCH_TOPICS: list[dict] = [
             },
         ],
     },
+    {
+        "name": "无负极钠电",
+        # 留空 = 不走 topics.id（OpenAlex 没有「anode-free sodium」这个主题）
+        "topic_query": "",
+        # 实测（24 本刊 / 近 45 天 / 引号短语 OR 并集 = 38 篇；90 天预热窗 = 88 篇）：
+        #   "sodium metal" 18、"anode-free" 17、"na deposition" 6、"sodiophilic" 5、
+        #   "na metal" 4、"na plating" 4、"sodium plating" 3、"sodium deposition" 3、
+        #   "anode-free sodium" 3、"anode-less" 2、"zero-excess" 1、"hostless" 1、
+        #   "na nucleation" 1。
+        # ⚠️ 实测**命中 0 篇**的写法没有写进来（OpenAlex 是**短语**匹配，写错一个字等于没写）：
+        #   "anode-free na"、"sodium-free anode"、"na-free anode"、"anodeless sodium"、
+        #   "sodium nucleation"、"sodium current collector"、"sodium electrolyte"、
+        #   "na metal battery"（论文里写的是 sodium metal batteries）。
+        #
+        # 为什么是这几个词：
+        #   · "sodium metal" 覆盖钠金属电池的电解液 / 界面 / 沉积工作（本主题主体）；
+        #   · "anode-free" 只有 17 篇，但能捞到 "anode-free metal batteries"、
+        #     "anode-free Na / Na metal" 这类体系词不挨着的写法；锂 / 锌 / 钾的同类论文
+        #     由 AI 按 description 判掉，多花十几次调用可以接受；
+        #   · "sodiophilic" / "na deposition" / "na plating" / "na nucleation" 是
+        #     集流体与界面改性的行话，标题里常常一个 "sodium" 都不写；
+        #   · 电解液工程**不单列词**：钠金属电解液论文几乎必然出现 "sodium metal"，
+        #     真做无负极的必然带 "anode-free"；单列 "sodium electrolyte" 实测 0 篇。
+        #   · "sodium metal battery" / "sodium metal anode" 在 OpenAlex 里是
+        #     "sodium metal" 的子集，保留是为了喂给 Crossref / S2 的分词检索。
+        "search_terms": [
+            # —— 无负极构型 ——
+            "anode-free sodium",
+            "anode-free",
+            "zero-excess",
+            "hostless",
+            "anode-less",
+            # —— 钠金属体系（电解液 / 界面 / 沉积的主体）——
+            "sodium metal",
+            "sodium metal battery",
+            "sodium metal anode",
+            "na metal",
+            # —— 集流体与沉积界面 ——
+            "sodiophilic",
+            "sodium deposition",
+            "na deposition",
+            "sodium plating",
+            "na plating",
+            "na nucleation",
+        ],
+        "keywords": [
+            "anode-free / anode-less / zero-excess / hostless sodium metal battery",
+            "sodium metal anode / Na metal battery",
+            "electrolyte engineering: solvation structure, weak-solvating solvent, electrolyte additive, SEI design",
+            "current collector modification: sodiophilic coating, Cu / Al current collector, 3D host, artificial interlayer",
+            "sodium nucleation / deposition / plating-stripping, Coulombic efficiency, dendrite-free",
+            "lean electrolyte, thin sodium, Ah-level pouch cell, practical anode-free cell",
+        ],
+        "description": (
+            "只看**无负极钠电**（anode-free / anode-less / zero-excess / hostless 的钠金属电池）："
+            "电解液工程（溶剂化结构、弱溶剂化溶剂、添加剂、SEI 设计）、集流体与界面改性"
+            "（亲钠 sodiophilic 涂层、Cu/Al 集流体、3D 集流体、人工界面层）、"
+            "钠沉积/剥离与库仑效率、贫电解液与 Ah 级实用电芯。"
+            "**电解液工程与集流体界面改性在本主题里是核心内容，不是排除项**。"
+            "不含锂/锌/钾等其它金属体系；不含钠离子电池正极材料研究（另有主题）；不含隔膜改性。"
+        ),
+        # 本主题自己的硬保底：无负极构型 **且** 钠电体系。
+        # 全局 KEEP_RULES 已被 skip_topics 豁免，换成这条更窄的闸门：
+        # 富锂锰的无负极论文不会再被强推进钠电邮件。
+        "keep": [
+            {
+                "label": "无负极钠电",
+                "any": ANODE_FREE_TERMS,
+                "require": [SODIUM_CATHODE_TERMS],
+            },
+        ],
+        # 覆盖全局的「不看电解液工程」：本主题正是要盯它。
+        # 全局说明里那句「无负极例外」本来就是为这类论文写的，但主句仍会把 AI
+        # 往「电解液工程 -> 低分」带，所以这里整段替换。
+        "exclude_note": (
+            "本主题**专门关注无负极钠电**，所以「电解液工程」在这里**不是排除项**："
+            "溶剂化结构、弱溶剂化 / 高浓电解液、添加剂、SEI 设计、集流体亲钠改性、"
+            "钠沉积/剥离与库仑效率都属于核心内容，请正常给高分。"
+            "仍然不看：隔膜改性；锂 / 锌 / 钾等其它金属体系；钠离子电池正极材料（另有主题）；"
+            "以及只研究钠离子电解液、与钠金属 / 无负极无关的工作。"
+        ),
+    },
 ]
 
 
@@ -955,6 +1059,10 @@ class ResearchTopic:
     exclude: list[dict] = field(default_factory=list)
     #: 只对本主题生效的硬保底规则（全局的 KEEP_RULES 照常叠加）。
     keep: list[dict] = field(default_factory=list)
+    #: 覆盖全局 ``GLOBAL_EXCLUDE_NOTE``（拼进 AI 提示词的「不看什么」）。
+    #: 空 = 用全局那句。专门看电解液工程的主题必须覆盖，否则 AI 会照着
+    #: 「不看电解液工程」给低分，跟主题描述自相矛盾。
+    exclude_note: str = ""
     #: 本主题的期刊范围（config.JOURNALS 里的刊名）。空 = 全部期刊。
     journals: list[str] = field(default_factory=list)
     #: 本主题启用的数据源。空 = config.DATA_SOURCES。
@@ -999,8 +1107,10 @@ class ResearchTopic:
             lines.append(self.description.strip())
         if self.keywords:
             lines.append("关注关键词：" + "、".join(self.keywords))
-        # 全局排除说明（在文件顶部配置）——让 AI 打分时也避开这些方向
-        note = (GLOBAL_EXCLUDE_NOTE or "").strip()
+        # 全局排除说明（在文件顶部配置）——让 AI 打分时也避开这些方向。
+        # 主题可以用 exclude_note 整段覆盖（例如「无负极钠电」主题要把
+        # 「不看电解液工程」换成「电解液工程是核心内容」）。
+        note = (self.exclude_note or GLOBAL_EXCLUDE_NOTE or "").strip()
         if note:
             lines.append(note)
         return "\n".join(lines)
@@ -1057,6 +1167,7 @@ def active_research_topics() -> list[ResearchTopic]:
             bonuses=[rule for rule in (item.get("bonuses") or []) if isinstance(rule, dict)],
             exclude=[rule for rule in (item.get("exclude") or []) if isinstance(rule, dict)],
             keep=[rule for rule in (item.get("keep") or []) if isinstance(rule, dict)],
+            exclude_note=str(item.get("exclude_note") or ""),
             journals=[str(name) for name in (item.get("journals") or [])],
             sources=[str(name) for name in (item.get("sources") or [])],
             lookback_days=_int_or_zero(item.get("lookback_days")),

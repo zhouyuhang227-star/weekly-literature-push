@@ -15,7 +15,7 @@
 > `RESEARCH_FIELD` / `RESEARCH_DESCRIPTION` / `USER_KEYWORDS` / `TOPIC_QUERY`），代码不用动。
 > 详见 [如何换研究方向](#如何换研究方向)。
 
-> **当前已开启多主题**：同时跟了两个方向 —— 「富锂锰正极」+「钠离子正极」，
+> **当前已开启多主题**：同时跟了三个方向 —— 「富锂锰正极」+「钠离子正极」+「无负极钠电」，
 > **每个主题各检索、各打分、各发一封邮件、各记各的已推送记录**。
 > 详见 [多主题调研](#多主题调研)。
 
@@ -23,7 +23,7 @@
 
 | 层级 | 手段 | 作用 | 实测候选量 |
 |---|---|---|---|
-| 第 1 层 | **多源字面短词召回**（OpenAlex + Crossref + Semantic Scholar，三源各自查完后按 DOI 合并） | 按研究方向捞出**可能相关**的全部论文 | 首次 90 天窗下两个主题各约 150～250 篇；常规 45 天窗约 80～180 篇（24 本刊，随召回词数量变化较大） |
+| 第 1 层 | **多源字面短词召回**（OpenAlex + Crossref + Semantic Scholar，三源各自查完后按 DOI 合并） | 按研究方向捞出**可能相关**的全部论文 | 首次 90 天窗下两个正极主题各约 150～250 篇、无负极钠电约 90 篇；常规 45 天窗约 80～180 篇、无负极钠电约 40 篇（24 本刊，随召回词数量变化较大） |
 | 第 2 层 | AI 逐篇打分（0–100），低于阈值丢弃 | 按**你的具体兴趣**做精读判断 | ~20 篇入选（首次预热 50 篇） |
 
 > 第 1 层也可以用 OpenAlex 的**语义主题** `topics.id`（`--retrieval-mode topic`），
@@ -92,7 +92,7 @@
 │   ├── dedup.py                        # DOI 去重 + 运行状态持久化（按主题分区）
 │   ├── mailer.py                       # HTML 渲染 + SMTP 发送（含 PDF 附件）
 │   └── main.py                         # 主流程编排（多主题循环）+ 命令行
-├── tests/test_core.py                  # 344 个单元测试（锁定高风险修复）
+├── tests/test_core.py                  # 349 个单元测试（锁定高风险修复）
 ├── data/
 │   ├── pushed_dois.json                # 去重状态（必须提交）
 │   ├── search_plan.json                # 可选：检索方案（--write-plan 生成，不入库）
@@ -128,6 +128,7 @@ python -m src.main --dry-run -v     # 按新方案跑一轮预览
 |---|---|---|
 | `search_terms` | 第 1 层召回词（短词，OR 并联） | 主题自带的召回词 |
 | `keywords` / `description` | 第 2 层 AI 的打分尺 | 同上 |
+| `exclude_note` | 覆盖全局 `GLOBAL_EXCLUDE_NOTE`（拼进本主题的 AI 打分尺） | 空 = 用全局那句 |
 | `journals` | **只搜这些刊**（空 = `config.JOURNALS` 全部 24 本） | 空 |
 | `sources` | 本轮用哪些数据源（空 = 三个全开） | 空 |
 | `lookback_days` | 常规回看天数（0 = 45 天） | 0 |
@@ -636,6 +637,19 @@ Actions 变红。宁可贵主题失败，也不要「绿着跑错」。
 而 `li2mno3` / `lrlo` / `lmr` 这类缩写实际是 **0**（论文里不这么写）。
 「钠离子正极」同理：`sodium-ion` 34、`sodium ion` 34、`na-ion` 8、`prussian blue` 5。
 
+「无负极钠电」（2026-10 实测，24 本刊、45 天、OpenAlex **引号短语** OR 并集）：
+`sodium metal` 18、`anode-free` 17、`na deposition` 6、`sodiophilic` 5、
+`na metal` 4、`na plating` 4、`sodium plating` 3、`sodium deposition` 3、
+`anode-free sodium` 3、`anode-less` 2、`zero-excess` 1、`hostless` 1、
+`na nucleation` 1 —— **并集 38 篇（90 天预热窗 88 篇）**。
+`sodium metal battery` / `sodium metal anode` 在 OpenAlex 里是 `sodium metal` 的子集，
+保留只是为了喂 Crossref / S2 的分词检索。
+**实测 0 篇的组合没有写进配置**（OpenAlex 是短语匹配，差一个词就等于没写）：
+`anode-free na`、`sodium-free anode`、`na-free anode`、`sodium nucleation`、
+`sodium current collector`、`sodium electrolyte`、`na metal battery`。
+电解液工程**不单列召回词**：钠金属电解液论文几乎必然写 `sodium metal`，
+真做无负极的必然带 `anode-free`；单列 `sodium electrolyte` 实测 0 篇。
+
 两条经验：
 1. **别用缩写、别带 `/` `(` `)`** —— OpenAlex 字面检索下命中数几乎必然为 0（`config.py` 会在
    `--show-config` 里直接警告你）。
@@ -920,7 +934,7 @@ python -m src.main --find-topic "solid-state battery"   # 只有 topic 模式下
 `push.cmd`（实际逻辑在 `push.ps1`）会依次做 5 件事：
 
 1. 检查待提交文件，**拦住 `.env` 等敏感文件**（推上去就泄露了，而且删掉也仍留在 git 历史里）
-2. 跑全部单元测试（当前 344 个），**不通过就中止**（配置改错了根本推不上去）
+2. 跑全部单元测试（当前 349 个），**不通过就中止**（配置改错了根本推不上去）
 3. `fetch` + `rebase` ← **关键，见下方说明**
 4. `push`，失败自动重试 4 次（`github.com` 在国内时通时不通）
 5. 校验远程 commit 和本地是否一致
@@ -1111,11 +1125,10 @@ ISSN 可在 [OpenAlex Sources](https://openalex.org/sources) 或期刊官网查�
 想同时跟两个以上方向（例如「富锂锰正极」+「钠离子正极」），
 就在 `src/config.py` 里的 `RESEARCH_TOPICS` 里填 —— **每个主题各检索、各打分、各发一封邮件**。
 
-> **当前已启用两个主题**：「富锂锰正极」（分区键 `富锂锰正极`）和
-> 「钠离子正极」（分区键 `钠离子正极`）。
-> 这两个分区**已被手动清空**（旧记录来自一次静默退化的全库检索，DOI 全是无关论文，
-> 留着会把正确结果挡在去重之外），所以下一轮会被当成首次运行 ——
-> **第一封邮件覆盖 90 天**，之后回到 45 天。
+> **当前已启用三个主题**：「富锂锰正极」「钠离子正极」「无负极钠电」（分区键都等于主题名）。
+> 前两个分区**曾被手动清空**（旧记录来自一次静默退化的全库检索，DOI 全是无关论文，
+> 留着会把正确结果挡在去重之外）；「无负极钠电」是 2026-10 新增的主题，分区本来就是空的。
+> 所以第一轮都会按首次运行处理 —— **第一封邮件覆盖 90 天**，之后回到 45 天。
 > 运行日志里的「使用 90 天窗口」就是这个原因，不是配置错了。
 
 ```python
@@ -1139,6 +1152,21 @@ RESEARCH_TOPICS: list[dict] = [
              "any": ["layered oxide cathode", "p2 type", "o3 type"], "all": ["sodium"]},
         ],
     },
+    {
+        "name": "无负极钠电",                      # 2026-10 新增
+        "search_terms": ["anode-free sodium", "anode-free", "sodium metal",
+                         "sodiophilic", "na deposition", "na plating",
+                         "sodium metal anode", "na nucleation"],
+        "keywords": ["anode-free / zero-excess sodium metal battery",
+                     "electrolyte engineering: solvation structure, additive, SEI",
+                     "current collector modification: sodiophilic coating, 3D host"],
+        "description": "只看无负极钠电（含电解液工程与集流体/界面改性），不含其它金属体系",
+        # ↓ 覆盖全局「不看电解液工程」：本主题正是要盯它
+        "exclude_note": "本主题专门关注无负极钠电，「电解液工程」在这里不是排除项……",
+        # ↓ 本主题自己的保底（只认钠电）；全局那条已被 skip_topics 豁免
+        "keep": [{"label": "无负极钠电", "any": ANODE_FREE_TERMS,
+                  "require": [SODIUM_CATHODE_TERMS]}],
+    },
 ]
 ```
 
@@ -1161,8 +1189,8 @@ RESEARCH_TOPICS: list[dict] = [
 | 现象 | 说明 |
 |---|---|
 | 填了 `RESEARCH_TOPICS` 后，`RESEARCH_FIELD` / `USER_KEYWORDS` / `TOPIC_QUERY` / `TOPICS` / `RESEARCH_DESCRIPTION` 不再生效 | 每个主题改用自己字典里的字段。程序会在日志里以 `配置说明：` 提示（INFO 级，不是报错） |
-| **同一篇论文可能同时出现在两个主题的邮件里** | 去重是**按主题分区**的：`data/pushed_dois.json` 里每个主题各一份已推 DOI 列表。两个方向的交叉论文（比如同时讲钠电与层状氧化物）都该看到 |
-| 主题跨领域时期刊也不同 | 期刊列表 `JOURNALS` 是**全局共用**的；现在两个主题都属电池方向，所以一张表就够了 |
+| **同一篇论文可能同时出现在多个主题的邮件里** | 去重是**按主题分区**的：`data/pushed_dois.json` 里每个主题各一份已推 DOI 列表。交叉论文（比如同时讲钠电与层状氧化物）都该看到 |
+| 主题跨领域时期刊也不同 | 期刊列表 `JOURNALS` 是**全局共用**的；现在三个主题都属电池方向，所以一张表就够了 |
 | `name` 改了，该主题突然又推了 90 天的旧文章 | 分区键默认是 `name`，改名 = 换了一个新分区 → 被视为首次运行（90 天预热）。想改名又不重推，把 `key` 填成旧 `name` |
 | 某个主题挂掉，其它主题照常发信 | 单个主题异常不会连累其余主题；但最终 Actions 仍会变红，避免静默漏推 |
 | 想看每个主题各自的分区情况 | 每次运行开头会打印 `【状态】去重库分区 {...}` |
@@ -1247,10 +1275,21 @@ python -m src.main --topic 富锂锰正极 --topic 钠离子正极
 |---|---|---|
 | `BONUS_RULES` | 命中关键词就**加分**（全局）—— **只管排序** | 固态电池 **+1** ｜ 固态聚合物电解质 **+1** ｜ 无负极 **+10** |
 | `EXCLUDE_RULES` | 命中关键词就**直接从候选里剔掉**（默认只看标题）—— **跑在 AI 之前** | 电解液工程 ｜ 隔膜改性 |
-| `KEEP_RULES` | 命中关键词（**且满足 `require` 体系闸门**）就**强制进邮件并置顶** —— 免于剔除规则、也免于 AI 入选线 | 无负极 **且（富锂锰 或 钠电）** |
+| `KEEP_RULES` | 命中关键词（**且满足 `require` 体系闸门**）就**强制进邮件并置顶** —— 免于剔除规则、也免于 AI 入选线 | 无负极 **且（富锂锰 或 钠电）**（「无负极钠电」主题换成只认钠电，见下） |
 | `GLOBAL_EXCLUDE_NOTE` | 一段中文说明，拼进**每个主题的 AI 打分尺** | 「不看电解液工程…与隔膜改性；不计入凝胶电解质。**例外：涉及无负极构型（anode-free / anodeless / hostless / zero-excess，含锂与钠体系），只要正极是富锂锰基或钠电体系，一律保留并给高分，即使它属于电解液工程**。⚠️ 无负极是电芯构型，标题里可能一个字都没写，请从摘要所描述的电芯结构自行判断。」 |
 | 主题里的 `bonuses` / `exclude` / `keep` | 只对那一个主题生效，与全局规则**叠加** | 「钠离子正极」额外有 层状钠离子正极 **+2** |
+| 规则里的 `skip_topics` | 让**全局**规则在指定主题里**不生效**（主题名或 `key` 都认） | 「电解液工程」对「无负极钠电」失效；全局保底也对该主题让位 |
+| 主题里的 `exclude_note` | 整段覆盖 `GLOBAL_EXCLUDE_NOTE`，只影响该主题的 AI 打分尺 | 「无负极钠电」把「不看电解液工程」换成「电解液工程是核心内容」 |
 
+**两条「按主题例外」的机制**（都是为「无负极钠电」主题加的）：
+
+- `skip_topics`：全局规则声明「在哪些主题里不生效」。现在「电解液工程」写了
+  `skip_topics: ["无负极钠电"]` —— 那个主题正是要盯电解液工程，硬剔除等于把要盯的方向
+  整片删掉；「富锂锰正极」「钠离子正极」照旧剔除。全局 `KEEP_RULES` 也用了它：
+  让位给「无负极钠电」主题自己那条更窄的保底（只认钠电），否则富锂锰的无负极论文
+  会被全局保底「富锂锰 或 钠电」强推进钠电邮件。
+- `exclude_note`：主题级整段覆盖全局口径，空 = 用全局那句。只改 AI 提示词，
+  不影响剔除规则（剔除规则用 `skip_topics` 豁免）。
 **为什么需要 `KEEP_RULES` 这一层（真实事故）：**
 
 title 里有 `electrolyte engineering` 的**无负极钠电**论文会被**两道关口连续杀掉**：
@@ -1290,7 +1329,7 @@ title 里有 `electrolyte engineering` 的**无负极钠电**论文会被**两�
 | 漏 | 补法 |
 |---|---|
 | **词表只能做字面匹配** —— 无负极是**电芯构型**，往往不是研究重点，标题里可能一个字都没有（「裸 Cu 集流体直接沉积」「负极过量≈0」），词表必定漏 | 让 **AI 顺手判一次**（见下），它本来就通读了摘要 |
-| **召回层根本没捞到** —— JACS 那篇《Data-Driven Knowledge Discovery Reveals Quantitative Electrolyte Design Rules for Anode-Free Sodium Metal Batteries》（`10.1021/jacs.6c05130`）在「钠离子正极」主题下**一个 `search_terms` 都不命中**（补词前 0 命中，于是连候选池都进不去，后面的保底再准也没用） | 给两个主题补召回词：补词后它命中 `sodium metal batteries` + `anode-free sodium` 两个词（有测试钉住），见 [改关键词](#改关键词user_keywords--主题的-search_termskeywords) |
+| **召回层根本没捞到** —— JACS 那篇《Data-Driven Knowledge Discovery Reveals Quantitative Electrolyte Design Rules for Anode-Free Sodium Metal Batteries》（`10.1021/jacs.6c05130`）在「钠离子正极」主题下**一个 `search_terms` 都不命中**（补词前 0 命中，于是连候选池都进不去，后面的保底再准也没用） | 给主题补召回词：补词后它命中 `sodium metal batteries` + `anode-free sodium` 两个词（有测试钉住），见 [改关键词](#改关键词user_keywords--主题的-search_termskeywords) |
 
 > 这类补词的代价是**会顺手捞到非本课题的无负极论文** —— 上面那篇锂硫就被
 > `anode-free lithium` 捞进了「富锂锰正极」的候选池。这是**故意**的：
@@ -1311,15 +1350,16 @@ title 里有 `electrolyte engineering` 的**无负极钠电**论文会被**两�
 免阈值与置顶都没了，而日志里看不出任何异常。实测 16 种真实写法里有 **9 种**是这么漏的。
 
 补法：把召回层的机理词、化学式写法、`OLO` 一并加进闸门
-（`LMR_CATHODE_TERMS` 22 个 + `SODIUM_CATHODE_TERMS` 8 个），并加一条**自维护测试**：
+（`LMR_CATHODE_TERMS` 22 个 + `SODIUM_CATHODE_TERMS` 14 个），并加一条**自维护测试**：
 
 ```python
 # 召回层能捞到的词，闸门必须也认 —— 新加了召回词却忘了加闸门，这条测试立刻红
 def test_every_recall_term_can_also_pass_the_gate(self): ...
 ```
 
-例外只能写进 `GATE_EXEMPT_RECALL_TERMS`（目前 2 个，每个都写了理由）：
-`anode-free lithium`（它是**构型**词不是体系词）、`voltage hysteresis`
+例外只能写进 `GATE_EXEMPT_RECALL_TERMS`（目前 6 个，每个都写了理由）：
+`anode-free` / `anode-less` / `zero-excess` / `hostless` / `anode-free lithium`
+（它们都是**构型**词，不指明体系，闸门的职责正是筛体系）、`voltage hysteresis`
 （锂硫论文几乎篇篇都写它，当体系证据会把锂硫重新推回置顶）。
 
 **② 别名表的键与查表用的键不是同一套归一化 → 多词别名全部静默失效**
@@ -1417,7 +1457,8 @@ def test_every_recall_term_can_also_pass_the_gate(self): ...
 | 「保底只留**富锂锰 / 钠电**的无负极，锂硫那些不要」 | `KEEP_RULES` 里那条的 **`require`**（体系闸门）；`ANODE_FREE_KEEP_CATHODES` 是词表所在 |
 | 「无负极明明没写关键词，怎么没保底？」 | 先看 `--show-config` 里的`且须命中`；确实体系词也拼不出来的，靠 **AI 侧保底**（`AI_ANODE_FREE_HINT` / `AI_CATHODE_HINT` 调口径），或把新写法加进 `ANODE_FREE_TERMS` |
 | 「AI 老把体系判错」 | `AI_CATHODE_HINT` 里那三个字符串就是 AI 要原样返回的值，而 `KEEP_CATHODE_SYSTEMS` 是代码的查表 —— **两边必须逐字一致** |
-| 「某个方向只有钠电要保底，锂电不用」 | 把 `keep` 写进「钠离子正极」主题里（主题级 `keep` 优先/叠加） |
+| 「某个方向只有钠电要保底，锂电不用」 | 主题写自己的 `keep`，再给全局那条加 `skip_topics: ["主题名"]`（现在「无负极钠电」就是这么做的） |
+| 「电解液工程在某个主题里是核心内容，别剔除、也别让 AI 打低分」 | 给全局剔除规则加 `skip_topics: ["主题名"]`，并在该主题写 `exclude_note` 覆盖全局口径（现在「无负极钠电」这么做） |
 | 「只看层状钠离子正极」 | 改「钠离子正极」主题的 `description` + 给其它类型更低分 |
 | 「电解液工程、隔膜改性的文章直接别给我」 | `EXCLUDE_RULES`（同时在 `GLOBAL_EXCLUDE_NOTE` 里说一句给 AI） |
 | 「剔除规则误杀了」 | 先看它是不是该进 `KEEP_RULES`；否则给那条规则加 `"scope": "title"`（默认就是）或写 `unless` 白名单 |
@@ -1558,7 +1599,7 @@ on:
 ## 本地开发
 
 ```bash
-# 跑测试（344 个）
+# 跑测试（349 个）
 python -m unittest discover -s tests -v
 
 # 语法检查

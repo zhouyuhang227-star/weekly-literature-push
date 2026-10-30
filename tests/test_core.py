@@ -2202,9 +2202,17 @@ def li_s_anode_free_work(**extra) -> dict:
 
 #: 故意**只**在召回层、不进保底闸门的词（见
 #: ``TestKeepRules.test_every_recall_term_can_also_pass_the_gate``）。
-#:   * ``anode-free lithium``：它是「构型词」不是「体系词」，闸门的职责正是筛体系；
+#:   * 构型词（``anode-free`` / ``anode-less`` / ``zero-excess`` / ``hostless`` /
+#:     ``anode-free lithium``）：它们不指明体系，闸门的职责正是筛体系；
 #:   * ``voltage hysteresis``：锂硫论文篇篇都写，当体系证据会把锂硫放回置顶。
-GATE_EXEMPT_RECALL_TERMS = {"anode-free lithium", "voltage hysteresis"}
+GATE_EXEMPT_RECALL_TERMS = {
+    "anode-free",
+    "anode-less",
+    "zero-excess",
+    "hostless",
+    "anode-free lithium",
+    "voltage hysteresis",
+}
 
 
 class TestKeepRules(unittest.TestCase):
@@ -2387,14 +2395,18 @@ class TestKeepRules(unittest.TestCase):
         论文进了候选池、AI 也打了分，却拿不到保底（日志里看不出任何异常）。
         这里逐词测：``Anode-free cell with <召回词>`` 必须能保底。
         例外只能写在 ``GATE_EXEMPT_RECALL_TERMS`` 里，改一处就必须改这里。
+        主题自带 keep 时，保底标签是主题的那条（例如「无负极钠电」）。
         """
         for topic in config.active_research_topics():
+            # 保底标签以当前主题**实际生效**的最后一条规则为准：
+            # 全局规则在前、主题自己的在后；没写 keep 的主题只有全局那条。
+            expected = content_rules.keep_rules(topic)[-1]["label"]
             for term in topic.search_terms:
                 if term in GATE_EXEMPT_RECALL_TERMS:
                     continue
                 with self.subTest(topic=topic.name, term=term):
                     work = {"title": f"Anode-free cell with {term}"}
-                    self.assertEqual(content_rules.keep_hit(work, topic), "无负极", term)
+                    self.assertEqual(content_rules.keep_hit(work, topic), expected, term)
 
     def test_real_li_s_anode_free_paper_is_blocked_by_the_gate(self):
         """★ 核心回归（Seg Q 的**真实**触发案例，标题与 DOI 是用户给的原文）。
@@ -2493,6 +2505,18 @@ class TestContentRuleValidation(unittest.TestCase):
         problems = config.topic_warnings("topic", broken)
         self.assertTrue(any("keep" in p and "永远不会生效" in p for p in problems), problems)
 
+    def test_bad_skip_topics_shape_is_reported(self):
+        """``skip_topics`` 写成字符串 = 豁免永远不生效，必须报出来。"""
+        broken = [{"label": "坏的", "score": 0, "any": ["x"], "skip_topics": "无负极钠电"}]
+        with patch.object(config, "EXCLUDE_RULES", broken):
+            problems = config.validate_content_rules()
+        self.assertTrue(any("skip_topics" in p for p in problems), problems)
+
+    def test_skip_topics_accepts_a_list_of_topic_names(self):
+        ok = [{"label": "好的", "score": 0, "any": ["x"], "skip_topics": ["无负极钠电"]}]
+        with patch.object(config, "EXCLUDE_RULES", ok):
+            self.assertEqual(config.validate_content_rules(), [])
+
 
 class TestContentBonusAffectsRanking(unittest.TestCase):
     """最终分 = AI 分 + 期刊档次加成 + 内容规则加成。"""
@@ -2576,9 +2600,10 @@ class TestMailerContentTags(unittest.TestCase):
 class TestLiveResearchConfig(unittest.TestCase):
     """把"用户当前想要的课题"钉进测试，防止后续改动悄悄回退。"""
 
-    def test_live_topics_are_lithium_rich_and_sodium_cathode(self):
+    def test_live_topics_are_lithium_rich_sodium_cathode_and_anode_free_sodium(self):
         self.assertEqual(
-            [topic.name for topic in config.active_research_topics()], ["富锂锰正极", "钠离子正极"]
+            [topic.name for topic in config.active_research_topics()],
+            ["富锂锰正极", "钠离子正极", "无负极钠电"],
         )
 
     def test_bonus_scores_match_the_request(self):
@@ -2601,10 +2626,63 @@ class TestLiveResearchConfig(unittest.TestCase):
             self.assertTrue(topic.keywords, topic.name)
             self.assertTrue(topic.description.strip(), topic.name)
 
+    def test_anode_free_sodium_topic_covers_electrolyte_and_collector(self):
+        topic = next(t for t in config.active_research_topics() if t.name == "无负极钠电")
+        for term in ("anode-free sodium", "sodium metal", "sodiophilic", "na deposition"):
+            self.assertIn(term, topic.search_terms)
+        joined = " ".join(topic.keywords).lower()
+        for clue in ("electrolyte", "current collector", "sodiophilic"):
+            self.assertIn(clue, joined)
+        # 本主题的核心内容必须在 AI 提示里说清楚「不是排除项」
+        self.assertIn("电解液工程", topic.exclude_note)
+        self.assertIn("不是排除项", topic.exclude_note)
+
+    def test_electrolyte_engineering_exclusion_is_skipped_for_the_anode_free_topic(self):
+        topics = {topic.name: topic for topic in config.active_research_topics()}
+        anode_free = topics["无负极钠电"]
+        self.assertNotIn(
+            "电解液工程",
+            [rule["label"] for rule in content_rules.exclusion_rules(anode_free)],
+        )
+        self.assertIn(
+            "电解液工程",
+            [rule["label"] for rule in content_rules.exclusion_rules(topics["富锂锰正极"])],
+        )
+        # 不含无负极构型 → 不会被保底豁免，能真正测到剔除规则
+        work = {
+            "title": "Electrolyte engineering for high-voltage sodium-ion batteries",
+            "abstract": "",
+        }
+        self.assertIsNone(content_rules.exclusion_hit(work, anode_free))
+        self.assertIsNotNone(content_rules.exclusion_hit(work, topics["富锂锰正极"]))
+
+    def test_anode_free_keep_gate_narrows_per_topic(self):
+        topics = {topic.name: topic for topic in config.active_research_topics()}
+        anode_free = topics["无负极钠电"]
+        # 全局那条（富锂锰 或 钠电）让位给主题自己的（只认钠电）
+        self.assertEqual(
+            [rule["label"] for rule in content_rules.keep_rules(anode_free)], ["无负极钠电"]
+        )
+        li_work = {"title": "Anode-free Li-rich layered oxide cathode", "abstract": ""}
+        self.assertIsNone(content_rules.keep_hit(li_work, anode_free))
+        self.assertEqual(
+            content_rules.keep_hit(li_work, topics["富锂锰正极"]), "无负极"
+        )
+        na_work = {
+            "title": "Sodiophilic current collector for anode-free sodium batteries",
+            "abstract": "",
+        }
+        self.assertEqual(content_rules.keep_hit(na_work, anode_free), "无负极钠电")
+
     def test_global_exclude_note_is_fed_to_the_ai(self):
         self.assertTrue(config.GLOBAL_EXCLUDE_NOTE.strip())
+        first_clause = config.GLOBAL_EXCLUDE_NOTE.split("；")[0]
         for topic in config.active_research_topics():
-            self.assertIn(config.GLOBAL_EXCLUDE_NOTE.split("；")[0], topic.brief())
+            if topic.exclude_note:
+                # 覆盖了的主题必须用**自己的**口径，不能继续喂全局那句
+                self.assertIn(topic.exclude_note, topic.brief(), topic.name)
+                continue
+            self.assertIn(first_clause, topic.brief(), topic.name)
 
     def test_keep_rule_has_the_cathode_gate(self):
         """★ Seg Q：无负极保底必须带体系闸门（锂硫事件后加的）。"""

@@ -185,9 +185,37 @@ def bonus_rules(topic=None) -> list[dict]:
     return rules
 
 
+def _skipped_by_topic(rule: dict, topic) -> bool:
+    """规则是否用 ``skip_topics`` 声明了在本主题不生效。
+
+    主题名与分区键都比对，避免改了 key 之后豁免静默失灵。
+    """
+    skip_keys = {
+        str(getattr(topic, "key", "") or "").strip(),
+        str(getattr(topic, "name", "") or "").strip(),
+    } - {""}
+    skip = {str(item).strip() for item in (rule.get("skip_topics") or []) if str(item).strip()}
+    if not (skip & skip_keys):
+        return False
+    log.debug(
+        "规则「%s」在主题「%s」里被 skip_topics 豁免",
+        rule.get("label") or "内容",
+        getattr(topic, "name", ""),
+    )
+    return True
+
+
 def exclusion_rules(topic=None) -> list[dict]:
-    """本轮生效的剔除规则：全局的 + 该主题自己的。"""
-    rules = [rule for rule in (config.EXCLUDE_RULES or []) if isinstance(rule, dict)]
+    """本轮生效的剔除规则：全局的 + 该主题自己的。
+
+    全局规则可以用 ``skip_topics`` 声明「在哪些主题里不生效」——
+    例如「电解液工程」对「无负极钠电」主题失效（那个主题正是要盯它）。
+    """
+    rules = [
+        rule
+        for rule in (config.EXCLUDE_RULES or [])
+        if isinstance(rule, dict) and not _skipped_by_topic(rule, topic)
+    ]
     if topic is not None:
         rules += [rule for rule in (getattr(topic, "exclude", None) or []) if isinstance(rule, dict)]
     return rules
@@ -198,8 +226,16 @@ def keep_rules(topic=None) -> list[dict]:
 
     与 ``bonus_rules`` 不同，这里**不过滤 score**：保底规则本来就
     不靠分数起作用（它是入选开关，不是排序权重）。
+
+    全局保底也可以用 ``skip_topics`` 让位给主题自己的保底：
+    全局那条的体系闸门是「富锂锰 **或** 钠电」，对「无负极钠电」主题
+    会把富锂锰的无负极论文也强推进去；该主题换成只认钠电的保底。
     """
-    rules = [rule for rule in (config.KEEP_RULES or []) if isinstance(rule, dict)]
+    rules = [
+        rule
+        for rule in (config.KEEP_RULES or [])
+        if isinstance(rule, dict) and not _skipped_by_topic(rule, topic)
+    ]
     if topic is not None:
         rules += [rule for rule in (getattr(topic, "keep", None) or []) if isinstance(rule, dict)]
     return rules
